@@ -2773,10 +2773,10 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         backends[n_be++] = c->backend;
         if (c->backend_cpu && c->backend_cpu != c->backend)
             backends[n_be++] = c->backend_cpu;
-        // 256k nodes — predictor has 4 bidir LSTMs at T_frames up to ~1500
-        // (~54k LSTM nodes) plus the decoder graph; the upper bound is
-        // generous to accommodate AdainResBlk1d + AdaIN expansion.
-        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, /*graph_size=*/262144,
+        // SoundsFun feeds Kokoro bounded utterance chunks. A 32k scheduler is
+        // sufficient for those graphs and avoids GGML reserving multi-GB
+        // cross-backend split metadata from the old 256k theoretical bound.
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, /*graph_size=*/32768,
                                           /*parallel=*/false, /*op_offload=*/false);
         if (!c->sched) {
             fprintf(stderr, "kokoro: failed to allocate main scheduler\n");
@@ -2799,7 +2799,8 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         gen_backends[n_gb++] = c->backend;
         if (c->backend_cpu && c->backend_cpu != c->backend)
             gen_backends[n_gb++] = c->backend_cpu;
-        c->gen_sched = ggml_backend_sched_new(gen_backends, nullptr, n_gb, /*graph_size=*/262144, false, false);
+        // The generator itself is roughly 600 ops; 4k leaves ample headroom.
+        c->gen_sched = ggml_backend_sched_new(gen_backends, nullptr, n_gb, /*graph_size=*/4096, false, false);
         if (!c->gen_sched) {
             fprintf(stderr, "kokoro: failed to allocate generator scheduler\n");
             kokoro_free(c);
