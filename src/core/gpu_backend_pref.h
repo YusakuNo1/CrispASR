@@ -15,6 +15,10 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"                    // core_cpu_backend::init() for the `--gpu-backend cpu` short-circuit
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include "metal_pipeline_cache_policy.h" // cap on the ggml-metal MTLBinaryArchive open cost (PLAN #88)
 
 #include <cctype>
@@ -71,6 +75,31 @@ inline bool ci_starts_with(const char* haystack, const char* needle) {
 // Falls back to ggml_backend_init_best() when no preference is set or
 // the preferred backend isn't found.
 inline ggml_backend_t crispasr_init_gpu_backend() {
+#ifdef GGML_BACKEND_DL
+    // Dynamic backends are not registered by static initializers. Flutter's
+    // Linux bundle places them next to libcrispasr in bundle/lib, while ggml's
+    // default search only checks the executable directory and current working
+    // directory. Resolve this library's directory explicitly so both the CUDA
+    // module and the mandatory CPU fallback are found regardless of cwd.
+#if defined(__linux__)
+    Dl_info library_info = {};
+    if (dladdr(reinterpret_cast<const void *>(&crispasr_init_gpu_backend), &library_info) != 0 &&
+        library_info.dli_fname && library_info.dli_fname[0]) {
+        std::string library_dir(library_info.dli_fname);
+        const std::string::size_type separator = library_dir.find_last_of('/');
+        if (separator != std::string::npos) {
+            library_dir.resize(separator);
+            ggml_backend_load_all_from_path(library_dir.c_str());
+        } else {
+            ggml_backend_load_all();
+        }
+    } else {
+        ggml_backend_load_all();
+    }
+#else
+    ggml_backend_load_all();
+#endif
+#endif
     std::string pref = crispasr_get_gpu_backend_pref();
 
     // PLAN #88 follow-up (logic synced from CrispEmbed's T18/G4 fixes): bound
