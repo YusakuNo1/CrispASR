@@ -308,6 +308,7 @@ extern "C" void crispasr_chat_generate_params_default(crispasr_chat_generate_par
     out->stop = nullptr;
     out->n_stop = 0;
     out->prefill_only = false;
+    out->assistant_prefix = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +660,8 @@ int32_t generate_loop(crispasr_chat_session* s, const std::vector<llama_token>& 
 // new prompt diverges from the history, the KV cache is truncated to
 // their common prefix so only the divergent tail is re-decoded.
 int32_t prepare_prompt(crispasr_chat_session* s, const crispasr_chat_message* messages, size_t n_messages,
-                       std::vector<llama_token>& out_new, crispasr_chat_error* err) {
+                       const char* assistant_prefix, std::vector<llama_token>& out_new,
+                       crispasr_chat_error* err) {
     if (n_messages == 0) {
         // Nothing to answer: the template would render a bare assistant
         // prefix and the model would continue from nowhere.
@@ -670,6 +672,9 @@ int32_t prepare_prompt(crispasr_chat_session* s, const crispasr_chat_message* me
     if (!apply_chat_template(s->tmpl.c_str(), messages, n_messages, /*add_ass=*/true, formatted)) {
         set_err(err, 20, "llama_chat_apply_template failed for template '%s'", s->tmpl.c_str());
         return 20;
+    }
+    if (assistant_prefix) {
+        formatted += assistant_prefix;
     }
     // `messages` is the whole conversation, so it is tokenized exactly as
     // a just-opened session would tokenize it, leading BOS included. That
@@ -753,7 +758,9 @@ extern "C" char* crispasr_chat_generate(crispasr_chat_session_t s, const crispas
     }
 
     std::vector<llama_token> prompt_new;
-    if (int32_t rc = prepare_prompt(s, messages, n_messages, prompt_new, err); rc != 0) {
+    if (int32_t rc = prepare_prompt(
+            s, messages, n_messages, gp.assistant_prefix, prompt_new, err);
+        rc != 0) {
         return nullptr;
     }
     std::string out;
@@ -796,7 +803,9 @@ extern "C" int32_t crispasr_chat_generate_stream(crispasr_chat_session_t s, cons
     }
 
     std::vector<llama_token> prompt_new;
-    if (int32_t rc = prepare_prompt(s, messages, n_messages, prompt_new, err); rc != 0) {
+    if (int32_t rc = prepare_prompt(
+            s, messages, n_messages, gp.assistant_prefix, prompt_new, err);
+        rc != 0) {
         return rc;
     }
     std::string sink;

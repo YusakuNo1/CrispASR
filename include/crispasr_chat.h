@@ -155,6 +155,12 @@ typedef struct crispasr_chat_generate_params {
     // If true, the system / user portion is prefilled but assistant
     // generation is suppressed — useful for measuring prompt cost.
     bool prefill_only;
+
+    // Optional bytes appended immediately after the assistant generation
+    // header rendered by the chat template. It is read only for this call.
+    // This supports model-specific generation controls which
+    // llama_chat_apply_template cannot express as template arguments.
+    const char* assistant_prefix;
 } crispasr_chat_generate_params;
 
 CRISPASR_CHAT_API void crispasr_chat_generate_params_default(crispasr_chat_generate_params* out);
