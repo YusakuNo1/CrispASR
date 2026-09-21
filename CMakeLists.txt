@@ -43,7 +43,7 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include(git-vars)
 
     # configure project version
-    configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY NEWLINE_STYLE LF)
 
     # Sync the pure-JS C2PA signer/verifier from the c2pa-audio submodule (single
     # source of truth) into bindings/javascript so `crispasr/c2pa` and the JS
