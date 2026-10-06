@@ -16,6 +16,32 @@ FetchContent_MakeAvailable(Catch2)
 list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
 include(Catch)
 
+# Compile the marked session language blocks in model-free test fixtures.
+set(_session_language_source "${PROJECT_SOURCE_DIR}/src/crispasr_c_api.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_session_language_source}")
+file(READ "${_session_language_source}" _session_language_code)
+foreach(_block getter qwen sensevoice)
+    set(_begin_marker "// BEGIN session-language: ${_block}\n")
+    set(_end_marker "// END session-language: ${_block}")
+    string(FIND "${_session_language_code}" "${_begin_marker}" _begin)
+    string(FIND "${_session_language_code}" "${_end_marker}" _end)
+    if(_begin LESS 0 OR _end LESS _begin)
+        message(FATAL_ERROR "Missing session language test block: ${_block}")
+    endif()
+    string(LENGTH "${_begin_marker}" _marker_length)
+    math(EXPR _begin "${_begin} + ${_marker_length}")
+    math(EXPR _length "${_end} - ${_begin}")
+    string(SUBSTRING "${_session_language_code}" ${_begin} ${_length} _code)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/session-language-${_block}.inc" "${_code}")
+endforeach()
+
+add_executable(test-session-language test-session-language.cpp)
+target_include_directories(test-session-language PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(test-session-language PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-session-language
+    TEST_SPEC "[session-language]"
+    PROPERTIES LABELS "unit;session-language")
+
 add_executable(test-realtime-turn-buffer test-realtime-turn-buffer.cpp)
 target_include_directories(test-realtime-turn-buffer PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-realtime-turn-buffer PRIVATE Catch2::Catch2WithMain)

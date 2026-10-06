@@ -11,6 +11,12 @@ to main before you start**. Several agents run here at once; a claim that lands
 with the work is a claim that did nothing. Delete it when the work lands, or if
 it goes stale for more than a day.
 
+## CLAIMED 2026-10-06 — session detected-language regression tests
+
+Worktree: repository root, branch `features/add-language-response`. Review
+`fb2dc8a52`; cover Qwen3 metadata parsing and SenseVoice result ownership
+without model fixtures, and correct language-cache edge cases.
+
 ## OPEN 2026-10-05 — live transcribe + translate: follow-ups
 
 Shipped 2026-10-06 (#493) together with the ggml v0.26.0 sync — what landed

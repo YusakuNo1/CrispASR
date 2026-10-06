@@ -244,9 +244,10 @@ CRISPASR_SESSION_API crispasr_session* crispasr_session_open_with_params(const c
 CRISPASR_SESSION_API const char* crispasr_session_backend(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_available_backends(char* out_csv, int out_cap);
 // Acoustic language detected by the last transcribe, as a code or language name
-// (Whisper, Qwen3, SenseVoice; other backends fall back to the source-language hint, then
-// "unknown"). Writes into out_buf (NUL-terminated, truncated to out_cap) and
-// returns the code length in bytes, or -1 on bad args. Distinct from the
+// (Whisper, Qwen3, SenseVoice; e.g. "en" or "English"). Without a detection,
+// falls back to the source-language hint, then "unknown"; "auto" is not a hint.
+// Writes into out_buf (NUL-terminated, truncated to out_cap) and returns the
+// full length in bytes excluding NUL, or -1 on bad args. Distinct from the
 // text-LID pass crispasr_text_detect_language.
 CRISPASR_SESSION_API int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap);
 // CTC vocabulary access (Omni CTC backend). crispasr_session_n_vocab returns

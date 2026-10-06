@@ -49,6 +49,7 @@
 
 #include "crispasr.h"
 #include "core/qwen3_prompt.h"
+#include "core/qwen3_stream.h"
 #include "core/backend_caps_table.h" // #433: backend -> verb lookup
 #include "crispasr_vad.h"            // VAD slicing + stitching (shared with CLI)
 #include "crispasr_diarize.h"        // Speaker diarization (shared with CLI)
@@ -4404,20 +4405,19 @@ CA_EXPORT const char* crispasr_session_backend(crispasr_session* s) {
 // (bytes, not counting NUL) or -1 on bad args. This is distinct from the
 // backend-agnostic text-LID pass (crispasr_text_detect_language), which runs
 // CLD3 + fastText over the transcript.
+// BEGIN session-language: getter
 CA_EXPORT int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap) {
     if (!s || !out_buf || out_cap <= 0)
         return -1;
-    std::string lang;
-    if (!s->detected_lang.empty())
-        lang = s->detected_lang;
-    else if (!s->source_language.empty())
-        lang = s->source_language;
-    else
-        lang = "unknown";
+    const std::string lang =
+        !s->detected_lang.empty()
+            ? s->detected_lang
+            : (!s->source_language.empty() && s->source_language != "auto" ? s->source_language : "unknown");
     std::strncpy(out_buf, lang.c_str(), out_cap - 1);
     out_buf[out_cap - 1] = '\0';
     return (int)lang.size();
 }
+// END session-language: getter
 
 // Return the sample rate the backend expects for input PCM. Callers should
 // use this with crispasr_audio_load_at_rate() to decode audio directly at
@@ -6872,35 +6872,46 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::string transcript;
         std::vector<ca_token_record> toks;
         toks.reserve(dec.tokens.size());
-        s->detected_lang = lang_set ? lang : s->source_language;
-        bool reading_language = s->detected_lang.empty();
-        bool capture_language = false;
-        for (size_t i = 0; i < dec.tokens.size(); i++) {
-            const int32_t id = dec.tokens[i];
+        std::vector<std::string> pieces;
+        pieces.reserve(dec.tokens.size());
+        for (const int32_t id : dec.tokens) {
             if (id == eos_id)
                 break;
             const char* raw_piece = qwen3_asr_token_text(s->qwen3_ctx, id);
-            if (!raw_piece || !*raw_piece)
+            pieces.push_back(raw_piece ? gpt2_byte_decode(raw_piece) : "");
+        }
+        // BEGIN session-language: qwen
+        const std::string language_hint = lang_set ? lang : s->source_language;
+        s->detected_lang = raon || language_hint == "auto" ? "" : language_hint;
+        size_t text_begin = 0;
+        if (!raon) {
+            std::string header;
+            for (size_t i = 0; i < pieces.size(); ++i) {
+                const auto& piece = pieces[i];
+                if (piece == "<asr_text>") {
+                    const auto parsed =
+                        core_qwen3_stream::parse_tagged(core_qwen3_stream::utf8_decode_replace(header + piece));
+                    s->detected_lang = core_qwen3_stream::utf8_encode(parsed.language);
+                    text_begin = i + 1;
+                    break;
+                }
+                if (piece.size() >= 2 && piece.front() == '<' && piece.back() == '>')
+                    continue;
+                if (piece.compare(0, 4, "[PAD") == 0)
+                    continue;
+                header += piece;
+            }
+        }
+        // END session-language: qwen
+        for (size_t i = text_begin; i < pieces.size(); i++) {
+            const std::string& piece = pieces[i];
+            if (piece.empty())
                 continue;
-            std::string raw = raw_piece;
-            if (raw == "<asr_text>") reading_language = false;
             // Skip qwen3 special tokens and structured tags.
-            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|')
+            if (piece.size() >= 2 && piece.front() == '<' && piece.back() == '>')
                 continue;
-            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>')
+            if (piece.compare(0, 4, "[PAD") == 0)
                 continue;
-            if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
-                continue;
-            std::string piece = gpt2_byte_decode(raw);
-            if (!raon && piece == "language") {
-                capture_language = true;
-                continue;
-            }
-            if (reading_language) s->detected_lang += piece;
-            if (capture_language) {
-                capture_language = false; // language name eaten, no transcript contribution
-                continue;
-            }
             transcript += piece;
             ca_token_record tk;
             tk.text = piece;
@@ -7810,13 +7821,16 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             if (s->beam_size > 1)
                 sensevoice_set_beam_size(s->sensevoice_ctx, s->beam_size, /*gamma=*/2.3f);
             const char* lang = s->source_language.empty() ? nullptr : s->source_language.c_str();
-            sensevoice_result* result = sensevoice_transcribe_structured(s->sensevoice_ctx, pcm, n_samples, lang, /*use_itn=*/true);
+            sensevoice_result* result =
+                sensevoice_transcribe_structured(s->sensevoice_ctx, pcm, n_samples, lang, /*use_itn=*/true);
+            // BEGIN session-language: sensevoice
+            s->detected_lang = result && result->language ? result->language : "";
             if (result) {
-                s->detected_lang = result->language ? result->language : "";
                 text = result->text;
                 result->text = nullptr;
-                sensevoice_result_free(result);
             }
+            // END session-language: sensevoice
+            sensevoice_result_free(result);
             need_free = true;
         }
 #endif
