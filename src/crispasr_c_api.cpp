@@ -4175,8 +4175,8 @@ CA_EXPORT const char* crispasr_session_backend(crispasr_session* s) {
 }
 
 // Acoustic language detected by the last transcribe, written into `out_buf` as
-// an ISO-639-1 code (e.g. "en"). Only whisper decodes an in-session acoustic
-// language; other backends (and whisper before its first pass) fall back to
+// a code or language name. Whisper, Qwen3, and SenseVoice return a detected
+// language; other backends (and models before their first pass) fall back to
 // the session's source-language hint, then "unknown". Returns the code length
 // (bytes, not counting NUL) or -1 on bad args. This is distinct from the
 // backend-agnostic text-LID pass (crispasr_text_detect_language), which runs
@@ -6501,6 +6501,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::string transcript;
         std::vector<ca_token_record> toks;
         toks.reserve(dec.tokens.size());
+        s->detected_lang = lang_set ? lang : s->source_language;
+        bool reading_language = s->detected_lang.empty();
         bool capture_language = false;
         for (size_t i = 0; i < dec.tokens.size(); i++) {
             const int32_t id = dec.tokens[i];
@@ -6510,6 +6512,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             if (!raw_piece || !*raw_piece)
                 continue;
             std::string raw = raw_piece;
+            if (raw == "<asr_text>") reading_language = false;
             // Skip qwen3 special tokens and structured tags.
             if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|')
                 continue;
@@ -6522,6 +6525,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 capture_language = true;
                 continue;
             }
+            if (reading_language) s->detected_lang += piece;
             if (capture_language) {
                 capture_language = false; // language name eaten, no transcript contribution
                 continue;
@@ -7426,7 +7430,13 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             if (s->beam_size > 1)
                 sensevoice_set_beam_size(s->sensevoice_ctx, s->beam_size, /*gamma=*/2.3f);
             const char* lang = s->source_language.empty() ? nullptr : s->source_language.c_str();
-            text = sensevoice_transcribe(s->sensevoice_ctx, pcm, n_samples, lang, /*use_itn=*/true);
+            sensevoice_result* result = sensevoice_transcribe_structured(s->sensevoice_ctx, pcm, n_samples, lang, /*use_itn=*/true);
+            if (result) {
+                s->detected_lang = result->language ? result->language : "";
+                text = result->text;
+                result->text = nullptr;
+                sensevoice_result_free(result);
+            }
             need_free = true;
         }
 #endif
