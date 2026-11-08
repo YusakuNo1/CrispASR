@@ -24,7 +24,7 @@
 #
 # It BUILDS FROM SOURCE rather than using a release tarball: the madlad arm in
 # `crispasr-diff` and `tools/reference_backends/madlad.py` are newer than
-# v0.8.25. That is what `chr1str/crispasr-ccache` is attached for — a warm
+# v0.8.25. That is what `${KAGGLE_ACCOUNT}/crispasr-ccache` is attached for — a warm
 # ccache turns a ~20 min build into ~3 min.
 
 # %% [code]

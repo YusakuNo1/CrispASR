@@ -10,9 +10,10 @@
 //                                              ggml_backend_init_best()
 //
 // The preference is matched against ggml backend registry names
-// (case-insensitive). Common values: "cuda", "vulkan", "metal", "cpu".
+// (case-insensitive). Common values: "cuda", "vulkan", "metal", "cann", "cpu".
 // Empty or null = auto (same as ggml_backend_init_best).
 
+#include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"                    // core_cpu_backend::init() for the `--gpu-backend cpu` short-circuit
 
@@ -27,6 +28,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 #include "core/ggml_cpu_backend.h"
 
 namespace crispasr_gpu_pref {
@@ -57,6 +59,15 @@ inline std::string crispasr_get_gpu_backend_pref() {
     return crispasr_gpu_pref::pref_storage();
 }
 
+inline int& crispasr_gpu_device_pref_storage() {
+    static int device = 0;
+    return device;
+}
+
+inline void crispasr_set_gpu_device_pref(int device) {
+    crispasr_gpu_device_pref_storage() = device;
+}
+
 // Case-insensitive prefix check: does `haystack` start with `needle`?
 inline bool ci_starts_with(const char* haystack, const char* needle) {
     for (; *needle; ++haystack, ++needle) {
@@ -70,7 +81,7 @@ inline bool ci_starts_with(const char* haystack, const char* needle) {
 
 // Drop-in replacement for ggml_backend_init_best().
 // If a gpu_backend preference is set, iterate registered devices and
-// pick the first GPU/iGPU device whose name starts with the preference
+// pick the requested GPU/iGPU device whose name starts with the preference
 // (e.g. "vulkan" matches "Vulkan0", "Vulkan1", …).
 // Falls back to ggml_backend_init_best() when no preference is set or
 // the preferred backend isn't found.
@@ -143,6 +154,8 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
         pref = "mtl";
 
     if (!pref.empty()) {
+        const int preferred_device = crispasr_gpu_device_pref_storage();
+        int matching_device = 0;
         // Iterate all registered devices and find the first GPU whose
         // name starts with the preference string.
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -152,6 +165,8 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
                 continue;
             const char* dev_name = ggml_backend_dev_name(dev);
             if (ci_starts_with(dev_name, pref.c_str())) {
+                if (matching_device++ != preferred_device)
+                    continue;
                 ggml_backend_t result = ggml_backend_dev_init(dev, nullptr);
                 if (result) {
                     fprintf(stderr, "%s: using preferred GPU backend: %s\n", __func__, dev_name);
@@ -163,6 +178,7 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
 
         // Also try matching against the registry (backend library) name,
         // e.g. the user writes "vulkan" and the registry name is "Vulkan".
+        matching_device = 0;
         for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
             ggml_backend_reg_t reg = ggml_backend_reg_get(i);
             const char* reg_name = ggml_backend_reg_name(reg);
@@ -173,6 +189,8 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
                 ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, j);
                 enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
                 if (dt != GGML_BACKEND_DEVICE_TYPE_GPU && dt != GGML_BACKEND_DEVICE_TYPE_IGPU)
+                    continue;
+                if (matching_device++ != preferred_device)
                     continue;
                 ggml_backend_t result = ggml_backend_dev_init(dev, nullptr);
                 if (result) {
@@ -190,4 +208,60 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
     }
 
     return ggml_backend_init_best();
+}
+
+// ── Can this backend actually run the model's matmuls? ─────────────────────
+//
+// A model that drives a single backend with ggml_gallocr + ggml_backend_graph_compute
+// (rather than a ggml_backend_sched with a CPU fallback) has NO graceful path for
+// an op the device declines: ggml aborts the process. Measured, not theorised —
+// GitHub's hosted macos-14 runner exposes an "Apple Paravirtual device"
+// (MTLGPUFamilyApple5) that reports
+//
+//     simdgroup reduction   = false
+//     simdgroup matrix mul. = false
+//
+// so ggml-metal supports no MUL_MAT at all there, and the first encoder GEMM
+// killed hft-parity-dump with "unsupported op 'MUL_MAT'" plus a backtrace.
+//
+// So ASK before committing. This probes GGML_OP_MUL_MAT for every weight dtype
+// the GGUF actually contains, which is the op every such model's arithmetic is
+// made of and the one that varies by dtype (a device can have an F16 kernel and
+// no q4_0 one). It builds no data and allocates nothing but tensor headers.
+//
+// This is narrower than "the device supports this model": a device that has
+// MUL_MAT but lacks, say, POOL_2D would still abort later. The complete answer
+// is a ggml_backend_sched with the CPU as the fallback backend, which is a
+// graph-lifecycle change rather than an init-time one. This catches the case
+// that actually occurs — a device with no matmul kernels is a device with
+// nothing useful to offer a transcription model — and it turns an abort into a
+// CPU fallback and a warning.
+inline bool crispasr_backend_supports_mul_mat(ggml_backend_t backend, const std::vector<ggml_type>& weight_types) {
+    if (!backend)
+        return false;
+    // 256 rows: a multiple of every ggml block size in use (32 for q4_0/q8_0,
+    // 256 for the K-quants), so the probe tensor is legal for each dtype.
+    const int64_t K = 256, N = 256, M = 64;
+    struct ggml_init_params ip = {/*.mem_size =*/ggml_tensor_overhead() * 16,
+                                  /*.mem_buffer =*/nullptr,
+                                  /*.no_alloc =*/true};
+    ggml_context* c = ggml_init(ip);
+    if (!c)
+        return false;
+    bool ok = true;
+    for (ggml_type wt : weight_types) {
+        if (ggml_blck_size(wt) <= 0 || K % ggml_blck_size(wt) != 0)
+            continue; // not a shape this probe can express; leave it to the device
+        ggml_tensor* w = ggml_new_tensor_2d(c, wt, K, N);
+        ggml_tensor* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, K, M);
+        ggml_tensor* y = ggml_mul_mat(c, w, x);
+        if (!ggml_backend_supports_op(backend, y)) {
+            fprintf(stderr, "%s: %s cannot MUL_MAT a %s weight — falling back to the CPU backend\n", __func__,
+                    ggml_backend_name(backend), ggml_type_name(wt));
+            ok = false;
+            break;
+        }
+    }
+    ggml_free(c);
+    return ok;
 }

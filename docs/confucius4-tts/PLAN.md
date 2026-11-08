@@ -10,7 +10,7 @@
 
 # ✅ PORT COMPLETE — FULLY NATIVE ZERO-SHOT PIPELINE, ROUNDTRIP 8/8
 
-Kernel run 18 (`chr1s4/crispasr-confucius4-cfg-verify`), all green:
+Kernel run 18 (`${KAGGLE_ACCOUNT}/crispasr-confucius4-cfg-verify`), all green:
 
 - **`[NATIVE-full] 8/8 = 100%`** — `--voice jfk.wav`, no env escapes, no
   Python anywhere: native SP-BPE tokenizer (byte-identical to
@@ -56,8 +56,8 @@ test ✓ go cgo sync ✓ docs/README ✓ HF license card ✓.
 Fully native `--voice` roundtrip on CUDA: **8/8, transcript verbatim, 183.2 s
 vs 685.2 s CPU control = 3.74×** — with zero code changes (the all-gallocr
 single-backend graphs ran as-is). GPU+persist 185.7 s (neutral → persist
-stays gated everywhere). Kernel: `chr1s4/crispasr-confucius4-gpu-verify`.
-GPU-effort doc: `/mnt/volume1/conf4gpu.md`.
+stays gated everywhere). Kernel: `${KAGGLE_ACCOUNT}/crispasr-confucius4-gpu-verify`.
+GPU-effort doc: `${CRISPASR_WORKTREES}/conf4gpu.md`.
 
 **Open (perf, optional):** CFG cond+uncond fusion in one DiT pass
 (seq-concat + block-diagonal mask — now the biggest CUDA lever); bucketed-Lk

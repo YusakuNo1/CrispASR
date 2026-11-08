@@ -31,6 +31,8 @@
 
 #include "core/utf8.h"
 #include "core/gguf_loader.h"
+#include "core/parallel_for.h"
+#include "core/cpu_model_kernels.h"
 #include "core/hifigan.h"          // #387 perf: shared GPU-capable HiFi-GAN vocoder
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
@@ -1582,59 +1584,70 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
 // ── Vocos vocoder ────────────────────────────────────────────────
 
+// Check if sequential baseline F5-TTS is requested.
+static inline bool crispasr_f5_serial() {
+    const char* e = std::getenv("CRISPASR_F5_SERIAL");
+    return (e && *e && std::strcmp(e, "0") != 0);
+}
+
 // ── CPU Conv1d helper (standard or depthwise) ──────────────────────
 // input/output: (C, T) row-major. weight: (C_out, C_in_per_group, K).
 static void cpu_conv1d(const float* input, int C_in, int T, const float* weight, const float* bias, int C_out, int K,
-                       int pad, int groups, float* output) {
+                       int pad, int groups, float* output, int n_threads) {
     int ch_per_group_in = C_in / groups;
     int ch_per_group_out = C_out / groups;
-    for (int g = 0; g < groups; g++) {
-        int oc_start = g * ch_per_group_out;
-        int ic_start = g * ch_per_group_in;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int oc = oc_start; oc < oc_start + ch_per_group_out; oc++) {
-            for (int t = 0; t < T; t++) {
-                float sum = bias ? bias[oc] : 0.0f;
-                for (int ic_local = 0; ic_local < ch_per_group_in; ic_local++) {
-                    int ic = ic_start + ic_local;
-                    for (int k = 0; k < K; k++) {
-                        int ti = t + k - pad;
-                        if (ti >= 0 && ti < T) {
-                            int w_idx = oc * ch_per_group_in * K + ic_local * K + k;
-                            sum += input[ic * T + ti] * weight[w_idx];
+    if (crispasr_f5_serial()) {
+        for (int g = 0; g < groups; g++) {
+            int oc_start = g * ch_per_group_out;
+            int ic_start = g * ch_per_group_in;
+            for (int oc = oc_start; oc < oc_start + ch_per_group_out; oc++) {
+                for (int t = 0; t < T; t++) {
+                    float sum = bias ? bias[oc] : 0.0f;
+                    for (int ic_local = 0; ic_local < ch_per_group_in; ic_local++) {
+                        int ic = ic_start + ic_local;
+                        for (int k = 0; k < K; k++) {
+                            int ti = t + k - pad;
+                            if (ti >= 0 && ti < T) {
+                                int w_idx = oc * ch_per_group_in * K + ic_local * K + k;
+                                sum += input[ic * T + ti] * weight[w_idx];
+                            }
                         }
                     }
+                    output[oc * T + t] = sum;
                 }
-                output[oc * T + t] = sum;
             }
         }
+        return;
     }
+
+    core_parallel::for_each_chunk_work(C_out, n_threads, (uint64_t)T * ch_per_group_in * K, 65536,
+                                       [&](int oc_start_chunk, int oc_end_chunk) {
+                                           for (int oc = oc_start_chunk; oc < oc_end_chunk; oc++) {
+                                               int g = oc / ch_per_group_out;
+                                               int ic_start = g * ch_per_group_in;
+                                               for (int t = 0; t < T; t++) {
+                                                   float sum = bias ? bias[oc] : 0.0f;
+                                                   for (int ic_local = 0; ic_local < ch_per_group_in; ic_local++) {
+                                                       int ic = ic_start + ic_local;
+                                                       for (int k = 0; k < K; k++) {
+                                                           int ti = t + k - pad;
+                                                           if (ti >= 0 && ti < T) {
+                                                               int w_idx = oc * ch_per_group_in * K + ic_local * K + k;
+                                                               sum += input[ic * T + ti] * weight[w_idx];
+                                                           }
+                                                       }
+                                                   }
+                                                   output[oc * T + t] = sum;
+                                               }
+                                           }
+                                       });
 }
 
 // Dilated 1-D conv (groups=1), same-padding. #387 HiFi-GAN resblocks.
 static void cpu_conv1d_dil(const float* input, int C_in, int T, const float* weight, const float* bias, int C_out,
-                           int K, int dilation, float* output) {
-    const int pad = dilation * (K - 1) / 2; // "same" for odd K
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int oc = 0; oc < C_out; oc++) {
-        for (int t = 0; t < T; t++) {
-            float sum = bias ? bias[oc] : 0.0f;
-            for (int ic = 0; ic < C_in; ic++) {
-                const float* in = input + (size_t)ic * T;
-                const float* w = weight + ((size_t)oc * C_in + ic) * K;
-                for (int k = 0; k < K; k++) {
-                    int ti = t + k * dilation - pad;
-                    if (ti >= 0 && ti < T)
-                        sum += in[ti] * w[k];
-                }
-            }
-            output[(size_t)oc * T + t] = sum;
-        }
-    }
+                           int K, int dilation, float* output, int n_threads) {
+    core_cpu_kernels::conv1d_dil(input, C_in, T, weight, bias, C_out, K, dilation, output,
+                                 crispasr_f5_serial() ? 1 : n_threads);
 }
 
 static inline void cpu_leaky_relu(std::vector<float>& x, float slope) {
@@ -1707,7 +1720,7 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
     {
         std::vector<float> out((size_t)init_ch * T, 0.0f);
         cpu_conv1d(x.data(), C, T, get("voc.conv_pre.weight").data(), get("voc.conv_pre.bias").data(), init_ch, 7, 3, 1,
-                   out.data());
+                   out.data(), ctx->n_threads);
         x = std::move(out);
         C = init_ch;
     }
@@ -1726,28 +1739,51 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
         // Gather per output channel (parallel-safe: each oc writes its own row).
         // For each output position `to`, sum over the input taps that scatter
         // into it: to = ti*stride + kk - pad  ⇒  ti = (to + pad - kk)/stride.
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int oc = 0; oc < out_ch; oc++) {
-            float* orow = up.data() + (size_t)oc * T_out;
-            for (int to = 0; to < T_out; to++) {
-                float acc = ub[oc];
-                for (int kk = 0; kk < k; kk++) {
-                    int num = to + pad - kk;
-                    if (num < 0 || (num % stride) != 0)
-                        continue;
-                    int ti = num / stride;
-                    if (ti < 0 || ti >= T)
-                        continue;
-                    for (int ic = 0; ic < ch; ic++) {
-                        float v = x[(size_t)ic * T + ti];
-                        float w = uw[(((size_t)ic * out_ch) + oc) * k + kk];
-                        acc += v * w;
+        if (crispasr_f5_serial()) {
+            for (int oc = 0; oc < out_ch; oc++) {
+                float* orow = up.data() + (size_t)oc * T_out;
+                for (int to = 0; to < T_out; to++) {
+                    float acc = ub[oc];
+                    for (int kk = 0; kk < k; kk++) {
+                        int num = to + pad - kk;
+                        if (num < 0 || (num % stride) != 0)
+                            continue;
+                        int ti = num / stride;
+                        if (ti < 0 || ti >= T)
+                            continue;
+                        for (int ic = 0; ic < ch; ic++) {
+                            float v = x[(size_t)ic * T + ti];
+                            float w = uw[(((size_t)ic * out_ch) + oc) * k + kk];
+                            acc += v * w;
+                        }
                     }
+                    orow[to] = acc;
                 }
-                orow[to] = acc;
             }
+        } else {
+            core_parallel::for_each_chunk_work(out_ch, ctx->n_threads, (uint64_t)T_out * ch * k, 65536,
+                                               [&](int oc_start, int oc_end) {
+                                                   for (int oc = oc_start; oc < oc_end; oc++) {
+                                                       float* orow = up.data() + (size_t)oc * T_out;
+                                                       for (int to = 0; to < T_out; to++) {
+                                                           float acc = ub[oc];
+                                                           for (int kk = 0; kk < k; kk++) {
+                                                               int num = to + pad - kk;
+                                                               if (num < 0 || (num % stride) != 0)
+                                                                   continue;
+                                                               int ti = num / stride;
+                                                               if (ti < 0 || ti >= T)
+                                                                   continue;
+                                                               for (int ic = 0; ic < ch; ic++) {
+                                                                   float v = x[(size_t)ic * T + ti];
+                                                                   float w = uw[(((size_t)ic * out_ch) + oc) * k + kk];
+                                                                   acc += v * w;
+                                                               }
+                                                           }
+                                                           orow[to] = acc;
+                                                       }
+                                                   }
+                                               });
         }
         x = std::move(up);
         ch = out_ch;
@@ -1765,12 +1801,12 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
                 std::vector<float> b1((size_t)ch * T, 0.0f);
                 const std::string p1 = "voc.resblocks." + std::to_string(rb) + ".convs1." + std::to_string(d);
                 cpu_conv1d_dil(a.data(), ch, T, get(p1 + ".weight").data(), get(p1 + ".bias").data(), ch, rb_kernels[j],
-                               rb_dils[d], b1.data());
+                               rb_dils[d], b1.data(), ctx->n_threads);
                 cpu_leaky_relu(b1, slope);
                 std::vector<float> b2((size_t)ch * T, 0.0f);
                 const std::string p2 = "voc.resblocks." + std::to_string(rb) + ".convs2." + std::to_string(d);
                 cpu_conv1d_dil(b1.data(), ch, T, get(p2 + ".weight").data(), get(p2 + ".bias").data(), ch,
-                               rb_kernels[j], 1, b2.data());
+                               rb_kernels[j], 1, b2.data(), ctx->n_threads);
                 for (size_t i = 0; i < h.size(); i++)
                     h[i] += b2[i]; // residual
             }
@@ -1786,7 +1822,7 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
     cpu_leaky_relu(x, slope);
     std::vector<float> out((size_t)1 * T, 0.0f);
     cpu_conv1d(x.data(), ch, T, get("voc.conv_post.weight").data(), get("voc.conv_post.bias").data(), 1, 7, 3, 1,
-               out.data());
+               out.data(), ctx->n_threads);
     for (float& v : out)
         v = tanhf(v);
 
@@ -1866,7 +1902,8 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     // ── Embed: Conv1d(100, 512, k=7, pad=3) ──
     {
         std::vector<float> out(D * T, 0.0f);
-        cpu_conv1d(x_ct.data(), mel_dim, T, vc.embed_w.data(), vc.embed_b.data(), D, 7, 3, 1, out.data());
+        cpu_conv1d(x_ct.data(), mel_dim, T, vc.embed_w.data(), vc.embed_b.data(), D, 7, 3, 1, out.data(),
+                   ctx->n_threads);
         x_ct = std::move(out);
     }
 
@@ -1886,7 +1923,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
         // 1. Depthwise Conv1d(512, 512, k=7, pad=3, groups=512)
         {
             std::vector<float> out(D * T, 0.0f);
-            cpu_conv1d(x_ct.data(), D, T, bc.dw_w.data(), bc.dw_b.data(), D, 7, 3, D, out.data());
+            cpu_conv1d(x_ct.data(), D, T, bc.dw_w.data(), bc.dw_b.data(), D, 7, 3, D, out.data(), ctx->n_threads);
             x_ct = std::move(out);
         }
 
@@ -2706,8 +2743,8 @@ static std::vector<float> f5_preprocess_ref_audio(const float* pcm, int n, int s
     return out;
 }
 
-int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n_samples, const char* ref_text) {
-    if (!ctx || !pcm_24k || n_samples <= 0)
+int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm, int n_samples, const char* ref_text) {
+    if (!ctx || !pcm || n_samples <= 0)
         return -1;
 
     // Reference preprocessing (upstream parity): silence-strip + clip. Gated so
@@ -2719,13 +2756,12 @@ int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n
     float ref_max_sec = max_env ? (float)atof(max_env) : 12.0f;
     const char* trim_env = crispasr_env::get("CRISPASR_F5_REF_TRIM_SILENCE");
     bool ref_trim = !(trim_env && std::strcmp(trim_env, "0") == 0);
-    std::vector<float> ref_pcm =
-        f5_preprocess_ref_audio(pcm_24k, n_samples, ctx->hp.sample_rate, ref_max_sec, ref_trim);
+    std::vector<float> ref_pcm = f5_preprocess_ref_audio(pcm, n_samples, ctx->hp.sample_rate, ref_max_sec, ref_trim);
     if (ctx->verbosity >= 1 && (int)ref_pcm.size() != n_samples) {
         fprintf(stderr, "f5_tts: ref preprocess %d -> %zu samples (%.2f -> %.2f s)\n", n_samples, ref_pcm.size(),
                 (float)n_samples / (float)ctx->hp.sample_rate, (float)ref_pcm.size() / (float)ctx->hp.sample_rate);
     }
-    pcm_24k = ref_pcm.data();
+    pcm = ref_pcm.data();
     n_samples = (int)ref_pcm.size();
 
     // Compute mel spectrogram of reference audio. sbhifigan16k (#387) uses the
@@ -2733,8 +2769,8 @@ int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n
     int T_ref;
     const bool sbmel = (ctx->hp.mel_spec_type == "sbhifigan16k");
     ctx->ref_mel =
-        compute_mel_spectrogram(pcm_24k, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length,
-                                ctx->hp.mel_dim, T_ref, (float)ctx->hp.sample_rate, sbmel ? &ctx->mel_fb : nullptr,
+        compute_mel_spectrogram(pcm, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length, ctx->hp.mel_dim,
+                                T_ref, (float)ctx->hp.sample_rate, sbmel ? &ctx->mel_fb : nullptr,
                                 sbmel ? &ctx->mel_window : nullptr, sbmel ? ctx->hp.mel_center : true);
 
     // If mel computation not yet implemented, allow setting ref_mel directly

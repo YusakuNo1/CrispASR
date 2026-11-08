@@ -32,9 +32,11 @@ extern "C" {
 struct whisper_context;
 struct whisper_context_params;
 struct whisper_full_params;
+typedef struct whisper_full_params whisper_full_params;
 
 struct crispasr_align_result;
 typedef struct crispasr_align_result crispasr_align_result;
+typedef struct crispasr_ultra_align_result crispasr_ultra_align_result;
 struct crispasr_diarize_opts_abi;
 typedef struct crispasr_diarize_opts_abi crispasr_diarize_opts_abi;
 struct crispasr_diarize_seg_abi;
@@ -168,8 +170,13 @@ CRISPASR_SESSION_API void crispasr_params_set_vad_threshold(whisper_full_params*
 CRISPASR_SESSION_API void crispasr_params_set_vad_min_speech_ms(whisper_full_params* p, int ms);
 CRISPASR_SESSION_API void crispasr_params_set_vad_min_silence_ms(whisper_full_params* p, int ms);
 CRISPASR_SESSION_API void crispasr_params_set_tdrz(whisper_full_params* p, int v);
+CRISPASR_SESSION_API int crispasr_transcribe_parallel_by_ref(whisper_context* ctx, const whisper_full_params* params,
+                                                             const float* samples, int n_samples, int n_processors);
+// Enabling DTW disables incompatible flash attention; disabling DTW keeps its current setting.
 CRISPASR_SESSION_API void crispasr_ctx_params_set_dtw(whisper_context_params* p, bool enable, int aheads_preset,
                                                       int n_top);
+// Token times are centiseconds on the original audio timeline when VAD is used;
+// unavailable negative values are preserved, including DTW timestamps.
 CRISPASR_SESSION_API int64_t crispasr_token_t0(whisper_context* ctx, int i_seg, int i_tok);
 CRISPASR_SESSION_API int64_t crispasr_token_t1(whisper_context* ctx, int i_seg, int i_tok);
 CRISPASR_SESSION_API float crispasr_token_p(whisper_context* ctx, int i_seg, int i_tok);
@@ -294,7 +301,8 @@ CRISPASR_SESSION_API int crispasr_diarize_segments_abi(const float* left_pcm, co
 // 0.8.30+ (issue #395): diarize AND hand back the speaker turns the method
 // derived from the audio, so a caller can split one of its own segments that
 // spans a speaker change — labelling alone can never resolve finer than the
-// segment grid the caller sent in. Only FoxNose (method 4) derives turns; the
+// segment grid the caller sent in. FoxNose (method 4) and Sortformer (method 5,
+// #466) derive turns; the
 // other methods report 0, which is not an error.
 //
 // A NEW SYMBOL rather than a signature change, so the existing ABI stays
@@ -336,7 +344,27 @@ CRISPASR_SESSION_API int crispasr_align_result_n_words(crispasr_align_result* r)
 CRISPASR_SESSION_API const char* crispasr_align_result_word_text(crispasr_align_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_align_result_word_t0(crispasr_align_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_align_result_word_t1(crispasr_align_result* r, int i);
+// Measured original-codepoint spans for wav2vec2-family CTC alignment.
+// Count is zero for unsupported/romanized words and other aligner families.
+// Times are absolute centiseconds; invalid indices return empty text / zero.
+CRISPASR_SESSION_API int crispasr_align_result_n_characters(crispasr_align_result* r, int word);
+CRISPASR_SESSION_API const char* crispasr_align_result_character_text(crispasr_align_result* r, int word, int i);
+CRISPASR_SESSION_API int64_t crispasr_align_result_character_t0(crispasr_align_result* r, int word, int i);
+CRISPASR_SESSION_API int64_t crispasr_align_result_character_t1(crispasr_align_result* r, int word, int i);
 CRISPASR_SESSION_API void crispasr_align_result_free(crispasr_align_result* r);
+// Experimental Ultra alignment with a separately converted local-head GGUF.
+// Audio is mono 16 kHz, limited to 120 seconds; times are milliseconds.
+// A null result means invalid input, load failure or alignment failure.
+CRISPASR_SESSION_API crispasr_ultra_align_result* crispasr_align_words_ultra_abi(const char* aligner_model,
+                                                                                 const char* head_model,
+                                                                                 const char* transcript,
+                                                                                 const float* samples,
+                                                                                 int32_t n_samples, int32_t n_threads);
+CRISPASR_SESSION_API int crispasr_ultra_align_result_n_words(const crispasr_ultra_align_result* r);
+CRISPASR_SESSION_API const char* crispasr_ultra_align_result_word_text(const crispasr_ultra_align_result* r, int i);
+CRISPASR_SESSION_API double crispasr_ultra_align_result_word_start_ms(const crispasr_ultra_align_result* r, int i);
+CRISPASR_SESSION_API double crispasr_ultra_align_result_word_end_ms(const crispasr_ultra_align_result* r, int i);
+CRISPASR_SESSION_API void crispasr_ultra_align_result_free(crispasr_ultra_align_result* r);
 CRISPASR_SESSION_API int crispasr_cache_ensure_file_abi(const char* filename, const char* url, int32_t quiet,
                                                         const char* cache_dir_override, char* out_buf, int32_t out_cap);
 CRISPASR_SESSION_API int crispasr_cache_dir_abi(const char* cache_dir_override, char* out_buf, int32_t out_cap);
@@ -380,6 +408,8 @@ CRISPASR_SESSION_API int crispasr_registry_default_bundle_artifact_abi(const cha
                                                                        int32_t url_cap, char* out_size,
                                                                        int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_session_result_n_segments(crispasr_session_result* r);
+// Result text is valid UTF-8. Malformed decoded bytes are replaced with U+FFFD
+// after token assembly; valid text, word counts, timings and confidence survive.
 CRISPASR_SESSION_API const char* crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t1(crispasr_session_result* r, int i);
@@ -397,6 +427,18 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_sess
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+// Native token metadata (#549). Empty for backends/routes without token output.
+// t0/t1 use centiseconds; negative means unavailable (never interpolate).
+// Token text may contain a UTF-8 byte fragment: concatenate bytes before decoding
+// to reconstruct the transcript. Returned pointers live until result_free.
+CRISPASR_SESSION_API int crispasr_session_result_n_tokens(crispasr_session_result* r, int i_seg);
+CRISPASR_SESSION_API const char* crispasr_session_result_token_text(crispasr_session_result* r, int i_seg, int i_token);
+CRISPASR_SESSION_API int64_t crispasr_session_result_token_t0(crispasr_session_result* r, int i_seg, int i_token);
+CRISPASR_SESSION_API int64_t crispasr_session_result_token_t1(crispasr_session_result* r, int i_seg, int i_token);
+CRISPASR_SESSION_API float crispasr_session_result_token_p(crispasr_session_result* r, int i_seg, int i_token);
+// Release the process-wide forced-aligner cache. Safe to repeat; waits for an
+// active alignment to finish. The next alignment reloads its requested model.
+CRISPASR_SESSION_API void crispasr_free_aligner_cache(void);
 // Whisper's per-segment no-speech probability (the <|nospeech|> token
 // posterior) in [0, 1]. Only the whisper backend populates it; other backends
 // and out-of-range indices return the -1.0 sentinel ("no data").
@@ -421,6 +463,12 @@ CRISPASR_SESSION_API void crispasr_session_result_free(crispasr_session_result* 
 // values = full attention; INT_MIN,INT_MIN = clear (use the model default).
 // No-op for non-parakeet backends. Returns 0 on success.
 CRISPASR_SESSION_API int crispasr_session_set_parakeet_att_context(crispasr_session* s, int left, int right);
+// Audio context size (in 20ms frames, e.g. 1024; 0 = all/1500). Bounds Whisper
+// encoder evaluation context for batch and streaming decodes. Returns 0 on success.
+CRISPASR_SESSION_API int crispasr_session_set_audio_ctx(crispasr_session* s, int audio_ctx);
+// Strided window refresh interval for Hikari streaming (0 = exact sliding, K > 0 = strided).
+// Returns 0 on success.
+CRISPASR_SESSION_API int crispasr_session_set_hikari_refresh_stride(crispasr_session* s, int stride);
 // Set the active backend's companion codec/tokenizer model. For OmniVoice this
 // is its HiggsAudioV2 tokenizer; for Chatterbox it is S3Gen.
 CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
@@ -576,6 +624,10 @@ CRISPASR_SESSION_API int crispasr_session_convert_content_dim(crispasr_session* 
 CRISPASR_SESSION_API int crispasr_session_convert_n_speakers(crispasr_session* s);
 // The checkpoint's native rate (32k/40k/48k) — not a constant.
 CRISPASR_SESSION_API int crispasr_session_convert_sample_rate(crispasr_session* s);
+// Explicit replay noise uses [inter_channels, n_frames] and
+// [n_frames, upsample_product] row-major arrays respectively.
+CRISPASR_SESSION_API int crispasr_session_convert_inter_channels(crispasr_session* s);
+CRISPASR_SESSION_API int crispasr_session_convert_upsample_product(crispasr_session* s);
 
 // Chord recognition: mono PCM at any rate (resampled internally to the
 // model's 22050 Hz) -> a chord timeline. Returns the span count (>0) on
@@ -654,8 +706,11 @@ CRISPASR_SESSION_API float crispasr_session_beats_tempo_bpm(crispasr_session* s)
 // resampling: silently resampling audio would move every beat time.
 CRISPASR_SESSION_API int crispasr_session_beats_sample_rate(crispasr_session* s);
 
-// Polyphonic piano transcription: mono PCM at the model's native rate
-// (16000 Hz for piano-transcription) -> note events.
+// Polyphonic note transcription: mono PCM at the model's native rate
+// -> note events. Served by piano-transcription (16000 Hz), basic-pitch
+// (22050) and MT3 (16000) alike; query crispasr_session_piano_sample_rate
+// rather than assuming, and note the pcm_16k parameter name is a fossil of
+// the first backend to use this entry point.
 //
 // Returns note count (>0) on success, 0 for "ran, found nothing", -1 on error
 // or a backend with no piano arm. Retrieve the notes with
@@ -676,16 +731,40 @@ CRISPASR_SESSION_API int crispasr_session_piano_n_notes(crispasr_session* s);
 // typed-array read (the same reason crispasr_session_pitch_frames is flat).
 // midi_note is 21-108 (A0-C8); velocity is 0-127.
 CRISPASR_SESSION_API const float* crispasr_session_piano_notes(crispasr_session* s, int* out_n_notes);
+// GM program per note, session-owned, parallel to crispasr_session_piano_notes
+// and the same length in notes. Valid until the next crispasr_session_piano
+// call or session close.
+//
+//   0-127  General MIDI program — which instrument played the note
+//   128    percussion (GM channel 10), which carries no meaningful program
+//   -1     the model does not identify an instrument
+//
+// A separate array rather than a fifth float in the note record, because
+// widening that record would break every existing reader of this ABI. A
+// caller that does not ask is unaffected.
+//
+// Only MT3 fills this with real values; piano-transcription and basic-pitch
+// report -1 throughout. -1 rather than 0 because 0 is "Acoustic Grand Piano"
+// and would be indistinguishable from a genuine answer.
+CRISPASR_SESSION_API const int* crispasr_session_piano_note_programs(crispasr_session* s, int* out_n_notes);
 CRISPASR_SESSION_API int crispasr_session_piano_sample_rate(crispasr_session* s);
 CRISPASR_SESSION_API const char* crispasr_session_last_synth_error(crispasr_session* s);
 CRISPASR_SESSION_API char* crispasr_session_translate_text(crispasr_session* s, const char* text, const char* src_lang,
                                                            const char* tgt_lang, int max_tokens);
 CRISPASR_SESSION_API void crispasr_session_translate_text_free(char* text);
+// Streaming implementation: 0 unavailable, 1 rolling windows, 2 persistent
+// model caches, 3 text-prefix streaming. Model session must outlive its stream;
+// only one active stream/inference call per model session is supported.
+CRISPASR_SESSION_API int crispasr_session_stream_kind(crispasr_session* s);
 CRISPASR_SESSION_API crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int n_threads, int step_ms,
                                                                    int length_ms, int keep_ms, const char* language,
                                                                    int translate);
 CRISPASR_SESSION_API void crispasr_session_close(crispasr_session* s);
-CRISPASR_SESSION_API void* crispasr_punc_init(const char* model_path);
+// Standalone punctuation restoration. `model` is a --punc-model value: an
+// alias (auto|firered|fullstop|punctuate-all|pcs; auto-downloaded) or a .gguf
+// path of the FireRedPunc family or PCS - dispatched on general.architecture.
+// Returns NULL for anything that is not a loadable punctuation model.
+CRISPASR_SESSION_API void* crispasr_punc_init(const char* model);
 CRISPASR_SESSION_API const char* crispasr_punc_process(void* ctx, const char* text);
 CRISPASR_SESSION_API void crispasr_punc_free_text(const char* text);
 CRISPASR_SESSION_API void crispasr_punc_free(void* ctx);
@@ -773,11 +852,28 @@ CRISPASR_SESSION_API int crispasr_session_set_min_speech_tokens(crispasr_session
 CRISPASR_SESSION_API int crispasr_session_set_length_scale(crispasr_session* s, float scale);
 CRISPASR_SESSION_API int crispasr_session_set_best_of(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);
+// Auto-chunking controls for long audio (issue #574).
+// enabled: 1 = enable, 0 = disable, < 0 = reset to default / env var.
+// chunk_seconds: > 0 sets chunk window in seconds; <= 0 resets to default (30 s).
+CRISPASR_SESSION_API int crispasr_session_set_autochunk(crispasr_session* s, int enabled, int chunk_seconds);
+// Piece-proportional token budget for chunked audio (issue #574).
+// rate > 0: each piece gets max(minimum, round(rate * piece_duration_seconds)).
+// If an explicit flat cap was set via crispasr_session_set_max_new_tokens, it acts as an upper ceiling.
+// rate <= 0 disables dynamic token budgets.
+CRISPASR_SESSION_API int crispasr_session_set_max_new_tokens_per_second(crispasr_session* s, float rate, int minimum);
 CRISPASR_SESSION_API int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty);
 CRISPASR_SESSION_API int crispasr_session_set_beam_size(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_return_logits(crispasr_session* s, int enable);
 CRISPASR_SESSION_API int crispasr_session_set_grammar_text(crispasr_session* s, const char* gbnf_text,
                                                            const char* root_rule, float penalty);
+// No end-of-text until the grammar is complete (whisper; off by default).
+CRISPASR_SESSION_API int crispasr_session_set_grammar_strict(crispasr_session* s, int strict);
+// log P(text | audio) for each candidate text, teacher-forced; the audio is
+// encoded once (whisper only; returns -10 for other backends).
+CRISPASR_SESSION_API int crispasr_session_score_texts(crispasr_session* s, const float* pcm, int n_samples,
+                                                      const char* language, const char* initial_prompt,
+                                                      const char** texts, int n_texts, float* out_logprobs,
+                                                      int* out_n_tokens);
 CRISPASR_SESSION_API int crispasr_session_set_fallback_thresholds(crispasr_session* s, float entropy_thold,
                                                                   float logprob_thold, float no_speech_thold,
                                                                   float temperature_inc);

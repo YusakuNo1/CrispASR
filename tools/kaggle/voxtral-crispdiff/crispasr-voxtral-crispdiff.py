@@ -13,7 +13,7 @@
 # kh.build_heartbeat so the run is pollable mid-flight via the HF progress mirror
 # cstr/crispasr-kaggle-progress and RSS/free-GB are visible before any OOM/ENOSPC.
 #
-# Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
+# Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache.
 # GPU + Internet + ~18 GB disk (ref model 8 GB + F16 GGUF 8 GB → /tmp).
 
 # ─────────────────────────── cell 1 (code) ───────────────────────────

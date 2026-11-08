@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-raon-roundtrip",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-raon-roundtrip",
   "title": "crispasr-raon-roundtrip",
   "code_file": "raon_roundtrip.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1s4/crispasr-hf-token",
-    "chr1s4/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

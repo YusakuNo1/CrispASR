@@ -26,6 +26,9 @@ fi
 export CRISPASR_MODEL_WHISPER="${CRISPASR_MODEL_WHISPER:-$_whisper_default}"
 unset _whisper_cache _whisper_default
 
+# hikari: simultaneous speech translation; Silero next to the model (as -m auto puts it).
+export CRISPASR_MODEL_HIKARI="${CRISPASR_MODEL_HIKARI:-$CRISPASR_MODELS_DIR/hikari-medium-f16.gguf}"
+
 # Tiron (#295): Whisper large-v3 + inline <|speakerN|> markers (legacy ggml bin).
 export CRISPASR_MODEL_TIRON="${CRISPASR_MODEL_TIRON:-$CRISPASR_MODELS_DIR/tiron-q4_k.bin}"
 
@@ -55,6 +58,12 @@ export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohe
 # the names the script already falls back to.
 export CRISPASR_KOKORO_MODEL="${CRISPASR_KOKORO_MODEL:-$CRISPASR_MODELS_DIR/kokoro-82m-q8_0.gguf}"
 export CRISPASR_KOKORO_VOICE="${CRISPASR_KOKORO_VOICE:-$CRISPASR_MODELS_DIR/kokoro-voice-af_heart.gguf}"
+
+# Phonon-2: explicit/auto C ABI and CLI wiring, repeated-call and English-only LID guards.
+export CRISPASR_MODEL_PHONON2="${CRISPASR_MODEL_PHONON2:-$CRISPASR_MODELS_DIR/phonon2-q8_0.gguf}"
+
+# Index-Echo requires a same-cohort index-echo-2b-decoder companion beside this file.
+export CRISPASR_MODEL_INDEX_ECHO="${CRISPASR_MODEL_INDEX_ECHO:-$CRISPASR_MODELS_DIR/index-echo-2b-f16.gguf}"
 
 # ── Parakeet non-JA long-form guards (issues #350 / #385) ──
 # test-parakeet-longform builds its fixture from samples/jfk.wav; it only needs
@@ -108,6 +117,8 @@ export CRISPASR_MODEL_MIOTTS="${CRISPASR_MODEL_MIOTTS:-$CRISPASR_MODELS_DIR/miot
 export CRISPASR_MODEL_CONFUCIUS4_T2S="${CRISPASR_MODEL_CONFUCIUS4_T2S:-$CRISPASR_MODELS_DIR/confucius4-tts-t2s-q4_k.gguf}"
 export CRISPASR_MODEL_PIANO_TRANSCRIPTION="${CRISPASR_MODEL_PIANO_TRANSCRIPTION:-$CRISPASR_MODELS_DIR/piano-transcription-f16.gguf}"
 export CRISPASR_MODEL_BASIC_PITCH="${CRISPASR_MODEL_BASIC_PITCH:-$CRISPASR_MODELS_DIR/basic-pitch-f32.gguf}"
+export CRISPASR_MODEL_ONSETS_AND_FRAMES="${CRISPASR_MODEL_ONSETS_AND_FRAMES:-$CRISPASR_MODELS_DIR/onsets-and-frames-q4_0.gguf}"
+export CRISPASR_MODEL_HFT_TRANSFORMER="${CRISPASR_MODEL_HFT_TRANSFORMER:-$CRISPASR_MODELS_DIR/hft-transformer-q8_0.gguf}"
 export CRISPASR_MODEL_MT3="${CRISPASR_MODEL_MT3:-$CRISPASR_MODELS_DIR/mt3-f16.gguf}"
 export CRISPASR_MODEL_MOSS_TTS="${CRISPASR_MODEL_MOSS_TTS:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-q4_k.gguf}"
 export CRISPASR_MODEL_MOSS_TTS_CODEC="${CRISPASR_MODEL_MOSS_TTS_CODEC:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-codec.gguf}"
@@ -134,8 +145,10 @@ export CRISPASR_MODEL_GIGAAM_F16="${CRISPASR_MODEL_GIGAAM_F16:-$CRISPASR_MODELS_
 export CRISPASR_FIXTURE_GIGAAM="${CRISPASR_FIXTURE_GIGAAM:-$CRISPASR_MODELS_DIR/fixtures/gigaam-example.wav}"
 
 # ── Nemotron (streaming ASR) ──
-export CRISPASR_MODEL_NEMOTRON="${CRISPASR_MODEL_NEMOTRON:-$CRISPASR_MODELS_DIR/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf}"
+export CRISPASR_MODEL_NEMOTRON="${CRISPASR_MODEL_NEMOTRON:-$CRISPASR_MODELS_DIR/nemotron-3.5-asr-streaming-0.6b-f16.gguf}"
 export CRISPASR_MODEL_NEMOTRON_F16="${CRISPASR_MODEL_NEMOTRON_F16:-$CRISPASR_MODELS_DIR/nemotron-3.5-asr-streaming-0.6b-f16.gguf}"
+# Optional historical Q4/JFK diagnostic: set CRISPASR_MODEL_NEMOTRON_Q4 explicitly.
+# It must not inherit the F16 default and compare that model with itself.
 
 # ── LFM2-Audio ──
 export CRISPASR_MODEL_LFM2="${CRISPASR_MODEL_LFM2:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-q5_k.gguf}"

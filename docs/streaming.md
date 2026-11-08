@@ -1,8 +1,51 @@
 # Streaming & live transcription
 
+## Stateful streams from C and Dart
+
+`crispasr_session_stream_kind(session)` reports the implementation actually
+available for the loaded model: 0 unavailable, 1 repeated rolling windows,
+2 persistent model caches, 3 text-prefix streaming. A streaming model name or
+per-token callback alone does not imply persistent state across audio calls.
+
+The session C ABI now exposes Nemotron's cache-aware encoder/RNN-T stream and
+Qwen3-ASR's prefix rollback stream, as well as the existing Voxtral realtime
+stream. Nemotron accepts `language="de"` at stream creation and selects the
+German model prompt; its output omits language control tags. Nemotron groups
+incoming PCM into canonical backend steps: microphone packet sizes no longer
+change frontend normalization/context and therefore the transcript. Stock Qwen uses
+the SDK defaults (2-second chunks, first two chunks unfixed, five-token
+rollback); R2T2 GGUFs retain their adaptive recipe. Qwen re-encodes accumulated
+audio and does **not** retain encoder/KV caches across chunks. The shared model
+call is used by both the CLI and the session API.
+
+In Dart, inspect `session.streamingKind`, create `session.openStream(language:
+'de')`, feed **only new** 16 kHz mono float PCM, then `flush()` and `close()`.
+For Voxtral captions call `stream.setLiveDecode(true)` before the first feed.
+Updates from the common session API contain the cumulative utterance text,
+including for Voxtral whose underlying API produces consuming deltas. Stream
+errors propagate through Dart; long UTF-8 output is read without truncation.
+
+Keep the parent model session alive until its stream closes. Use only one
+stream/inference call at a time per model session. Nemotron and Qwen streams
+are finalized by flush; repeated flush is harmless and feeding afterwards
+fails. Open a new stream for the next utterance, retaining the loaded model.
+Parakeet TDT remains an offline recognizer used with buffered windows; a
+German routing label cannot constrain its decoder to German.
+
+Verification (no models needed): `cd flutter/crispasr && dart test
+ test/stream_protocol_test.dart`; native prefix state tests:
+`build/bin/test-qwen3-stream`. For German native integration, set
+`CRISPASR_LIB`, `CRISPASR_STREAM_MODEL` (Nemotron), `CRISPASR_STREAM_WAV`
+(16 kHz mono PCM16 German fixture) and run `dart test
+ test/native_stream_live_test.dart`. This checks partial output before flush,
+irregular feed partitions, finalization and reopening on the same model.
+
+
 CrispASR supports three streaming modes — pipe input, microphone
 capture, and continuous live mode — and per-token confidence output.
 All work with every supported backend.
+A fourth, [live transcription + translation](#live-transcription--translation---live-translate),
+adds a text translator behind the recogniser.
 
 `--backend vibevoice-streaming -m auto` uses the model's native streaming
 protocol: fixed 2.93-second chunks, 0.53-second lookahead, and one persistent
@@ -224,6 +267,395 @@ crispasr --live --monitor -m model.gguf
 chunk. `--monitor` adds visual feedback so you can tell processing
 state at a glance.
 
+## Live transcription + translation (`--live-translate`)
+
+Listen, transcribe, and translate sentence by sentence — all local, two
+models: a streaming recogniser and a text translator behind it.
+
+```bash
+# German speech in, German + English text out:
+crispasr --live-translate -l de --tr-tl en \
+    -m auto --backend parakeet --translate-model hy-mt2
+
+# Same pipeline on a pipe instead of the microphone (a live feed, or a file
+# replayed in real time). --stream-realtime tells it the input is live:
+ffmpeg -re -i talk.wav -f s16le -ar 16000 -ac 1 - 2>/dev/null \
+  | crispasr --stream --stream-realtime -l de --tr-tl en \
+      -m auto --backend parakeet --translate-model hy-mt2
+```
+
+On a terminal, finished sentence pairs scroll up and the sentence still being
+spoken is redrawn dimmed below them, with a draft translation:
+
+```
+de  Wir haben heute drei Punkte auf der Tagesordnung.
+en  Today we have three points on the agenda.
+de  Zuerst sprechen wir über die Ergebnisse des                    ← still open
+en  First we talk about the results of                             ← draft
+```
+
+When stdout is not a terminal you get one `[de] …` / `[en] …` pair per
+sentence. With `--stream-json` you get events instead (below).
+
+`-l` is the spoken language and is required. `--tr-tl` is the language to
+translate into (default: `en`, or `de` when the speech is English).
+`--translate-model` takes `auto` (m2m100-418M, 100 languages, ~500 MB), a
+registry name — `opus-mt-<src>-<tgt>` (Opus-MT, ~85 MB, the fastest; 24
+directions, see [Opus-MT language pairs](#opus-mt-language-pairs)), `hy-mt2` (Hy-MT2-1.8B, ~1.1 GB, the best speed-for-quality LLM) or
+`index-translate` (Index-Translate-2B, ~1.3 GB) — or a translator GGUF. The
+kind of translator is detected from the file
+(`--translate-backend m2m100|marian|madlad|llm` overrides); see the table below.
+Passing `--translate-model` on a plain `--stream` / `--mic` run enables
+translation there too; `--live-translate` is the preset that also implies
+`--mic`, `--vad`, and `--stream-realtime`.
+
+### How it stays close to the speaker
+
+Translating only when an utterance ends (a `final`) waits for a pause — on a
+lecture that is tens of seconds. Translating every partial re-translates text
+that is still changing. This mode commits **sentences**:
+
+- A sentence is committed as soon as the recogniser has moved past it and its
+  terminator has been written before — by the previous partial or the one
+  before that (a recogniser undecided between "vorstellen. Er kommt" and
+  "vorstellen, er kommt" flips between them on alternate partials). That second condition
+  matters: recognisers put a period at the cut end of every partial
+  (`Ich gehe.` → `Ich gehe nach Hause.`), and it must not split the sentence.
+- A committed sentence is **final**. It is translated once and never revised —
+  not by later partials and not when the utterance closes.
+- The open remainder is re-translated as a dimmed draft
+  (`--no-translate-drafts` turns that off). If it already contains a
+  finished sentence that is only waiting to be confirmed, exactly that
+  sentence is translated ahead of time, so its translation is ready the
+  moment it commits (10 of 11 sentences on the test clip).
+- Translation runs on its own thread, so a slow translator delays the
+  translation line and never the recogniser.
+- Each step decodes only the audio that is not yet committed. With a
+  recogniser that has word timestamps (parakeet) the boundary is the end
+  time of the last committed word and decoding starts 0.3 s before it;
+  without them it is estimated from when each word first showed up, and
+  decoding starts ~1.5 s earlier so the end of the committed text is in view
+  to line up against. Either way a step no longer re-decodes the whole
+  utterance (median decoded per step on the test clip: 5.5 s estimated,
+  3.5 s with timestamps).
+- A pause half as long as `--stream-final-on-silence-ms` commits the open text
+  if it ends a sentence, instead of waiting for the next word or the final.
+- If the open sentence grows past ~9 s of audio, its stable part is committed
+  at a clause boundary so it stops being re-decoded. That piece is settled
+  *text*, not a translation unit: it is held and translated together with
+  the rest of its sentence (translated cold, "…auf den starken Export nach |
+  Frankreich und Italien zurückzuführen." came out as "…due to strong
+  exports." / "Caused by France and Italy.").
+- With `--stream-realtime`, a step that ran long reads the whole backlog at
+  once rather than working through it one `--stream-step` at a time. (The
+  Windows side — `PeekNamedPipe`, and virtual-terminal mode for the live
+  view — is written but has not been run on Windows.)
+
+### Incremental sessions (`--stream-session`)
+
+`--stream-session` hands the recogniser only each step's *new* audio through
+its own stateful session (`nemotron`, `qwen3`, `vibevoice-streaming`) instead
+of re-decoding the open speech. A turn ends when the speaker has been silent
+for `--stream-final-on-silence-ms`, judged from the audio (VAD over the last
+3 s); without a VAD model, when no text has arrived for 2.5 s.
+
+For nemotron use the CPU (`-ng`): its chunks are 320 ms of audio, far too
+small for a GPU to pay off. Since 2026-10-06 a session runs one graph per
+chunk with its state kept in backend memory and caches the attention's K/V
+projections and position table instead of recomputing them for all 56 cached
+frames in every layer:
+
+| nemotron q4_k, 50 s German clip, load ~8 | Compute | Per 320 ms chunk |
+|---|---|---|
+| CPU, before (one graph per layer, host caches) | 52.6 s | — |
+| CPU, now | 24.5 s | 67 ms |
+| GPU (Metal), now | not faster than before | 148 ms |
+
+So it is real time on CPU with cores to spare it, and it follows the speaker
+closely while it has them (translations 0.44–0.76 s after the deciding audio
+in the first 22 s of a run). It is also CPU-bound: when unrelated jobs took
+the cores mid-run it fell 17–25 s behind, where parakeet on the GPU held
+~0.8 s at a load of 49. Transcript quality is below parakeet's ("bisher
+hinfragen" for "bis hierhin Fragen", sentences run together). Recommendation
+unchanged: parakeet for live use on a shared machine; nemotron on CPU when
+the machine is yours and the lowest algorithmic latency matters.
+
+### Which models
+
+| Recogniser | Notes |
+|---|---|
+| `parakeet` (parakeet-tdt-0.6b-v3, 25 European languages) | **Use this.** Accurate, punctuated, stable partials. Not a streaming model — the open sentence is re-decoded each step — so on a laptop expect a second or two behind the speaker. |
+| `moonshine-de` (61 M, German only, CC-BY-NC-SA) | Several times cheaper per step, so it keeps up on a busy machine. Partials are less stable (punctuation flips, so commits come later), and it **stops at the first longer pause in a clip** and drops the rest. |
+| `nemotron` (39 languages, cache-aware) | A true streaming model whose cost follows the new audio only. Real time on CPU with `--stream-session -ng`; CPU-bound and less accurate than parakeet — see [Incremental sessions](#incremental-sessions---stream-session). |
+| `canary` | Can translate speech directly (`-tl en`), but one decode gives the transcript *or* the translation, not both. |
+
+| Translator | Per sentence (de→en) | Notes |
+|---|---|---|
+| **`opus-mt-de-en` / `opus-mt-en-de`: Opus-MT** (`marian` backend; ~75M parameters, q8_0 84 MB, CC-BY-4.0; [`cstr/opus-mt-de-en-GGUF`](https://huggingface.co/cstr/opus-mt-de-en-GGUF), [`cstr/opus-mt-en-de-GGUF`](https://huggingface.co/cstr/opus-mt-en-de-GGUF)) | **23–118 ms, median ~45** (load 7–10; m2m100 in the same interleaved runs: 125–922 ms, median 315–650) | **Fastest by a wide margin, and better text than m2m100** ("new colleague", "furniture packers"). One model per language pair: `--translate-backend marian` picks it from `-l` / `--tr-tl`; other pairs need `models/convert-marian-to-gguf.py`. At f16 the output equals the reference implementation exactly, greedy and with beam 4 (14/14 de→en, 8/8 en→de); the q8_0 file that is downloaded by default matches on 12/14 and 8/8 (the rest differ in wording). |
+| `m2m100` (418M, the `auto` default) | 92–392 ms, median 210 | Fast, mediocre: dropped "Danach", wrote "colleagues" for one colleague. Greedy only (`--translate-beam 1`, the default here) — beam search is cached since 2026-10 but still costs several greedy decodes. |
+| **`hy-mt2`: Hy-MT2-1.8B** (`tencent/Hy-MT2-1.8B-GGUF`, Q4_K_M 1.1 GB, Apache-2.0, 33 languages) | 370–910 ms, median 570 | **Best trade-off measured.** Clearly better translations, and the translation is shown as it is generated. `--translate-model hy-mt2`, or pass any GGUF: a file that is none of the built-in translators is run as a translation chat LLM. |
+| **`index-translate`: Index-Translate-2B** (`IndexTeam/Index-Translate-2B-GGUF`, Q4_K_M 1.3 GB, Apache-2.0, 150 languages) | 476–1100 ms, median 692 | Best translations of the lot ("a warm welcome to today's meeting", "as early as 7 a.m."), a little slower than Hy-MT2. Needed a loader fix: its GGUF appends a multi-token-prediction block the vendored Qwen3.5 loader took for a recurrent layer. |
+| `madlad` (MADLAD-400 3B, q4_k 2 GB) | 0.75–2.8 s (load ~6–8) | Good translations, too slow to keep up sentence by sentence; also slows the recogniser (same GPU). |
+| `m2m100` with `wmt21-dense-24-wide-x-en` (4.7B, q4_k 2.7 GB) | 1–6.5 s, first two 13–15 s (load ~6–8) | Very good translations, not live: the display ran 20–35 s behind. |
+
+The first three rows are from one session on 2026-10-06 at load average 4–5
+(the quietest this machine got), same 50 s German clip, parakeet-v3
+recogniser; every run kept real time (94–97 steps of 500 ms) and produced all
+11 sentences. Time from the audio that decided a sentence to its translation
+on screen: m2m100 0.32–1.7 s (median 0.95), Hy-MT2 0.62–1.7 s (median 1.1),
+Index-Translate 0.73–1.7 s (median 1.1).
+
+A translation LLM only works with the instruction it was trained on.
+`--translate-prompt hy-mt2` and `--translate-prompt index-translate` are built
+in (the second is chosen automatically for a file named like the model,
+otherwise the first); anything else is taken as a template —
+`--translate-prompt 'Translate from {src} to {tgt}:\n{text}'`. A reasoning
+model's `<think>` block is removed from the output.
+On Apple Silicon Opus-MT runs on the CPU and m2m100 on the GPU by default; the LLM
+translators need the GPU (Hy-MT2 on CPU: ~8.5 s per sentence against ~0.6 s,
+`CRISPASR_TRANSLATE_CPU=1`, load 12–27). `CRISPASR_M2M100_GPU=1` / `=0`
+forces either device for m2m100 and Opus-MT; measured in interleaved pairs at load 10–50:
+
+| | CPU | GPU |
+|---|---|---|
+| Opus-MT q8_0, translator alone (warm, 4 pairs) | median 81–128 ms | 60–76 ms |
+| Opus-MT q8_0, in the live pipeline (3 pairs) | **median 38–69 ms** | 98–118 ms |
+| m2m100 q8_0, translator alone (4 pairs) | median 307–476 ms | 203–288 ms |
+| m2m100 q8_0, in the live pipeline (3 pairs) | median 195–251 ms, worst sentence 0.3–2.2 s | median 174–274 ms, worst sentence 0.5–0.7 s |
+
+Tokens were identical on both devices in every isolated run. Alone, the GPU
+wins because it is immune to the CPU contention on this machine. In the live
+pipeline the recogniser already owns the GPU, and each of a sentence's ~20
+single-token decoder steps queues behind it — for Opus-MT, whose step is
+~4 ms of CPU work, that queueing costs more than the step. So Opus-MT stays
+on the CPU. m2m100 was a draw on the median at that load, so it was
+repeated at load 4–7: alone the GPU is ~20% faster (median 134–140 ms
+against 158–186, 3 of 3 pairs), and in the live pipeline ~9% (summed
+9.67 s against 10.59 s over 4 pairs, 3 of 4 in its favour), with identical
+tokens for greedy and beam 5. m2m100 therefore defaults to the GPU;
+`CRISPASR_M2M100_GPU=0` puts it back on the CPU.
+
+Where an Opus-MT decoder step goes (`CRISPASR_M2M100_BENCH=1`, CPU): graph
+build 0.11 ms, allocation 0.15 ms, compute 3.5–4 ms, read-back 0.04 ms.
+The graph is rebuilt per token, but that is ~7% of the step; more than half
+of the compute is the output projection over the 58k-word vocabulary.
+
+### Opus-MT language pairs
+
+Hosted at `cstr/opus-mt-<src>-<tgt>-GGUF`, CC-BY-4.0. `--translate-backend
+marian` picks the model from `-l` / `--tr-tl`. A pair without a model of its
+own, where both halves exist, goes through English in two hops (de↔tr: no
+Opus-MT model was ever released; fr→ar and the like). Every f16 file equals
+the reference implementation on 8 test sentences, greedy and with beam 4.
+q8_0 is what is downloaded, except de→ar.
+
+| | into de | into en | other |
+|---|---|---|---|
+| **de** | — | 12/14 | fr 7/8 · it 8/8 · es 7/8 · ar **f16** (q8_0 3/8) · he 8/8 · tr via en |
+| **en** | 8/8 | — | fr 7/8 · it 7/8 · es 8/8 · ar 8/8 · he 8/8 · tr 8/8 (tc-big, 262 MB) |
+| **fr** | 8/8 | 8/8 | via en |
+| **it** | 6/8 | 7/8 | via en |
+| **es** | 7/8 | 8/8 | via en |
+| **ar** | 8/8 | 8/8 | via en |
+| **he** | 7/8 | 8/8 (tc-big, 265 MB) | via en |
+| **tr** | via en | 8/8 | via en |
+
+The numbers are q8_0 sentences identical to the reference, greedy (the
+others differ in wording). German→Turkish through English, live: "Wir haben
+heute drei Punkte auf der Tagesordnung." → "Bugün gündemde üç madde var."
+
+**Quantisation of Opus-MT.** q8_0 differs from f16 on 2 of 14 German
+sentences and q4_k on 6 of 14, which looks alarming next to the recognisers
+and is not: the differences are "departs" / "leaves", "reduce taxes" /
+"lower taxes", "on 3 October in Berlin" / "in Berlin on 3 October".
+Translation has many near-tied continuations, so a small logit change picks
+another valid sentence where a recogniser would still pick the same word.
+Keeping the shared embedding (also the output projection) at full precision
+was measured and does not pay: q8_0 unchanged at 12/14 for 111 MB instead of
+84 MB, q4_k 10/14 instead of 8/14 for 89 MB instead of 47 MB. q8_0 is what
+ships.
+Drafts of the open sentence switch themselves off while committed sentences
+take more than ~500 ms to translate — a slow translator would still be busy
+with a draft when the next real sentence arrives.
+
+Recogniser measurements, 2026-10-05/06 on an M1 (16 GB, Metal), the same clip.
+**The machine was running unrelated heavy jobs for most of it (load average
+4–66); nothing here was measured on an idle machine:**
+
+- parakeet-v3 q4_k at load 4–5: median step cost ~300 ms for a 500 ms step
+  (~240 ms recogniser for ~3.5 s of open audio with word-timestamp
+  boundaries, ~65 ms VAD). At load 10–20 the same run falls 2–4 s behind and
+  long sentences get committed at clause boundaries.
+- parakeet decode cost: 32–75 ms per second of audio at load ~5 (q4_k and
+  q8_0 the same), 100–480 ms under load.
+- moonshine-de q4_k: translation 0.5–1.7 s after the deciding audio, median
+  ~1.0 s (load 14–18). It transcribes up to the first longer pause of a clip
+  and drops what follows (15 s clip: the sentence after a 0.7 s pause is
+  missing; the same sentence alone transcribes fine), so it needs short
+  decode regions — try `--stream-final-on-silence-ms 400`.
+- nemotron q4_k: usable again on Metal after two fixes (the ggml fork had
+  lost the `_hp` matmul kernel, which aborted every non-streaming run; the
+  one-shot GPU stream cache resubmitted cached graphs and produced word
+  salad after ~4.5 s). Speed is still not there: a 50 s clip took 57–106 s in
+  streaming mode under load 7–19. Its `<de-DE>` language-tag tokens are now
+  stripped from text, word lists and the session stream.
+
+### Two speeds: a fast pass now, a better translation a few seconds later
+
+`--translate-revise MODEL` adds a slow pass. The fast pass works as above
+(sentence by sentence, usually Opus-MT or m2m100). The slow pass collects the
+committed sentences into paragraphs — closed when the utterance ends, or after
+four sentences of continuous speech — and re-translates each paragraph as one
+unit with a translation LLM, so every sentence is translated with its
+neighbours as context:
+
+```bash
+crispasr --live-translate -l de --tr-tl en -m auto --backend parakeet \
+    --translate-backend marian --translate-revise hy-mt2
+```
+
+The result replaces the fast translations of those sentences: a `revision`
+event in JSON (`sentence_ids`, `text`, `translation`, `mt_ms`, `lag_ms`), a
+green ✓ block in the terminal. It runs on its own low-priority thread, starts
+a paragraph only while the fast translator has nothing waiting, and drops the
+oldest paragraph (`revision_skipped`) if more than three are queued, so it can
+lag but never pile up.
+
+Measured on the 50 s German clip, Hy-MT2 as the slow pass (chrF against a
+reference translation; 2 runs each):
+
+| fast translator | fast only | after revisions | revision arrives |
+|---|---|---|---|
+| m2m100 | 79.8 / 79.1 | **81.9 / 81.9** | median 5–10 s after the audio |
+| Opus-MT | 82.5 / 82.5 | 80.1 / 80.1 | median 5–6 s |
+
+With m2m100 the revisions fix real errors ("our new colleagues. he comes" →
+"our new colleague to you. He comes"; "furniture packaging" → "furniture
+movers"; "Do you have questions until here?" → "… up to this point?"). Opus-MT
+is already good on this clean clip, and the lower score there is mostly the
+reference's spelled-out numbers against Hy-MT2's "12%", "October 3rd", "7 a.m."
+Load was 7–158 during these runs, so whether the slow pass slows the fast one
+down on a shared GPU is not settled (one pair showed it, one did not).
+
+**Re-transcribing too** (`--translate-revise-asr MODEL`, with
+`--translate-revise`): a second, slower recogniser re-reads each finished
+utterance from its audio before the slow translator sees it; the paragraph is
+then the whole utterance, and the revision carries the new source text
+(`source_revised`, `asr_ms`; a ✓ source line in the terminal).
+
+```bash
+crispasr --live-translate -l de --tr-tl en -m auto --backend parakeet \
+    --translate-backend marian --translate-revise hy-mt2 --translate-revise-asr canary
+```
+
+Measured on the 50 s clip with canary-1b-v2 re-transcribing (2 runs each,
+m2m100 as the fast translator):
+
+| fast recogniser | German changed by the slow pass | chrF fast → after revisions |
+|---|---|---|
+| parakeet-v3 | 0 of 3 utterances (it was already right, 0.9 % WER) | 78.4 → 80.2 |
+| moonshine-de | 2 of 3 utterances | 76.7 → 80.2 |
+
+The gain with moonshine-de is segmentation, not words: its "Bitte denken Sie
+daran. Ihre Unterlagen rechtzeitig einzupacken? Weil die Möbelpacker …" came
+back from canary as one sentence with commas, which the translator then
+handled. Canary took 0.9–6.8 s per utterance on the M1, so revisions arrived
+3–15 s after the audio.
+
+**In the terminal**, with a slow pass the view is in place by default
+(`--translate-view inplace|scroll`): the transcript lives on the alternate
+screen and is redrawn, so a revision replaces the fast sentences where they
+stand (green, ✓) instead of being appended below them; when the stream ends,
+the final transcript is printed to the normal screen. In JSON every revision
+carries `final_until_sentence`: all sentences up to that id are final
+(revised, or skipped by the backlog limit). `--translate-revise-backlog N`
+(default 3) sets how many paragraphs may wait for the slow pass before the
+oldest is dropped.
+
+A caveat: an LLM reviser can add what was not said. On a clip cut off
+mid-sentence ("Die Umsätze sind … um zwölf.") Hy-MT2 wrote "Sales are 12%
+**lower** …", where the fast m2m100 stayed literal. Paragraphs normally end
+with the utterance, so this is rare, but the revision is a better reading,
+not a guaranteed one.
+
+### One model instead of two: hikari (English speech → de / ja / ru)
+
+`sbintuitions/hikari-medium` (MIT) translates straight from audio and decides
+every 80 ms whether to emit the next word or wait, so text appears while the
+speaker talks — no recogniser, no sentence commits, no drafts:
+
+```bash
+crispasr --stream --backend hikari -m auto -l en --tr-tl de   # live, mic or stdin
+crispasr --backend hikari -m auto -l en -tl ja -f talk.wav    # a file
+```
+
+`-m auto` fetches `cstr/hikari-medium-GGUF` (f16, 1.5 GB) and the Silero VAD
+it needs: Silero's speech probability raises the policy's wait penalty, and
+without it the model hardly ever emits. The f16 equals the reference
+implementation (161/161 stream steps on jfk); q8_0 (`-m auto:q8_0`, 873 MB)
+changed one German sentence of a 27 s clip on Metal. Speed, jfk.wav en→de:
+
+| device | f16 | q8_0 |
+|---|---|---|
+| NVIDIA GPU (CUDA, Kaggle) | 234–258 ms per audio-second | 193–207 ms |
+| CPU (Kaggle x86) | 2775 ms | 1684 ms |
+| Apple M1, Metal | ~1800 ms | ~2100 ms |
+
+So on an NVIDIA GPU it is 4–5× faster than real time, and the CUDA runs gave
+the reference text exactly with q8_0 too; on an M1 it is not real time.
+English speech only; for German speech use the pipeline above.
+
+Other models people ask about (Hugging Face tags `speech-translation`,
+`streaming-translation`, `simultaneous-translation`, looked at 2026-10-05,
+none of these run here unless stated):
+
+- `sbintuitions/hikari-medium` — **runs here** (`--backend hikari`, see
+  below): causal-Whisper simultaneous speech translation, English speech
+  only (→ de/ja/ru), plus English ASR.
+- `netease-youdao/Confucius4-T3PO` — append-only streaming text translation
+  with KV-cache reuse, the ideal protocol for this mode; Qwen2.5-14B, zh↔en,
+  smallest GGUF 10.5 GB.
+- `febilly/Hy-MT2-1.8B-StreamRevise(-v4)` — Hy-MT2 fine-tuned to revise its
+  own previous translation as the ASR hypothesis changes (no flicker);
+  trained on zh/en/ja only.
+- Index-Echo S2TT (`--backend index-echo`, already in this repo) — direct
+  speech→text translation; upstream documents Chinese speech with
+  English/Japanese/Spanish output.
+- `unswnlporg/tor-simt-llama-3-8b-*-de-en` (8B), Phi-4-multimodal, GigaChat
+  audio: too large for a laptop next to a recogniser.
+
+`CRISPASR_STREAM_TIMING=1` prints one line per step (audio taken in, VAD
+cost, decode cost, seconds decoded) — a step that costs more than the audio
+it took in is a stream falling behind. The closing
+`crispasr[translate]: …` line reports translate time, lag behind the audio,
+and how many partials were discarded because they did not line up with the
+committed text.
+
+### Events (`--stream-json`)
+
+The stream's own `partial` / `final` / `silence` events are still emitted,
+plus:
+
+| `type` | When | Fields |
+|---|---|---|
+| `sentence` | A sentence was committed. | `utterance_id`, `sentence_id`, `text`, `t` |
+| `translation` | Its translation is ready. | `utterance_id`, `sentence_id`, `text`, `translation`, `source_lang`, `target_lang`, `t`, `mt_ms`, `lag_ms` |
+| `translation_partial` | Draft translation of the open remainder: of the words the last two partials agree on, without the recogniser's provisional last word and full stop (`CRISPASR_LT_DRAFT_AGREE=0`: the whole remainder; that is rewritten 2–13× more often). May change or never be followed up. `stable` is the start of `translation` (whole words) that the previous draft of the same sentence agreed on; it is rewritten far less often (normalized erasure 0.16–0.18 against 1.17–1.48 for the whole draft, German→English with Opus-MT). Show only `stable` for a calm display, all of `translation` for the earliest one. The terminal view prints `stable` normally and the rest dimmed. | `utterance_id`, `text`, `translation`, `stable`, `t`, `mt_ms`, `lag_ms` |
+
+`t` is the stream time of the step that decided the event; `lag_ms` is how
+long after that audio arrived the translation was ready. `sentence_id` counts
+up across the whole stream. Two things differ from plain `--stream-json`
+while translating: `partial.text` covers only the region still being decoded
+(not the whole utterance), and `final.text` is the utterance **as committed**
+— its sentences joined — rather than a fresh re-decode, so `--stream-final-mode`
+has no effect.
+
+Not done here: `--punc-model` is switched to `--stream-punc partial`
+automatically (sentences are found in partials); there is no speaker
+labelling on `sentence` events. The first Ctrl+C ends the stream cleanly
+(the sentence in progress is committed and translated); a second one kills
+the process.
+
 ## Per-token confidence
 
 ```bash
@@ -335,6 +767,14 @@ one update.
 For native streaming-architecture backends (`voxtral4b`,
 `moonshine-streaming`, `kyutai-stt`, `nemotron`), the encoder also runs
 incrementally — the sliding window cost is lower than for batch backends.
+
+### German Moonshine ONNX
+
+The optional `moonshine-onnx` backend supports the official German Streaming
+Tiny/Small checkpoints through pinned five-graph exports, with persistent
+frontend state and bounded encoder updates. The original Tiny two-graph export
+uses buffered recognition. See [German Moonshine deployment](german-moonshine.md)
+for licenses, SDK setup, bundle layout, streaming semantics and replay tests.
 
 ### Nemotron streaming (cache-aware FastConformer)
 

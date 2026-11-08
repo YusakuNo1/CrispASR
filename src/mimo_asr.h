@@ -82,8 +82,18 @@ void mimo_asr_free(struct mimo_asr_context* ctx);
 void mimo_asr_set_n_threads(struct mimo_asr_context* ctx, int n_threads);
 
 // Override the default transcription instruction. Pass NULL or "" to
-// clear and resume the default ("Please transcribe this audio file").
+// clear and resume the selected language's upstream instruction (Chinese
+// for "zh", "Please transcribe this audio file" otherwise).
 void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt);
+
+// Set the upstream ASR language bias. "en" and "zh" select the official
+// <english>/<chinese> assistant tags; NULL, "", "auto", and unsupported
+// values leave the tag empty for model-side language detection.
+void mimo_asr_set_language(struct mimo_asr_context* ctx, const char* language);
+
+// Exposed for prompt-contract tests and callers that need to inspect the
+// language mapping without loading a model.
+const char* mimo_asr_language_tag(const char* language);
 
 // Beam search. 1 = greedy (default). >1 = beam search via
 // core_beam_decode replay-from-prefix (§167f, needs Kaggle for testing).

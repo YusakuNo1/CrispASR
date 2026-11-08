@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-parakeet-ja-autochunk-10s",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-parakeet-ja-autochunk-10s",
   "title": "CrispASR Parakeet JA Autochunk 10s",
   "code_file": "crispasr-parakeet-ja-chunk-verify.py",
   "language": "python",
@@ -8,7 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "competition_sources": [],
-  "dataset_sources": ["chr1str/crispasr-hf-token"],
+  "dataset_sources": ["${KAGGLE_ACCOUNT}/crispasr-hf-token"],
   "kernel_sources": [],
   "model_sources": []
 }

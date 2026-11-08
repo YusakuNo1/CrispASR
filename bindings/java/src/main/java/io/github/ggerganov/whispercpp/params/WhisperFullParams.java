@@ -19,10 +19,12 @@ public class WhisperFullParams extends Structure {
 
     public WhisperFullParams() {
         super();
+        setStringEncoding("UTF-8");
     }
 
     public WhisperFullParams(Pointer p) {
         super(p);
+        setStringEncoding("UTF-8");
     }
 
     /** Sampling strategy for whisper_full() function. */
@@ -293,8 +295,11 @@ public class WhisperFullParams extends Structure {
     /** User data for the abort_callback */
     public Pointer abort_callback_user_data;
 
+    private GgmlAbortCallback abort_callbackOwner;
+
     public void setAbortCallback(GgmlAbortCallback callback) {
-        abort_callback = CallbackReference.getFunctionPointer(callback);
+        abort_callbackOwner = callback;
+        abort_callback = callback == null ? null : CallbackReference.getFunctionPointer(callback);
     }
 
     /**
@@ -309,20 +314,32 @@ public class WhisperFullParams extends Structure {
     public Pointer logits_filter_callback_user_data;
 
 
+    private WhisperNewSegmentCallback new_segment_callbackOwner;
+
     public void setNewSegmentCallback(WhisperNewSegmentCallback callback) {
-        new_segment_callback = CallbackReference.getFunctionPointer(callback);
+        new_segment_callbackOwner = callback;
+        new_segment_callback = callback == null ? null : CallbackReference.getFunctionPointer(callback);
     }
+
+    private WhisperProgressCallback progress_callbackOwner;
 
     public void setProgressCallback(WhisperProgressCallback callback) {
-        progress_callback = CallbackReference.getFunctionPointer(callback);
+        progress_callbackOwner = callback;
+        progress_callback = callback == null ? null : CallbackReference.getFunctionPointer(callback);
     }
+
+    private WhisperEncoderBeginCallback encoder_begin_callbackOwner;
 
     public void setEncoderBeginCallbackeginCallbackCallback(WhisperEncoderBeginCallback callback) {
-        encoder_begin_callback = CallbackReference.getFunctionPointer(callback);
+        encoder_begin_callbackOwner = callback;
+        encoder_begin_callback = callback == null ? null : CallbackReference.getFunctionPointer(callback);
     }
 
+    private WhisperLogitsFilterCallback logits_filter_callbackOwner;
+
     public void setLogitsFilterCallback(WhisperLogitsFilterCallback callback) {
-        logits_filter_callback = CallbackReference.getFunctionPointer(callback);
+        logits_filter_callbackOwner = callback;
+        logits_filter_callback = callback == null ? null : CallbackReference.getFunctionPointer(callback);
     }
 
     /** Grammar stuff */
@@ -338,6 +355,9 @@ public class WhisperFullParams extends Structure {
 
     /** Top-N alternative-candidate tokens (0 = off) */
     public int alt_n;
+
+    /** With a grammar: no end-of-text until the grammar can be complete */
+    public CBool grammar_strict;
 
     @Override
     protected List<String> getFieldOrder() {
@@ -358,7 +378,7 @@ public class WhisperFullParams extends Structure {
                 "abort_callback", "abort_callback_user_data",
                 "logits_filter_callback", "logits_filter_callback_user_data",
                 "grammar_rules", "n_grammar_rules", "i_start_rule", "grammar_penalty",
-                "vad", "vad_model_path", "vad_params", "alt_n");
+                "vad", "vad_model_path", "vad_params", "alt_n", "grammar_strict");
     }
 
     public static class ByValue extends WhisperFullParams implements Structure.ByValue {

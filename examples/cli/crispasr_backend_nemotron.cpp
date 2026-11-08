@@ -8,11 +8,15 @@
 #include "whisper_params.h"
 
 #include "nemotron.h"
+#include "core/nemotron_text.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
+
+using core_nemotron_text::strip_lang_tags;
 
 class NemotronRealtimeSession final : public CrispasrRealtimeSession {
 public:
@@ -44,13 +48,14 @@ public:
                     state.self->first_token_ = false;
             }
             state.self->text_ += piece;
-            if (!state.self->text_.empty())
-                (*state.fn)(state.self->text_, false);
+            const std::string clean = strip_lang_tags(state.self->text_);
+            if (!clean.empty())
+                (*state.fn)(clean, false);
         };
         if (!nemotron_stream_append(stream_, samples, n_samples, flush, token_cb, &state))
             return false;
         if (flush)
-            on_text(text_, true);
+            on_text(strip_lang_tags(text_), true);
         return true;
     }
 
@@ -150,14 +155,16 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs;
-        seg.text = r->text ? r->text : "";
+        seg.text = strip_lang_tags(r->text ? r->text : "");
 
         // Words
         seg.words.reserve(r->n_words);
         for (int i = 0; i < r->n_words; i++) {
             const auto& w = r->words[i];
             crispasr_word cw;
-            cw.text = w.text;
+            cw.text = strip_lang_tags(w.text);
+            if (cw.text.empty())
+                continue; // the tag was a "word" of its own
             cw.t0 = w.t0;
             cw.t1 = w.t1;
             seg.words.push_back(std::move(cw));
@@ -220,12 +227,13 @@ public:
                     first_tok = false;
             }
             accumulated += piece;
-            if (!accumulated.empty())
-                on_text(accumulated.c_str(), false);
+            const std::string clean = strip_lang_tags(accumulated);
+            if (!clean.empty())
+                on_text(clean, false);
         };
         auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
         nemotron_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
-        on_text(accumulated.c_str(), true);
+        on_text(strip_lang_tags(accumulated), true);
     }
 
     std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params& params) override {

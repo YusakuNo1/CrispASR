@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-memory-recurrent.h"
+#include "qwen35-norm.h"
 
 llm_build_qwen35::llm_build_qwen35(const llama_model& model, const llm_graph_params& params)
     : llm_build_delta_net_base(params), model(model) {
@@ -23,7 +24,9 @@ llm_build_qwen35::llm_build_qwen35(const llama_model& model, const llm_graph_par
     ggml_tensor* inp_pos = build_inp_pos();
     ggml_tensor* inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // NextN/MTP blocks are loaded as extra decoder blocks but not executed in the main pass
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
+    for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor* inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -40,7 +43,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model& model, const llm_graph_par
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -286,10 +289,8 @@ ggml_tensor* llm_build_qwen35::build_layer_attn_linear(llm_graph_input_rs* inp, 
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
-    const float eps_norm = hparams.f_norm_rms_eps;
-
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = llama_qwen35::l2_norm(ctx0, q_conv);
+    k_conv = llama_qwen35::l2_norm(ctx0, k_conv);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

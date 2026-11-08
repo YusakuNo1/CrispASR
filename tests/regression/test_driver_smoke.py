@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -92,6 +94,7 @@ class ManifestSchemaTests(unittest.TestCase):
         gguf_required = {"repo", "revision", "file"}
         names_seen: set[str] = set()
         for entry in self.manifest["backends"]:
+            run_one.validate_exact_diff_transcript(entry)
             missing = always_required - set(entry)
             self.assertEqual(missing, set(),
                 f"backend missing keys: {missing} in {entry.get('name', '?')}")
@@ -178,6 +181,120 @@ class ManifestSchemaTests(unittest.TestCase):
                     f"{entry['name']}: in-repo sample {sample} not "
                     f"present; either drop the field or check the WAV in",
                 )
+
+
+class MandatoryDiffGateTests(unittest.TestCase):
+    def test_nightly_rejects_missing_declared_stages(self):
+        entry = dict(name="probe", backend_id="probe", sample="samples/jfk.wav",
+                     expected_transcript="correct words", fixture_ref_path="probe/ref.gguf",
+                     gguf=dict(repo="unused/model", file="model.gguf", revision="1" * 40),
+                     diff_thresholds={"encoder_output": 0.999, "ctc_logits": 0.999})
+        manifest = dict(backends=[entry], fixtures=dict(repo="unused/fixtures", revision="2" * 40))
+        for stages, expected_failures in [({"encoder_output": 1.0}, 1),
+                                          ({"unrelated_stage": 1.0}, 2),
+                                          ({"encoder_output": 1.0, "ctc_logits": 1.0}, 0)]:
+            with self.subTest(stages=stages), \
+                    mock.patch.object(run_one, "hf_download", return_value=Path("unused.gguf")), \
+                    mock.patch.object(run_one, "run_transcript", return_value="correct words"), \
+                    mock.patch.object(run_one, "run_diff", return_value=stages):
+                self.assertEqual(run_one.regression_for("probe", manifest, HERE,
+                                                       Path("unused-cli"), Path("unused-diff")), expected_failures)
+
+    def test_quantized_allowance_requires_exact_full_precision_control(self):
+        entry = next(b for b in json.loads((HERE / "manifest.json").read_text())["backends"]
+                     if b["name"] == "data2vec-base")
+        target = entry["expected_transcript"]
+        one_error = target.replace("SO A MY", "SO MY")
+        two_errors = target.replace("SO A MY", "SO")
+        manifest = dict(backends=[entry], fixtures=dict(repo="unused/fixtures", revision="2" * 40))
+        for quant, control, stages, failures in [
+                (one_error, target, {"ctc_logits": 0.999138}, 0),
+                (one_error, one_error, {"ctc_logits": 0.999138}, 1),
+                (two_errors, target, {"ctc_logits": 0.999138}, 1),
+                (one_error, target, {"ctc_logits": 0.998}, 1),
+                (one_error, target, {}, 1)]:
+            with self.subTest(quant=quant, control=control, stages=stages), \
+                    mock.patch.object(run_one, "hf_download", return_value=Path("unused.gguf")), \
+                    mock.patch.object(run_one, "verify_transcript_reference"), \
+                    mock.patch.object(run_one, "run_transcript", side_effect=[quant, control]) as transcript, \
+                    mock.patch.object(run_one, "run_diff", return_value=stages):
+                self.assertEqual(run_one.regression_for(entry["name"], manifest, HERE,
+                                                       Path("unused-cli"), Path("unused-diff")), failures)
+                self.assertEqual(transcript.call_args.kwargs["label"], "transcript-f16")
+
+    def test_retained_profile_outputs_pass_both_production_drivers(self):
+        # Execute only the real Kaggle function AST: importing the notebook
+        # would start installs/builds. No model execution or downloads here.
+        import ast
+        import time
+        import types
+        import tempfile
+        root = HERE.parents[1]
+        tree = ast.parse((root / "tools/kaggle/crispasr-regression.py").read_text())
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_validate")
+        entry = next(b for b in json.loads((HERE / "manifest.json").read_text())["backends"]
+                     if b["name"] == "data2vec-base")
+        receipt = json.loads((root / "docs/historical/data2vec-avx512-controls-2026-10-28.json").read_text())
+        for profile, row in receipt["profiles"].items():
+            for surface in ["raw_transcript", "fixed_language_pipeline", "nightly_invocation"]:
+                q4 = row["models"]["q4"][surface].splitlines()[-1]
+                f16 = row["models"]["f16"][surface].splitlines()[-1]
+                for control, expected in [(f16, True), (q4, profile == "avx2")]:
+                    with self.subTest(profile=profile, surface=surface, control=control), \
+                            tempfile.TemporaryDirectory() as temp, \
+                            mock.patch.dict(sys.modules, {"run_one": run_one,
+                                "huggingface_hub": types.SimpleNamespace(hf_hub_download=lambda **kw: str(Path(temp) / kw["filename"]))}), \
+                            mock.patch.object(run_one, "verify_transcript_reference"), \
+                            mock.patch.object(run_one, "run_transcript", side_effect=[q4, control]), \
+                            mock.patch.object(run_one, "run_diff", return_value=row["f16_stage"]["values"]):
+                        env = dict(Path=Path, time=time, sys=SimpleNamespace(path=SimpleNamespace(insert=lambda *args: None)), BACKENDS=[entry], MANIFEST={"fixtures": {
+                            "repo": "unused", "revision": "pin"}}, REPO=root, BUILD=Path(temp), HF_CACHE=Path(temp))
+                        exec(compile(ast.Module(body=[function], type_ignores=[]), "kaggle-validation", "exec"), env)
+                        result = env["run_validate"]()[0]
+                        self.assertEqual(result.get("ok"), expected, result)
+                        self.assertEqual(run_one.transcript_gate(entry, q4)[0]
+                                         and run_one.exact_diff_transcript_gate(entry, control)[0], expected)
+
+    def test_incomplete_exact_control_rejected_before_download(self):
+        entry = next(b for b in json.loads((HERE / "manifest.json").read_text())["backends"]
+                     if b["name"] == "data2vec-base")
+        for changes in [{"skip_diff": True}, {"diff_gguf": None},
+                        {"transcript_reference": None}, {"require_exact_diff_transcript": "true"}]:
+            with self.subTest(changes=changes), mock.patch.object(run_one, "hf_download") as download:
+                with self.assertRaises(ValueError):
+                    run_one.regression_for(entry["name"], dict(backends=[dict(entry, **changes)]),
+                                           HERE, Path("unused-cli"), Path("unused-diff"))
+                download.assert_not_called()
+
+    def test_index_echo_rejects_scale_failure_despite_perfect_cosine(self):
+        # Cosine divides magnitude out: a uniformly wrong scale can emit only
+        # PASS rows while the separate relative-L2 check makes the process fail.
+        proc = SimpleNamespace(returncode=1, stderr='', stdout=
+            '[PASS] mel_spectrogram shape=[128,100] cos_min=1.000000 cos_mean=1.000000\n'
+            '       relative_l2=151.00000000\n')
+        paths = [Path('unused')] * 4
+        with mock.patch.object(run_one.subprocess, 'run', return_value=proc):
+            with self.assertRaises(SystemExit):
+                run_one.run_diff(paths[0], 'index-echo', *paths[1:])
+            # Other backends keep their manifest-controlled cosine policy.
+            self.assertEqual(run_one.run_diff(paths[0], 'parakeet', *paths[1:]),
+                             {'mel_spectrogram': 1.0})
+
+
+class BilingualTranscriptTests(unittest.TestCase):
+    def test_srt_checks_all_cues_and_both_languages(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            model = Path(temp) / "model.gguf"
+            def emit(command, **kwargs):
+                prefix = Path(command[command.index("-of") + 1])
+                prefix.with_suffix(".srt").write_text(
+                    "1\n00:00:00,430 --> 00:00:04,570\n原文一。\nTranslation one.\n\n"
+                    "2\n00:00:05,230 --> 00:00:07,470\n原文二。\nTranslation two.\n")
+                return SimpleNamespace(stdout="Translation two.", stderr="", returncode=0)
+            with mock.patch.object(run_one.subprocess, "run", side_effect=emit):
+                text = run_one.run_transcript(Path("cli"), model, Path("audio"), srt=True)
+            self.assertEqual(text, "原文一。 Translation one. 原文二。 Translation two.")
 
 
 class DiffParserTests(unittest.TestCase):
@@ -283,6 +400,49 @@ class ThresholdEvaluationTests(unittest.TestCase):
         }
         p, f, m, e = run_one.evaluate_stage_thresholds(stages, self.THRESHOLDS)
         self.assertEqual(e, [("some_new_stage", 0.42)])
+
+    def test_default_gates_unlisted_stages(self):
+        """stage_threshold_default turns ungated extras into real gates; an
+        advisory_stages prefix keeps a stage INFO-only."""
+        stages = {
+            "encoder_output": 0.9999,
+            "encoder_output_ref_mel": 0.9999,
+            "mel_spectrogram": 0.96,
+            "encoder_layer_3": 0.9999,
+            "encoder_layer_18": 0.2,   # drifted -> must FAIL under the default
+            "pre_enc_c0": -0.16,       # advisory -> extra, not a failure
+        }
+        p, f, m, e = run_one.evaluate_stage_thresholds(
+            stages, self.THRESHOLDS, default=0.998, advisory=("pre_enc_c",))
+        self.assertEqual(f, [("encoder_layer_18", 0.2, 0.998)])
+        self.assertIn(("encoder_layer_3", 0.9999, 0.998), p)
+        self.assertEqual(e, [("pre_enc_c0", -0.16)])
+        # Without a default the same drift is only an extra (old behaviour).
+        p, f, m, e = run_one.evaluate_stage_thresholds(stages, self.THRESHOLDS)
+        self.assertEqual(f, [])
+        self.assertEqual(len(e), 3)
+
+    def test_transcript_gate(self):
+        """Shared by GH and the Kaggle suite: case/punctuation-only diffs pass
+        at the default zero tolerance; a word error fails; CJK gates on CER."""
+        e = {"expected_transcript": "And so, my fellow Americans, ask not."}
+        self.assertTrue(run_one.transcript_gate(e, "and so my fellow americans ask not")[0])
+        self.assertFalse(run_one.transcript_gate(e, "and so my fellow americas ask not")[0])
+        self.assertTrue(run_one.transcript_gate(dict(e, transcript_tolerance={"wer_max": 0.25}),
+                                                "and so my fellow americas ask not")[0])
+        zh = {"expected_transcript": "我们都是好朋友"}
+        self.assertFalse(run_one.transcript_gate(zh, "我们都是好朋")[0])
+
+    def test_manifest_gate_kwargs(self):
+        """Every stage_threshold_default in the manifest is a sane cosine, and
+        stage_gate_kwargs reads it."""
+        manifest = json.loads((Path(run_one.__file__).parent / "manifest.json").read_text())
+        gated = [b for b in manifest["backends"] if "stage_threshold_default" in b]
+        self.assertTrue(gated)
+        for b in gated:
+            kw = run_one.stage_gate_kwargs(b)
+            self.assertTrue(0.9 <= kw["default"] <= 1.0, b["name"])
+        self.assertEqual(run_one.stage_gate_kwargs({}), {"default": None, "advisory": ()})
 
     def test_end_to_end_against_canned_diff_output(self):
         """Wire parse_diff_stdout → evaluate_stage_thresholds against
@@ -633,6 +793,87 @@ class TtsBackendsSchemaTests(unittest.TestCase):
         overlap = asr_names & tts_names
         self.assertEqual(overlap, set(),
             f"tts_backends names collide with asr backend names: {overlap}")
+
+
+class AlignBackendsTests(unittest.TestCase):
+    """manifest.align_backends schema + the alignment comparator + align_for routing."""
+
+    WORDS = [{"word": "And", "start": 0.32, "end": 0.56}, {"word": "so", "start": 0.64, "end": 0.96}]
+
+    def test_manifest_align_entries_are_complete(self):
+        manifest = json.loads((HERE / "manifest.json").read_text())
+        entries = manifest.get("align_backends", [])
+        self.assertGreaterEqual(len(entries), 3)
+        names = [e["name"] for e in entries]
+        self.assertEqual(len(names), len(set(names)))
+        for e in entries:
+            for key in ("name", "backend_id", "gguf", "sample", "ref_text", "expected_words",
+                        "expected_source", "tolerance_s"):
+                self.assertIn(key, e, f"{e.get('name')}: missing {key}")
+            self.assertEqual(len(e["gguf"]["revision"]), 40, e["name"])
+            self.assertTrue((HERE.parent.parent / e["sample"]).exists(), e["sample"])
+            self.assertGreater(e["tolerance_s"], 0)
+            self.assertLess(e["tolerance_s"], 0.2)
+            ends = [w["end"] for w in e["expected_words"]]
+            self.assertTrue(all(w["start"] <= w["end"] for w in e["expected_words"]), e["name"])
+            self.assertEqual(ends, sorted(ends), e["name"])
+            if e["backend_id"] == "qwen3-forced-aligner":
+                # Filename-based dispatch: the pinned file must select the Qwen path.
+                self.assertIn("forced-aligner", e["gguf"]["file"].lower())
+
+    def test_compare_accepts_exact_and_within_tolerance(self):
+        ok, _, stats = run_one.compare_alignment(self.WORDS, self.WORDS, 0.081)
+        self.assertTrue(ok)
+        self.assertEqual(stats["max_abs_s"], 0.0)
+        shifted = [dict(w, start=w["start"] + 0.08) for w in self.WORDS]
+        self.assertTrue(run_one.compare_alignment(self.WORDS, shifted, 0.081)[0])
+        # Punctuation/case differences in the word text are normalized away.
+        self.assertTrue(run_one.compare_alignment(self.WORDS, [dict(self.WORDS[0], word="and,"), self.WORDS[1]],
+                                                  0.081)[0])
+
+    def test_compare_rejects_drift_words_counts_and_bad_values(self):
+        late = [dict(w, end=w["end"] + 0.2) for w in self.WORDS]
+        self.assertFalse(run_one.compare_alignment(self.WORDS, late, 0.081)[0])
+        self.assertFalse(run_one.compare_alignment(self.WORDS, self.WORDS[:1], 0.081)[0])
+        self.assertFalse(run_one.compare_alignment(self.WORDS, [self.WORDS[0], dict(self.WORDS[1], word="no")],
+                                                   0.081)[0])
+        self.assertFalse(run_one.compare_alignment(self.WORDS, [self.WORDS[0], dict(self.WORDS[1], start=float("nan"))],
+                                                   0.081)[0])
+        self.assertFalse(run_one.compare_alignment(self.WORDS, [self.WORDS[0], {"word": "so"}], 0.081)[0])
+        self.assertFalse(run_one.compare_alignment([], [], 0.081)[0])
+
+    def test_align_for_runs_cli_and_gates_on_output(self):
+        import tempfile
+        entry = {"name": "probe-aligner", "backend_id": "qwen3-forced-aligner",
+                 "gguf": {"repo": "r", "revision": "0" * 40, "file": "x-forced-aligner.gguf"},
+                 "sample": "samples/jfk.wav", "ref_text": "And so", "expected_words": self.WORDS,
+                 "expected_source": "unit", "tolerance_s": 0.081}
+        manifest = {"backends": [], "align_backends": [entry]}
+        for produced, expected_failures in ((self.WORDS, 0), ([dict(w, start=w["start"] + 1) for w in self.WORDS], 1)):
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+
+                def fake_run(argv, **_):
+                    self.assertIn("--align-only", argv)
+                    self.assertEqual(argv[argv.index("-am") + 1], "x-forced-aligner.gguf")
+                    Path(argv[argv.index("--align-output") + 1]).write_text(json.dumps(produced))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with mock.patch.object(run_one, "hf_download", return_value=Path("x-forced-aligner.gguf")), \
+                        mock.patch.object(run_one, "_run_captured", side_effect=fake_run):
+                    self.assertEqual(run_one.align_for("probe-aligner", manifest, work, Path("crispasr")),
+                                     expected_failures)
+
+    def test_align_for_fails_when_cli_fails(self):
+        import tempfile
+        entry = {"name": "p", "gguf": {"repo": "r", "revision": "0" * 40, "file": "f.gguf"},
+                 "sample": "samples/jfk.wav", "ref_text": "x", "expected_words": self.WORDS,
+                 "expected_source": "unit", "tolerance_s": 0.081}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(run_one, "hf_download", return_value=Path("f.gguf")), \
+                mock.patch.object(run_one, "_run_captured",
+                                  return_value=SimpleNamespace(returncode=3, stdout="", stderr="boom")):
+            self.assertEqual(run_one.align_for("p", {"align_backends": [entry]}, Path(tmp), Path("crispasr")), 1)
 
 
 class TranscriptToleranceTests(unittest.TestCase):

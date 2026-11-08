@@ -164,6 +164,21 @@ float* qwen3_asr_run_llm_kv(struct qwen3_asr_context* ctx, const float* inputs_e
 // Qwen3-ForcedAligner-0.6B this is 5000 (timestamp classes).
 int qwen3_asr_lm_head_dim(struct qwen3_asr_context* ctx);
 
+// #455 Raon-Speech-9B (GGUF qwen3asr.variant = "raon-speech"). The audio
+// path differs from Qwen3-ASR: 8 s chunks at 24 kHz, per-chunk mel, a
+// 12.5 Hz frame grid and an EmbeddingAdaptor to the LLM width. Use
+// qwen3_asr_raon_encode instead of compute_mel + run_encoder; it returns
+// LLM-ready embeddings (out_N rows of out_dim). The _stages variant also
+// returns one chunk's mel (mel_chunk; -1 = the last; n_mels x T, mel-major)
+// and the pre-adaptor encoder frames (out_N x enc_dim) for the diff harness;
+// free() them.
+bool qwen3_asr_is_raon_speech(struct qwen3_asr_context* ctx);
+float* qwen3_asr_raon_encode(struct qwen3_asr_context* ctx, const float* samples, int n_samples, int* out_N,
+                             int* out_dim);
+float* qwen3_asr_raon_encode_stages(struct qwen3_asr_context* ctx, const float* samples, int n_samples, int mel_chunk,
+                                    float** out_mel, int* out_T, float** out_enc, int* out_enc_dim, int* out_N,
+                                    int* out_dim);
+
 // Run a single full-T forward pass through the LLM body (NOT autoregressive,
 // no KV cache) starting from already-embedded inputs. Returns the lm_head
 // logits at every position (not just last-token), shape
@@ -193,6 +208,22 @@ float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const float* inputs_
 // 0 on success, non-zero on failure.
 int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float* samples, int n_samples, const char** words,
                           int n_words, int64_t* out_start_ms, int64_t* out_end_ms);
+
+// Diagnostic/porting API: additionally copy the final normalized hidden state
+// at each timestamp marker into `out_hidden`, in word/start/end order. The
+// buffer capacity is measured in float elements and must hold 2*n_words*d_model.
+// This opt-in path leaves the existing alignment API and its graph unchanged.
+int qwen3_asr_align_words_with_hidden(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
+                                      const char** words, int n_words, int64_t* out_start_ms, int64_t* out_end_ms,
+                                      float* out_hidden, size_t hidden_capacity);
+
+// Experimental isolated Ultra base+local-head path. The caller supplies the
+// separately converted F32 head sidecar and output arrays of n_words doubles;
+// times are milliseconds. The normal aligner is unchanged. This is not yet
+// wired into CLI, the session C ABI, or language bindings.
+int qwen3_asr_align_words_ultra(struct qwen3_asr_context* ctx, const float* samples, int n_samples, const char** words,
+                                int n_words, const char* head_gguf, double* out_start_ms, double* out_end_ms);
+
 
 #ifdef __cplusplus
 }

@@ -21,7 +21,10 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "parallel_for.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -228,6 +231,71 @@ static inline ggml_tensor* convt1d_decomp_tf(ggml_context* ctx, ggml_tensor* x, 
 //   ggml_tensor* dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K*OC);
 //   ggml_backend_tensor_set(dst, buf.get(), 0, ggml_nbytes(dst));
 
+// Check if sequential baseline conv permutation is requested.
+static inline bool crispasr_conv_serial() {
+    const char* e = std::getenv("CRISPASR_CONV_SERIAL");
+    return (e && *e && std::strcmp(e, "0") != 0);
+}
+
+template <typename Load>
+static inline void permute_convt1d_host_baseline(Load load, float* dp, int K, int OC, int IC, int n_threads = 0) {
+    const size_t J = (size_t)OC * K;
+    const int B = 32;
+    const int n_blk = (IC + B - 1) / B;
+#if defined(_OPENMP)
+    const int nt = core_parallel::resolve_threads_for_work(n_blk, n_threads, (uint64_t)B * J, 65536);
+#pragma omp parallel for schedule(static) num_threads(nt) if (nt > 1 && (size_t)IC * J > ((size_t)1 << 20))
+#else
+    (void)n_threads;
+#endif
+    for (int bi = 0; bi < n_blk; bi++) {
+        const int i0 = bi * B;
+        const int i1 = i0 + B < IC ? i0 + B : IC;
+        for (size_t j0 = 0; j0 < J; j0 += B) {
+            const size_t j1 = j0 + B < J ? j0 + B : J;
+            for (size_t j = j0; j < j1; j++)
+                for (int i = i0; i < i1; i++)
+                    dp[j * IC + i] = load((size_t)i * J + j);
+        }
+    }
+}
+
+template <typename Load>
+static inline void permute_convt1d_host_accelerated(Load load, float* dp, int K, int OC, int IC, int n_threads = 0) {
+    const size_t J = (size_t)OC * K;
+    const int B = 32;
+    const int n_blk = (IC + B - 1) / B;
+
+    core_parallel::for_each_chunk_work(n_blk, n_threads, (uint64_t)B * J, 65536, [&](int b_start, int b_end) {
+        for (int bi = b_start; bi < b_end; bi++) {
+            const int i0 = bi * B;
+            const int i1 = i0 + B < IC ? i0 + B : IC;
+            for (size_t j0 = 0; j0 < J; j0 += B) {
+                const size_t j1 = j0 + B < J ? j0 + B : J;
+                for (size_t j = j0; j < j1; j++)
+                    for (int i = i0; i < i1; i++)
+                        dp[j * IC + i] = load((size_t)i * J + j);
+            }
+        }
+    });
+}
+
+// Host-side core of the permutation: a plain 2-D transpose of
+// src[ic][j] (IC rows, J = OC*K cols) into dst[j][ic], where `load(s)` reads
+// source element s as float. 32x32 tiles: the naive loop's stores stride by
+// IC floats, and for the voxcpm2 VAE (41M elements) it took ~1.1 s of every
+// process start (#461). Tile rows are split across OpenMP threads when the
+// including target has it; every dst element is written exactly once from
+// the same source value, so the result is byte-identical either way.
+template <typename Load>
+static inline void permute_convt1d_host(Load load, float* dp, int K, int OC, int IC, int n_threads = 0) {
+    if (crispasr_conv_serial() || (size_t)IC * (size_t)OC * K <= (size_t)1 << 16) {
+        permute_convt1d_host_baseline(load, dp, K, OC, IC, 1);
+    } else {
+        permute_convt1d_host_accelerated(load, dp, K, OC, IC, n_threads);
+    }
+}
+
 static inline std::unique_ptr<float[]> permute_convt1d_weight(ggml_tensor* src) {
     const int K = (int)src->ne[0];
     const int OC = (int)src->ne[1];
@@ -237,23 +305,19 @@ static inline std::unique_ptr<float[]> permute_convt1d_weight(ggml_tensor* src) 
     auto out = std::make_unique<float[]>((size_t)IC * K * OC);
     float* dp = out.get();
 
+    // src layout: [K, OC, IC] → src[ic][oc][k] = tmp[ic * OC * K + oc * K + k]
+    // dst layout: [IC, K*OC]  → dst[oc*K+k][ic] = dp[(oc * K + k) * IC + ic]
     if (src->type == GGML_TYPE_F32) {
         auto tmp = std::make_unique<float[]>(n_elems);
         ggml_backend_tensor_get(src, tmp.get(), 0, n_elems * sizeof(float));
-        // src layout: [K, OC, IC] → src[ic][oc][k] = tmp[ic * OC * K + oc * K + k]
-        // dst layout: [IC, K*OC]  → dst[oc*K+k][ic] = dp[(oc * K + k) * IC + ic]
-        for (int ic = 0; ic < IC; ic++)
-            for (int oc = 0; oc < OC; oc++)
-                for (int k = 0; k < K; k++)
-                    dp[(oc * K + k) * IC + ic] = tmp[ic * OC * K + oc * K + k];
+        const float* tp = tmp.get();
+        permute_convt1d_host([tp](size_t s) { return tp[s]; }, dp, K, OC, IC);
     } else {
         // F16 (most codec weights are F16)
         auto tmp = std::make_unique<ggml_fp16_t[]>(n_elems);
         ggml_backend_tensor_get(src, tmp.get(), 0, n_elems * sizeof(ggml_fp16_t));
-        for (int ic = 0; ic < IC; ic++)
-            for (int oc = 0; oc < OC; oc++)
-                for (int k = 0; k < K; k++)
-                    dp[(oc * K + k) * IC + ic] = ggml_fp16_to_fp32(tmp[ic * OC * K + oc * K + k]);
+        const ggml_fp16_t* tp = tmp.get();
+        permute_convt1d_host([tp](size_t s) { return ggml_fp16_to_fp32(tp[s]); }, dp, K, OC, IC);
     }
     return out;
 }
@@ -270,6 +334,12 @@ static inline std::unique_ptr<float[]> permute_convt1d_weight(ggml_tensor* src) 
 //   permute_convt1d_weights_batch(src_list, dst_list, n, backend, &ctx_perm, &buf_perm);
 static inline bool permute_convt1d_weights_batch(ggml_tensor** srcs, ggml_tensor*** dsts, int n, ggml_backend_t backend,
                                                  ggml_context** out_ctx, ggml_backend_buffer_t* out_buf) {
+    // Publish borrowed tensor pointers only after the allocation succeeds.
+    // Otherwise callers' fallback paths would dereference a freed context.
+    for (int i = 0; i < n; i++)
+        if (srcs[i] && srcs[i]->type != GGML_TYPE_F32 && srcs[i]->type != GGML_TYPE_F16)
+            return false;
+    std::vector<ggml_tensor*> pending(n, nullptr);
     const size_t meta_bytes = ggml_tensor_overhead() * (size_t)n + 4096;
     struct ggml_init_params pp = {meta_bytes, nullptr, true};
     ggml_context* ctx = ggml_init(pp);
@@ -284,7 +354,7 @@ static inline bool permute_convt1d_weights_batch(ggml_tensor** srcs, ggml_tensor
         const int IC = (int)srcs[i]->ne[2];
         const int K = (int)srcs[i]->ne[0];
         const int OC = (int)srcs[i]->ne[1];
-        *dsts[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K * OC);
+        pending[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K * OC);
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) {
@@ -292,8 +362,11 @@ static inline bool permute_convt1d_weights_batch(ggml_tensor** srcs, ggml_tensor
         return false;
     }
     for (int i = 0; i < n; i++) {
-        if (*dsts[i] && bufs[i])
-            ggml_backend_tensor_set(*dsts[i], bufs[i].get(), 0, ggml_nbytes(*dsts[i]));
+        if (pending[i] && bufs[i])
+            ggml_backend_tensor_set(pending[i], bufs[i].get(), 0, ggml_nbytes(pending[i]));
+    }
+    for (int i = 0; i < n; i++) {
+        *dsts[i] = pending[i];
     }
     *out_ctx = ctx;
     *out_buf = buf;

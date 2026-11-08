@@ -36,6 +36,7 @@ struct whisper_params {
     float logprob_thold = -1.00f;
     float no_speech_thold = 0.6f;
     float grammar_penalty = 100.0f;
+    bool grammar_strict = false;
     float temperature = 0.0f;
     float temperature_inc = 0.2f;
     uint64_t seed = 0; // RNG seed for sampling (0 = non-deterministic)
@@ -247,11 +248,12 @@ struct whisper_params {
     // negative = full attention. Set via --att-context "L,R".
     int att_context_left = INT_MIN;
     int att_context_right = INT_MIN;
+    // Hikari streaming strided encoder refresh interval (0 = exact, K > 0 = strided, -1 = default).
+    int hikari_refresh_stride = -1;
     std::string hotwords;        // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f; // per-token log-prob boost for hotword prefix matches
-    // Free-form hotword/context text injected into the vibevoice-asr prompt
-    // (only backend that reads this so far). Matches the `context_info` param
-    // in microsoft/VibeVoice's vibevoice_asr_processor.py.
+    // Free-form context injected verbatim into Qwen3-ASR's system turn or
+    // VibeVoice-ASR's instruction prompt.
     std::string context;
     // #205: granite-speech incremental decoding — seed the assistant turn with a
     // previously-decoded transcript so the model continues from it instead of
@@ -259,6 +261,7 @@ struct whisper_params {
     std::string prefix_text;
     std::string lid_backend;
     std::string lid_model;
+    bool lid_full_recording = false; // score successive 15 s LID windows across the recording
     // Post-ASR text LID: when set, after transcription completes, run
     // a fastText-supervised classifier (GlotLID / LID-176) on the
     // assembled transcript and emit `lang=<code>\tconf=<score>` to
@@ -324,6 +327,25 @@ struct whisper_params {
     bool diarize_embedder_is_foxnose() const {
         return diarize_method == "foxnose" || diarize_method == "foxnose-diarize";
     }
+    // #466: NVIDIA Nemotron-3-Diarization (streaming Sortformer). Like foxnose
+    // it diarizes in one global pass (speakers are numbered by first arrival,
+    // so per-slice runs would renumber them). Model from --diarize-model.
+    bool diarize_is_sortformer() const {
+        return diarize_method == "sortformer" || diarize_method == "nemotron3-diar" || diarize_method == "nemotron3";
+    }
+    // Methods that label speakers in one pass over the whole recording.
+    bool diarize_is_global_method() const { return diarize_embedder_is_foxnose() || diarize_is_sortformer(); }
+    // The legacy whisper path labels speakers in a post-step after decoding
+    // (crispasr_apply_diarize). Only the stereo methods can be estimated live
+    // in the per-segment print callback; for every other method the live line
+    // would carry whisper's stereo-energy guess, "(speaker ?)" on mono input.
+    bool diarize_labels_after_decode() const {
+        return diarize && !diarize_method.empty() && diarize_method != "energy" && diarize_method != "xcorr";
+    }
+    // GGUF for --diarize-method sortformer ("auto" / empty: NVIDIA's q8_0 GGUF).
+    std::string diarize_model;
+    // #466: sortformer chunk schedule, "offline" (default) or a streaming preset.
+    std::string sortformer_mode;
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;
@@ -469,7 +491,8 @@ struct whisper_params {
     // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
     // requiring an ASR model or transcription step.
     bool align_only = false;
-    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+    std::string ultra_head; // optional separately converted Ultra local-head GGUF
+    std::string text_file;  // path to .txt or .srt (text extracted, timestamps stripped)
     // Output granularity: "word" = one entry per aligned word; "segment" =
     // one entry per input SRT cue (or per non-empty .txt line), re-timed
     // from the word alignment; "auto" = segment for .srt input, word otherwise.
@@ -589,6 +612,17 @@ struct whisper_params {
     // this; only the server route reads it.
     float tts_speed = 1.0f;
 
+    // Opt-in Qwen3-TTS capture correlation and source-text pairing. These
+    // fields are populated only when CRISPASR_QWEN3_TTS_CAPTURE_DIR is enabled.
+    std::string tts_capture_request_id;
+    std::string tts_capture_source_text;
+    bool tts_capture_suppress = false;
+
+    // Exact target duration in seconds for backends with native length control
+    // (omnivoice; upstream OmniVoice `duration` parity). 0 = use the backend's
+    // own estimate. CLI: --tts-duration; server: the `duration` body field.
+    float tts_duration = 0.0f;
+
     // 75c-opt-2: per-request TTS backend knobs exposed via /v1/audio/speech.
     // Negative sentinel = "use backend default". The server route parses
     // these from JSON and each backend adapter applies them via native
@@ -652,9 +686,58 @@ struct whisper_params {
     //     / `-trtl` flags only matter when the primary backend's
     //     `-sl`/`-tl` mean something else (e.g., 2-stage piping).
     std::string text_input;
-    int translate_max_tokens = 256;
+    // 0 = let the backend apply its own documented default (#439). Both
+    // translate runtimes already default to 200 when passed <= 0, matching
+    // m2m100/wmt21's config.json max_length; madlad declares none and 200 is
+    // the runtime's own figure. This was 256 — a number from nowhere that
+    // SILENTLY OVERRODE both, because `translate_max_tokens > 0` is true for
+    // the default, so every "fall back to the backend" branch was dead code.
+    int translate_max_tokens = 0;
     std::string translate_source_lang; // overrides source_lang for the translator stage
     std::string translate_target_lang; // overrides target_lang for the translator stage
+
+    // Live transcribe + translate. A second, text-to-text backend (m2m100 /
+    // madlad) runs behind the streaming recogniser and translates each
+    // sentence as soon as the recogniser has committed to it — see
+    // crispasr_live_translate.h for the commit policy. Active on a streaming
+    // run when `translate_model` is set; `--live-translate` is the preset
+    // (microphone + VAD + a short step + the default translator).
+    bool live_translate = false;
+    std::string translate_model;   // translator GGUF, or "auto" for the registry default
+    std::string translate_backend; // m2m100 | madlad | llm; empty = detect from the GGUF
+    // Prompt for `--translate-backend llm` (a chat LLM trained to translate).
+    // {src} / {tgt} are replaced by the English language names, {text} by the
+    // sentence. Empty = the Hy-MT2 instruction.
+    std::string translate_prompt;
+    // Live translation, slow pass: a better translator that re-translates each
+    // finished paragraph and replaces the fast translations (hy-mt2,
+    // index-translate or a translation-LLM GGUF). Empty = no slow pass.
+    std::string translate_revise_model;
+    // Slow pass, phase 2: a slower, better recogniser that re-transcribes each
+    // finished utterance before the slow translator re-translates it (a GGUF,
+    // or a registry name such as canary / cohere). Needs translate_revise_model.
+    std::string translate_revise_asr;
+    // Terminal view for live translation: "inplace" keeps the transcript on
+    // the alternate screen so revisions replace text where it stands;
+    // "scroll" prints and moves on. Default: inplace with a slow pass.
+    std::string translate_view;
+    int translate_revise_backlog = 3; // paragraphs queued for the slow pass before the oldest is dropped
+    int translate_beam = 1;           // greedy: m2m100 beam search has no KV cache (~5x slower); 0 = backend default
+    bool translate_drafts = true;     // re-translate the still-open sentence as a dimmed draft
+    // The input arrives in real time (microphone, a live feed). When decoding
+    // falls behind, read the whole backlog in one step instead of working
+    // through it one --stream-step at a time and staying behind for good.
+    bool stream_realtime = false;
+    // Live translation only: feed the recogniser's own incremental session
+    // (CrispasrBackend::create_realtime_session — nemotron, qwen3,
+    // vibevoice-streaming) each step's NEW audio, instead of re-decoding the
+    // open speech every step. The cost then follows the audio, not the
+    // length of the sentence.
+    bool stream_session = false;
+    // Whether the user set these, so the live-translate preset only replaces
+    // defaults and never an explicit choice.
+    bool stream_step_explicit = false;
+    bool stream_length_explicit = false;
 
     // Text-LLM chat (server-mode /v1/chat/completions). Independent from
     // the audio backend's `model` path so a server can serve ASR + chat

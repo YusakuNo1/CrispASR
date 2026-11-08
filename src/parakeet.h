@@ -19,9 +19,12 @@ extern "C" {
 
 struct parakeet_context;
 
+// Model metadata declares English-only training (Phonon-2), even after renaming.
+bool parakeet_is_english_only(const struct parakeet_context* ctx);
+
 struct parakeet_context_params {
     int n_threads;
-    bool use_flash; // flash attention in encoder (default: false)
+    bool use_flash; // flash attention in encoder (default: true)
     int verbosity;  // 0=silent 1=normal 2=verbose
     bool use_gpu;   // false => force CPU backend
 };
@@ -225,10 +228,12 @@ int parakeet_test_audio(struct parakeet_context* ctx, const float* samples, int 
 float* parakeet_joint_project_encoder(struct parakeet_context* ctx, const float* enc_frames, int T_enc, int d_model,
                                       int* out_joint_hidden);
 
-// Run predictor on blank/SOS token (initial state).
-// Output: malloc'd (1, pred_hidden) — the LSTM output after feeding blank.
+// Legacy NeMo capture: two blank steps from zero LSTM state (SOS + pad).
+// Output: malloc'd (1, pred_hidden).
 // Caller must free().
 float* parakeet_predictor_initial(struct parakeet_context* ctx, int* out_pred_hidden);
+// Production greedy start: one blank token, zero LSTM state.
+float* parakeet_predictor_sos(struct parakeet_context* ctx, int* out_pred_hidden);
 
 // Run full joint step at a single encoder frame + predictor output.
 // proj_enc: (joint_hidden,) — output of parakeet_joint_project_encoder for one frame

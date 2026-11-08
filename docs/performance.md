@@ -184,5 +184,5 @@ RTF = real-time factor (lower = faster; < 1.0 means faster than real-time).
   unified backend that supports 40+ model families across ASR/TTS/S2S/LID/MT.
 
 Benchmark script: `tools/kaggle/transcribe-cpp-bench/transcribe_cpp_bench.py`
-Kernel: `chr1s4/crispasr-vs-transcribe-cpp-bench`
+Kernel: `${KAGGLE_ACCOUNT}/crispasr-vs-transcribe-cpp-bench`
 Results: `cstr/crispasr-kaggle-progress` dataset, prefix `transcribe-cpp-bench/`

@@ -334,19 +334,29 @@ static void frt_graph_end(frt_graph& g) {
 //   causal: j <= i;  sliding window w: j >= i-w+1
 //   block-diagonal blocks of size B (block b: tokens [bB, (b+1)B))
 static void frt_fill_mask(std::vector<float>& m, int T, bool causal, int window, int block) {
-    m.assign((size_t)T * T, 0.0f);
     const float NEG = -1e30f;
+    m.assign((size_t)T * T, NEG);
     for (int i = 0; i < T; i++) {
-        for (int j = 0; j < T; j++) {
-            bool ok = true;
-            if (causal && j > i)
-                ok = false;
-            if (window > 0 && j < i - window + 1)
-                ok = false;
-            if (block > 0 && (j / block) != (i / block))
-                ok = false;
-            if (!ok)
-                m[(size_t)i * T + j] = NEG;
+        int j_min = 0;
+        int j_max = T - 1;
+        if (causal && i < j_max)
+            j_max = i;
+        if (window > 0) {
+            int w_min = i - window + 1;
+            if (w_min > j_min)
+                j_min = w_min;
+        }
+        if (block > 0) {
+            int b = i / block;
+            int b_start = b * block;
+            int b_end = (b + 1) * block - 1;
+            if (b_start > j_min)
+                j_min = b_start;
+            if (b_end < j_max)
+                j_max = b_end;
+        }
+        if (j_min <= j_max) {
+            std::fill_n(m.data() + (size_t)i * T + j_min, j_max - j_min + 1, 0.0f);
         }
     }
 }
@@ -1076,7 +1086,7 @@ static bool frt_redae_decode(fireredtts3_tts_context* ctx, const float* latents,
     // window envelope unconditionally after asserting > 1e-11.
     pcm = core_istft::istft(mag.data(), phase.data(), n_fft, ctx->ae_patch, T50,
                             ctx->istft_window.empty() ? nullptr : ctx->istft_window.data(), core_istft::TRIM_SAME, 0.0f,
-                            1e-11f, false);
+                            1e-11f, false, ctx->params.n_threads > 0 ? ctx->params.n_threads : 4);
     return true;
 }
 

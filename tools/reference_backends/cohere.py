@@ -99,6 +99,21 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         low_cpu_mem_usage=True,
     ).eval()
 
+    # The remote model's generate() path leaves decoder_attention_mask=None in
+    # model_kwargs, which current transformers then tries to extend
+    # ("'NoneType' object has no attribute 'new_ones'", rebake 2026-09-28 -
+    # filtering the processor output was not enough). Drop None masks at the
+    # exact spot, per step; an absent mask means all-ones, as before.
+    _orig_upd = model._update_model_kwargs_for_generation
+
+    def _upd_drop_none_masks(outputs, model_kwargs, *a, **kw):
+        for _k in ("decoder_attention_mask", "attention_mask"):
+            if _k in model_kwargs and model_kwargs[_k] is None:
+                model_kwargs.pop(_k)
+        return _orig_upd(outputs, model_kwargs, *a, **kw)
+
+    model._update_model_kwargs_for_generation = _upd_drop_none_masks
+
     # Workaround: from_pretrained with trust_remote_code + the Cohere
     # CohereAsrPreTrainedModel._init_weights re-initializes all Linear/Conv
     # weights to normal(0, 0.02), overwriting the pretrained values.  Detect
@@ -166,6 +181,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # bf16→f32 path (we load in f32 here so this is a no-op).
     if "input_features" in inputs:
         inputs["input_features"] = inputs["input_features"].to(torch.float32)
+    # Newer transformers' generate() extends every *attention_mask key it is
+    # handed ("'NoneType' object has no attribute 'new_ones'", rebake
+    # 2026-09-28): drop None-valued entries and give a decoder prompt an
+    # explicit all-ones mask, which is what an absent one meant before.
+    inputs = {k: v for k, v in dict(inputs).items() if v is not None}
+    if "decoder_input_ids" in inputs and "decoder_attention_mask" not in inputs:
+        inputs["decoder_attention_mask"] = torch.ones_like(inputs["decoder_input_ids"])
 
     out: Dict[str, np.ndarray] = {}
     if "mel_spectrogram" in stages and "input_features" in inputs:

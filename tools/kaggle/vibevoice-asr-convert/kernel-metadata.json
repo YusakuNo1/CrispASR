@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-vibevoice-asr-f16-one-off",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-vibevoice-asr-f16-one-off",
   "title": "CrispASR — vibevoice-asr-f16 one-off",
   "code_file": "crispasr-vibevoice-asr-f16-one-off.ipynb",
   "language": "python",

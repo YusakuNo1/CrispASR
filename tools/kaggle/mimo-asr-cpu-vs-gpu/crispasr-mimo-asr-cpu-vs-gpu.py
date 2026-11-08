@@ -34,7 +34,7 @@ the union of the best parts of the per-kernel copies:
     ccache (primed at /kaggle/working/.ccache, persisted across runs) +
     mold linker, so re-runs reuse cached objects and link faster
   - kh.resolve_hf_token(): 3-tier auth env → Kaggle Secret (retry) →
-    chr1str/crispasr-hf-token dataset (kernel-metadata.json:dataset_sources)
+    ${KAGGLE_ACCOUNT}/crispasr-hf-token dataset (kernel-metadata.json:dataset_sources)
 """
 
 import os

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local-side companion to the Kaggle rebake kernel.
 #
-# The Kaggle kernel (chr1str/crispasr-auto-rebake-refs) generates
+# The Kaggle kernel (${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs) generates
 # fresh reference dumps and writes them to
 # `/kaggle/working/rebake-stage/`. Because Kaggle Secrets has been
 # flaky (HTTPError 400 from GetUserSecretByLabel even after multiple
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-KAGGLE_KERNEL="chr1str/crispasr-auto-rebake-refs"
+KAGGLE_KERNEL="${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs"
 LOCAL_OUT="/Volumes/backups/ai/crispasr-regression/rebake-out"
 FIXTURES_REPO="cstr/crispasr-regression-fixtures"
 ENV_FILE="/Users/christianstrobele/code/.env"
@@ -74,7 +74,7 @@ echo
 echo "uploading to $FIXTURES_REPO …"
 cd "$STAGE"
 hf upload "$FIXTURES_REPO" . . \
-    --commit-message "rebake from chr1str/crispasr-auto-rebake-refs $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --commit-message "rebake from ${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     2>&1 | tail -10
 
 # ── Report new fixtures commit SHA ────────────────────────────────────

@@ -11,16 +11,21 @@
 // CrispasrBackend interface.
 
 #include "crispasr_backend.h"
+#include "core/qwen3_prompt.h"
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
 #include "core/bpe.h"
 #include "core/greedy_decode.h"
 #include "core/beam_decode.h"
 #include "core/ngram_loop_fix.h"
+#include "core/gguf_loader.h"
+#include "core/qwen3_stream.h"
+#include "core/qwen3_stream_model.h"
 
 #include "qwen3_asr.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,7 +42,7 @@ std::string decode_token(const std::string& s) {
 
 class Qwen3Backend : public CrispasrBackend {
 public:
-    Qwen3Backend() = default;
+    explicit Qwen3Backend(bool context_enabled) : context_enabled_(context_enabled) {}
     ~Qwen3Backend() override { Qwen3Backend::shutdown(); }
 
     const char* name() const override { return "qwen3"; }
@@ -65,7 +70,63 @@ public:
             fprintf(stderr, "crispasr[qwen3]: failed to load model '%s'\n", p.model.c_str());
             return false;
         }
+        if (gguf_context* meta = core_gguf::open_metadata(p.model.c_str())) {
+            stream_recipe_ = core_gguf::kv_str(meta, "qwen3asr.streaming_recipe", "");
+            gguf_free(meta);
+        }
+        raon_ = qwen3_asr_is_raon_speech(ctx_);
         return true;
+    }
+
+    // #455 Raon-Speech has its own front end (8 s chunks at 24 kHz, per-chunk
+    // mel, 12.5 Hz frames, EmbeddingAdaptor); everything else is Qwen3-ASR's.
+    float* encode_audio(const float* samples, int n_samples, int* N_enc, int* pdim) {
+        if (raon_)
+            return qwen3_asr_raon_encode(ctx_, samples, n_samples, N_enc, pdim);
+        int n_mels = 0, T_mel = 0;
+        float* mel = qwen3_asr_compute_mel(ctx_, samples, n_samples, &n_mels, &T_mel);
+        if (!mel)
+            return nullptr;
+        float* emb = qwen3_asr_run_encoder(ctx_, mel, n_mels, T_mel, N_enc, pdim);
+        free(mel);
+        return emb;
+    }
+
+    // Raon-Speech has no language / translation / hotword conditioning: its
+    // STT prompt is fixed (en + ko are recognised automatically). Say so once
+    // instead of silently dropping the flags (docs/contributing.md 9b).
+    static void warn_raon_ignored_flags(const whisper_params& params) {
+        static bool warned = false;
+        if (warned || params.no_prints)
+            return;
+        std::string ignored;
+        if (!params.language.empty() && params.language != "auto")
+            ignored += " --language " + params.language;
+        if (params.translate)
+            ignored += " --translate";
+        if (!params.hotwords.empty())
+            ignored += " --hotwords";
+        if (ignored.empty())
+            return;
+        warned = true;
+        fprintf(stderr,
+                "crispasr[raon-speech]: the model has no language/translation/hotword conditioning "
+                "(English and Korean are recognised automatically); ignored:%s. "
+                "Use --ask to change the instruction.\n",
+                ignored.c_str());
+    }
+
+    // RaonPipeline.stt: no system turn; the instruction follows the audio.
+    // --ask replaces the default instruction (the model is instruction-tuned).
+    static std::string raon_prompt(int N_enc, const std::string& ask) {
+        std::string text = "<|im_start|>user\n<|audio_start|>";
+        text.reserve(text.size() + (size_t)N_enc * 13 + 96);
+        for (int i = 0; i < N_enc; i++)
+            text += "<|audio_pad|>"; // id 151676 (= Raon's <|audio_input_placeholder|>)
+        text += "<|audio_end|>";
+        text += ask.empty() ? std::string("Transcribe the audio into text") : ask;
+        text += "<|im_end|>\n<|im_start|>assistant\n";
+        return text;
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
@@ -74,18 +135,9 @@ public:
         if (!ctx_)
             return out;
 
-        // ---- Mel ----
-        int n_mels = 0, T_mel = 0;
-        float* mel = qwen3_asr_compute_mel(ctx_, samples, n_samples, &n_mels, &T_mel);
-        if (!mel) {
-            fprintf(stderr, "crispasr[qwen3]: mel failed\n");
-            return out;
-        }
-
-        // ---- Encoder ----
+        // ---- Mel + encoder ----
         int N_enc = 0, pdim = 0;
-        float* audio_embeds = qwen3_asr_run_encoder(ctx_, mel, n_mels, T_mel, &N_enc, &pdim);
-        free(mel);
+        float* audio_embeds = encode_audio(samples, n_samples, &N_enc, &pdim);
         if (!audio_embeds) {
             fprintf(stderr, "crispasr[qwen3]: encoder failed\n");
             return out;
@@ -133,23 +185,13 @@ public:
             else
                 assistant_prefill = "language " + crispasr_iso_to_english_lang(params.language) + "<asr_text>";
         }
-        // PLAN #98 Phase B: hotword prompt injection
-        if (!params.hotwords.empty()) {
-            if (!sys_instruction.empty() && sys_instruction.back() != ' ')
-                sys_instruction += ' ';
-            sys_instruction += "The following words may appear in the audio: " + params.hotwords + ".";
+        std::string text = core_qwen3_prompt::build(N_enc, sys_instruction, "", assistant_prefill, params.hotwords,
+                                                    context_enabled_ ? params.context : "");
+        if (raon_) {
+            warn_raon_ignored_flags(params);
+            text = raon_prompt(N_enc, params.ask);
+            assistant_prefill.clear();
         }
-
-        std::string text = "<|im_start|>system\n" + sys_instruction +
-                           "<|im_end|>\n"
-                           "<|im_start|>user\n"
-                           "<|audio_start|>";
-        text.reserve(text.size() + (size_t)N_enc * 13 + 64);
-        for (int i = 0; i < N_enc; i++)
-            text += "<|audio_pad|>";
-        text += "<|audio_end|><|im_end|>\n"
-                "<|im_start|>assistant\n";
-        text += assistant_prefill;
 
         int n_prompt = 0;
         int32_t* raw_ids = qwen3_asr_tokenize(ctx_, text.c_str(), &n_prompt);
@@ -220,6 +262,8 @@ public:
                 fprintf(stderr, "crispasr[qwen3]: prefill failed\n");
                 return out;
             }
+            if (raon_ && eos_id >= 0 && eos_id < vocab)
+                logits[(size_t)(n_t - 1) * vocab + eos_id] = -INFINITY; // disable_eos_on_first_output
             const float* last_logits = logits + (n_t - 1) * vocab;
 
             auto replay = [this](qwen3_asr_context* /*ctx*/, const int32_t* toks, int n, int pl) -> float* {
@@ -270,7 +314,7 @@ public:
                 if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
                     continue;
                 std::string txt = decode_token(raw);
-                if (assistant_prefill.empty() && raw == "language") {
+                if (!raon_ && assistant_prefill.empty() && raw == "language") {
                     capture_language = true;
                     continue;
                 }
@@ -332,6 +376,8 @@ public:
                 dec_cfg.vocab_size = vocab;
 
             const int last_off = (n_t - 1) * vocab;
+            if (raon_ && eos_id >= 0 && eos_id < vocab)
+                logits[last_off + eos_id] = -INFINITY; // disable_eos_on_first_output
             int next = 0;
             float next_p = 1.0f;
             if (dec_cfg.temperature > 0.0f) {
@@ -407,7 +453,7 @@ public:
             // was NOT prefilled — with the forced-language prefill the model
             // emits transcript text directly and a literal leading word
             // "language" must not be swallowed.
-            if (assistant_prefill.empty() && txt == "language") {
+            if (!raon_ && assistant_prefill.empty() && txt == "language") {
                 capture_language = true;
                 continue;
             }
@@ -497,16 +543,9 @@ public:
         if (!ctx_)
             return;
 
-        // ---- Mel ----
-        int n_mels = 0, T_mel = 0;
-        float* mel = qwen3_asr_compute_mel(ctx_, samples, n_samples, &n_mels, &T_mel);
-        if (!mel)
-            return;
-
-        // ---- Encoder ----
+        // ---- Mel + encoder ----
         int N_enc = 0, pdim = 0;
-        float* audio_embeds = qwen3_asr_run_encoder(ctx_, mel, n_mels, T_mel, &N_enc, &pdim);
-        free(mel);
+        float* audio_embeds = encode_audio(samples, n_samples, &N_enc, &pdim);
         if (!audio_embeds)
             return;
 
@@ -530,20 +569,13 @@ public:
             else
                 assistant_prefill = "language " + crispasr_iso_to_english_lang(params.language) + "<asr_text>";
         }
-        if (!params.hotwords.empty()) {
-            if (!sys_instruction.empty() && sys_instruction.back() != ' ')
-                sys_instruction += ' ';
-            sys_instruction += "The following words may appear in the audio: " + params.hotwords + ".";
+        std::string text = core_qwen3_prompt::build(N_enc, sys_instruction, "", assistant_prefill, params.hotwords,
+                                                    context_enabled_ ? params.context : "");
+        if (raon_) {
+            warn_raon_ignored_flags(params);
+            text = raon_prompt(N_enc, params.ask);
+            assistant_prefill.clear();
         }
-
-        std::string text = "<|im_start|>system\n" + sys_instruction +
-                           "<|im_end|>\n"
-                           "<|im_start|>user\n"
-                           "<|audio_start|>";
-        for (int i = 0; i < N_enc; i++)
-            text += "<|audio_pad|>";
-        text += "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
-        text += assistant_prefill;
 
         int n_prompt = 0;
         int32_t* raw_ids = qwen3_asr_tokenize(ctx_, text.c_str(), &n_prompt);
@@ -617,6 +649,8 @@ public:
         int first_token = 0;
         float first_prob = 1.0f;
         const int last_off = (n_t - 1) * vocab;
+        if (raon_ && eos_id >= 0 && eos_id < vocab)
+            logits[last_off + eos_id] = -INFINITY; // disable_eos_on_first_output
         if (params.temperature > 0.0f) {
             std::mt19937_64 seed_rng((params.seed != 0 ? params.seed : (uint64_t)std::random_device{}()) ^
                                      (uint64_t)0x9E3779B97F4A7C15ull);
@@ -646,7 +680,7 @@ public:
             if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
                 return;
             std::string txt = decode_token(raw);
-            if (txt == "language") {
+            if (!raon_ && txt == "language") {
                 capture_language = true;
                 return;
             }
@@ -671,6 +705,38 @@ public:
         }
     }
 
+    // ---- Prefix-rollback streaming (#445, Confucius4-R2T2) ----------------
+    //
+    // One model call of the streaming algorithm (core/qwen3_stream.h): greedy
+    // decode over ALL audio so far, with `assistant_suffix` appended after the
+    // assistant generation prompt, at most max_new tokens, special tokens
+    // skipped. This is the vLLM call in R2T2ASRModel.streaming_transcribe:
+    // llm.generate({prompt: prompt_raw + prefix, audio}, temperature=0,
+    // max_tokens, skip_special_tokens=True).
+    std::string stream_generate(const std::vector<float>& audio, const std::string& assistant_suffix, int max_new) {
+        return core_qwen3_stream_model::generate(ctx_, raon_, audio, assistant_suffix, max_new);
+    }
+
+    std::vector<int32_t> stream_encode(const std::string& utf8) {
+        int n = 0;
+        int32_t* a = qwen3_asr_tokenize(ctx_, utf8.c_str(), &n);
+        std::vector<int32_t> v(a, a + (a ? n : 0));
+        free(a);
+        return v;
+    }
+
+    std::string stream_decode_bytes(const std::vector<int32_t>& ids) {
+        std::string out;
+        for (int32_t id : ids) {
+            const char* piece = qwen3_asr_token_text(ctx_, id);
+            if (piece)
+                out += decode_token(piece);
+        }
+        return out;
+    }
+
+    std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params& params) override;
+
     void shutdown() override {
         if (ctx_) {
             qwen3_asr_free(ctx_);
@@ -679,11 +745,143 @@ public:
     }
 
 private:
+    int special_id(const char* tok) {
+        int n = 0;
+        int32_t* a = qwen3_asr_tokenize(ctx_, tok, &n);
+        const int id = (a && n == 1) ? a[0] : -1;
+        free(a);
+        return id;
+    }
+
     qwen3_asr_context* ctx_ = nullptr;
+    std::string stream_recipe_; // GGUF qwen3asr.streaming_recipe ("r2t2" or "")
+    bool raon_ = false;         // #455 Raon-Speech-9B GGUF
+    bool context_enabled_;      // CLI context is supported only for Qwen3-ASR.
 };
+
+// Realtime session: Confucius4-R2T2's prefix-rollback streaming, driven by the
+// example.py schedule. The per-chunk logic lives in core/qwen3_stream.h and is
+// unit-tested there; this class only feeds it audio and the model call.
+class Qwen3RealtimeSession final : public CrispasrRealtimeSession {
+public:
+    Qwen3RealtimeSession(Qwen3Backend* be, const whisper_params& p) : be_(be) {
+        cfg_.unfixed_chunk_num = env_int("CRISPASR_QWEN3_STREAM_UNFIXED_CHUNKS", 0);
+        cfg_.unfixed_token_num = env_int("CRISPASR_QWEN3_STREAM_UNFIXED_TOKENS", 1);
+        step_ = 16 * env_int("CRISPASR_QWEN3_STREAM_STEP_MS", 160);
+        lookahead_ = 16 * env_int("CRISPASR_QWEN3_STREAM_LOOKAHEAD_MS", 160);
+        if (!p.language.empty() && p.language != "auto") {
+            const std::string name = crispasr_iso_to_english_lang(p.language);
+            std::u32string u;
+            if (core_qwen3_stream::utf8_decode(name, u))
+                cfg_.force_language = core_qwen3_stream::normalize_language_name(u);
+        }
+        hooks_.encode = [this](const std::string& s) { return be_->stream_encode(s); };
+        hooks_.decode_bytes = [this](const std::vector<int32_t>& ids) { return be_->stream_decode_bytes(ids); };
+        hooks_.generate = [this](const std::vector<float>& audio, const std::string& prefix, int max_new) {
+            // prompt_raw carries "language X<asr_text>" when the language is forced.
+            std::string suffix;
+            if (!cfg_.force_language.empty())
+                suffix = "language " + core_qwen3_stream::utf8_encode(cfg_.force_language) + "<asr_text>";
+            return be_->stream_generate(audio, suffix + prefix, max_new);
+        };
+        // Qualified: the class is final, so this is the call that happens
+        // anyway — spelled non-virtual (cppcheck virtualCallInConstructor).
+        // cppcheck-suppress virtualCallInConstructor
+        Qwen3RealtimeSession::reset();
+    }
+
+    bool append(const float* samples, int n_samples, bool flush, callback on_text) override {
+        buffer_.insert(buffer_.end(), samples, samples + std::max(0, n_samples));
+        while ((int)buffer_.size() >= sched_.next_chunk_samples()) {
+            const int n = sched_.next_chunk_samples();
+            const int max_new = sched_.max_new;
+            const auto r = core_qwen3_stream::step(st_, hooks_, buffer_.data(), (size_t)n, max_new);
+            buffer_.erase(buffer_.begin(), buffer_.begin() + n);
+            trace("step", max_new, r);
+            sched_.update(r.fixed_text);
+            // Append-only, as R2T2's ws_server.py emits it: only the part of
+            // the fixed (rolled-back) text beyond what was already committed,
+            // measured by length, so a client can concatenate the deltas.
+            if (r.fixed_text.size() > committed_.size()) {
+                committed_ += r.fixed_text.substr(committed_.size());
+                on_text(core_qwen3_stream::utf8_encode(committed_), false);
+            }
+        }
+        if (flush) {
+            const auto r = core_qwen3_stream::finish(st_, hooks_, buffer_.data(), buffer_.size(), sched_.first_max_new);
+            if (r.counted)
+                trace("finish", sched_.first_max_new, r);
+            buffer_.clear();
+            if (st_.text.size() > committed_.size())
+                committed_ += st_.text.substr(committed_.size());
+            on_text(core_qwen3_stream::utf8_encode(committed_), true);
+        }
+        return true;
+    }
+
+    void reset() override {
+        st_ = core_qwen3_stream::State{};
+        st_.cfg = cfg_;
+        sched_.init(step_, lookahead_);
+        buffer_.clear();
+        committed_.clear();
+    }
+
+private:
+    // CRISPASR_QWEN3_STREAM_TRACE=1: one JSON line per model call on stderr,
+    // the same fields tools/kaggle/r2t2-stream-ref logs, for call-by-call diffs.
+    void trace(const char* kind, int max_new, const core_qwen3_stream::StepResult& r) const {
+        static const bool on = env_int("CRISPASR_QWEN3_STREAM_TRACE", 0) != 0;
+        if (!on)
+            return;
+        auto esc = [](const std::u32string& u) {
+            std::string s = core_qwen3_stream::utf8_encode(u), o;
+            for (char c : s) {
+                if (c == '"' || c == '\\')
+                    o.push_back('\\');
+                if (c == '\n') {
+                    o += "\\n";
+                    continue;
+                }
+                o.push_back(c);
+            }
+            return o;
+        };
+        fprintf(stderr,
+                "QWEN3_STREAM {\"kind\":\"%s\",\"n_audio\":%zu,\"max_tokens\":%d,\"prefix\":\"%s\",\"gen_text\":\"%s\","
+                "\"after_text\":\"%s\",\"after_fixed\":\"%s\",\"after_chunk_id\":%d}\n",
+                kind, st_.audio_accum.size(), max_new, esc(r.prefix).c_str(), esc(r.gen_text).c_str(),
+                esc(st_.text).c_str(), esc(r.fixed_text).c_str(), st_.chunk_id);
+    }
+
+    static int env_int(const char* name, int def) {
+        const char* v = getenv(name);
+        return (v && *v) ? atoi(v) : def;
+    }
+
+    Qwen3Backend* be_;
+    core_qwen3_stream::Config cfg_;
+    core_qwen3_stream::Hooks hooks_;
+    core_qwen3_stream::State st_;
+    core_qwen3_stream::Schedule sched_;
+    std::vector<float> buffer_;
+    std::u32string committed_; // append-only text already emitted
+    int step_ = 2560, lookahead_ = 2560;
+};
+
+// Streaming is on for GGUFs converted with --streaming-recipe r2t2, or for
+// any Qwen3-ASR model when CRISPASR_QWEN3_STREAM=1 (the recipe was tuned for
+// R2T2; stock Qwen3-ASR's own streaming defaults differ).
+std::unique_ptr<CrispasrRealtimeSession> Qwen3Backend::create_realtime_session(const whisper_params& params) {
+    const char* force = getenv("CRISPASR_QWEN3_STREAM");
+    const bool on = force ? atoi(force) != 0 : stream_recipe_ == "r2t2";
+    if (!ctx_ || !on)
+        return nullptr;
+    return std::make_unique<Qwen3RealtimeSession>(this, params);
+}
 
 } // namespace
 
-std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend() {
-    return std::unique_ptr<CrispasrBackend>(new Qwen3Backend());
+std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend(bool context_enabled) {
+    return std::unique_ptr<CrispasrBackend>(new Qwen3Backend(context_enabled));
 }

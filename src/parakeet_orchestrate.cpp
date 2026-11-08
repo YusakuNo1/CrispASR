@@ -5,8 +5,10 @@
 // adapter path (verified by the surface-parity harness + CLI A/B).
 
 #include "parakeet_orchestrate.h"
+#include "core/parakeet_word_ranges.h"
 
 #include "core/asr_segment_group.h"
+#include "core/sys_mem.h"
 
 #include <algorithm>
 #include <cctype>
@@ -80,6 +82,8 @@ std::vector<parakeet_seg> split_result_to_segs(const parakeet_result* r, int64_t
         word_t0.push_back(r->words[i].t0);
     const std::vector<int> starts = core_segment::group_by_window(word_t0, (int64_t)seg_seconds * 100);
 
+    const auto token_ranges = core_parakeet_words::token_ranges(r->n_tokens, [&](int i) { return r->tokens[i].text; });
+    const bool own_tokens = token_ranges.size() == (size_t)r->n_words;
     int ti = 0;
     for (size_t si = 0; si < starts.size(); si++) {
         const int w_begin = starts[si];
@@ -102,7 +106,8 @@ std::vector<parakeet_seg> split_result_to_segs(const parakeet_result* r, int64_t
         seg.t0 = seg.words.front().t0;
         seg.t1 = seg.words.back().t1;
         const int64_t next_start = (w_end < r->n_words) ? r->words[w_end].t0 : INT64_MAX;
-        for (; ti < r->n_tokens && r->tokens[ti].t0 < next_start; ti++) {
+        const int token_end = own_tokens ? token_ranges[w_end - 1].second : r->n_tokens;
+        for (; ti < token_end && (own_tokens || r->tokens[ti].t0 < next_start); ti++) {
             const auto& t = r->tokens[ti];
             parakeet_seg::token ct;
             ct.text = t.text;
@@ -298,7 +303,10 @@ int gap_fill_segments(parakeet_context* ctx, const float* samples, int n_samples
             parakeet_seg got = result_to_seg(r, win0_cs);
             parakeet_result_free(r);
 
-            for (auto& w : got.words) {
+            const auto ranges = core_parakeet_words::token_ranges((int)got.tokens.size(),
+                                                                  [&](int i) { return got.tokens[i].text.c_str(); });
+            for (size_t wi = 0; wi < got.words.size(); ++wi) {
+                auto& w = got.words[wi];
                 const int64_t mid = (w.t0 + w.t1) / 2;
                 if (mid < g.first - kCoverSlopCs || mid >= g.second + kCoverSlopCs)
                     continue; // context word from outside the hole
@@ -343,12 +351,10 @@ int gap_fill_segments(parakeet_context* ctx, const float* samples, int n_samples
                 }
                 dirty[si] = true;
                 seam.push_back({w.t0, norm_word(w.text)}); // guard the next window's edge too
-                std::vector<parakeet_seg::token> keep;
-                for (auto& tk : got.tokens)
-                    if (tk.t0 >= w.t0 && tk.t0 <= w.t1)
-                        keep.push_back(tk);
-                for (auto& tk : keep)
-                    segs[si].tokens.push_back(std::move(tk));
+                if (ranges.size() == got.words.size()) {
+                    for (int ti = ranges[wi].first; ti < ranges[wi].second; ++ti)
+                        segs[si].tokens.push_back(got.tokens[ti]);
+                }
                 segs[si].words.push_back(std::move(w));
                 ++recovered;
             }
@@ -579,22 +585,42 @@ resolved_strategy resolve_strategy(parakeet_context* ctx, int n_samples, bool is
     // Phase 2: proactive encoder memory policy. When single-pass is chosen but
     // its estimated O(T^2) rel-pos bias would exceed a user-set VRAM budget,
     // switch to the streamed (bounded-window) encoder BEFORE allocating —
-    // instead of allocate → OOM → reactive fallback. Opt-in: default budget 0
-    // = disabled → single-pass as before (the reactive fallback still backstops).
-    //   CRISPASR_PARAKEET_MEM_POLICY = auto (default) | off | single | streamed
-    //   CRISPASR_PARAKEET_VRAM_BUDGET_MB : budget (MiB); 0/unset = disabled
+    // instead of allocate → OOM → reactive fallback. The allocation-site hard
+    // guard in parakeet.cpp remains active even when this routing policy is off.
+    //   CRISPASR_PARAKEET_MEM_POLICY = auto (default) | off | streamed
+    //   CRISPASR_PARAKEET_VRAM_BUDGET_MB : budget (MiB); explicit 0 disables routing policy
     //   CRISPASR_PARAKEET_MEM_COEFF : O(T^2) estimate coefficient (default 8.0)
     if (rs.strat == parakeet_strategy::SINGLE_PASS) {
         const char* pol = getenv("CRISPASR_PARAKEET_MEM_POLICY");
         const bool mode_off = pol && strcmp(pol, "off") == 0;
-        const bool mode_force_single = pol && strcmp(pol, "single") == 0;
         const bool mode_force_streamed = pol && strcmp(pol, "streamed") == 0;
         if (mode_force_streamed) {
             rs.strat = parakeet_strategy::STREAMED;
-        } else if (!mode_off && !mode_force_single) {
+        } else if (!mode_off) {
             double budget = 0.0, coeff = 8.0;
-            if (const char* e = getenv("CRISPASR_PARAKEET_VRAM_BUDGET_MB"))
-                budget = atof(e);
+            // #441: an UNSET budget used to mean "policy disabled", which left a
+            // ~123 GB single-pass allocation to be attempted on a 15 GB machine.
+            // Linux overcommit granted it about half the time (RSS stayed ~1 GB,
+            // because the buffer is never fully written) and refused it the rest,
+            // and the refusal was dereferenced — so the symptom was an
+            // INTERMITTENT SIGSEGV rather than a diagnosable error. The estimate
+            // and the switch to STREAMED were both already implemented; only the
+            // budget was missing. Default it to what the machine can give.
+            //
+            // Half of MemAvailable, because the encoder bias is not the only live
+            // allocation — weights, activations and the decoder share the pool.
+            // An EXPLICIT 0 still disables the policy, so that escape hatch
+            // survives; only "unset" changes meaning.
+            const char* bud_env = getenv("CRISPASR_PARAKEET_VRAM_BUDGET_MB");
+            if (bud_env) {
+                budget = atof(bud_env);
+            } else {
+                const double avail = core_sys_mem::available_mb();
+                // -1 means "could not determine". Treating that as 0 would turn
+                // an unreadable /proc into a policy that refuses every input.
+                if (avail > 0.0)
+                    budget = avail * 0.5;
+            }
             if (const char* e = getenv("CRISPASR_PARAKEET_MEM_COEFF"))
                 coeff = atof(e);
             const int T_enc = parakeet_est_enc_frames(ctx, n_samples);
@@ -603,7 +629,8 @@ resolved_strategy resolve_strategy(parakeet_context* ctx, int n_samples, bool is
                 if (!opts.no_prints && !quiet)
                     fprintf(stderr,
                             "crispasr[parakeet]: single-pass est %.0f MiB > budget %.0f MiB (T=%d, H=%d); "
-                            "using streamed encoding (set CRISPASR_PARAKEET_MEM_POLICY=single to force)\n",
+                            "using streamed encoding (MEM_POLICY=off disables proactive routing; the physical-memory "
+                            "guard remains active)\n",
                             parakeet_est_singlepass_peak_mb(T_enc, H, coeff), budget, T_enc, H);
                 rs.strat = parakeet_strategy::STREAMED;
             }
@@ -682,14 +709,25 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
 
     const int SR = 16000;
 
+    // Resolve EVERY route before dispatch. #441's first fix guarded only the
+    // SINGLE_PASS branch below an early explicit-chunk return, which meant its
+    // unit test did not exercise the reporter's actual command.
+    const resolved_strategy rs = resolve_strategy(ctx, n_samples, is_ja, opts, /*quiet=*/false);
+    const parakeet_strategy strat = rs.strat;
+
     // Issue #257: explicit --chunk-seconds (non-JA) → coherent quality-window
     // decode grouped into ~N-second segments (see parakeet_orchestrate.h).
-    if (!is_ja && opts.chunk_seconds_explicit && opts.chunk_seconds > 0) {
+    if (strat == parakeet_strategy::CHUNK_SEGMENTED) {
         const int seg_seconds = std::max(2, opts.chunk_seconds);
         int enc_window = 0;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
             enc_window = std::max(2, atoi(e));
         const int ov = std::max(0, (int)(opts.chunk_overlap_seconds + 0.5f));
+        if (!opts.no_prints)
+            fprintf(stderr,
+                    "crispasr[parakeet]: route=chunk-segmented output-window=%ds encoder-window=%ds "
+                    "(bounded encoder allocation)\n",
+                    seg_seconds, enc_window > 0 ? enc_window : 30);
         enc_progress_bridge bridge{&opts};
         parakeet_result* rc =
             parakeet_transcribe_streamed_progress(ctx, samples, n_samples, t_offset_cs, enc_window, ov,
@@ -708,8 +746,6 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         return out;
     }
 
-    const resolved_strategy rs = resolve_strategy(ctx, n_samples, is_ja, opts, /*quiet=*/false);
-    const parakeet_strategy strat = rs.strat;
     const int stream_chunk_s = rs.stream_chunk_s;
     const int stream_overlap_s = rs.stream_overlap_s;
 

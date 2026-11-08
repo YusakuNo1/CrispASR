@@ -11,7 +11,7 @@ non-trivial wav, word overlap — a crash or silent no-op cannot mint a pass.
 GPU build so both the DiT and the HiFi-GAN vocoder run on-device (#387 perf:
 the vocoder now uses the shared GPU-capable core_hifigan graph; ggml-cuda ships
 sm_60/75, so P100/T4 are fine — unlike torch, which lacks P100 kernels).
-Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
+Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache.
 """
 
 import json

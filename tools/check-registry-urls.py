@@ -33,6 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REGISTRY = ROOT / "src" / "crispasr_model_registry.cpp"
+MANIFEST = ROOT / "tests" / "regression" / "manifest.json"
 
 # {"name", "file.gguf", "https://…", "~size", companion_file, companion_url, …}
 # Entries span lines and contain nullptrs, so match the URL string literals and
@@ -56,9 +57,22 @@ def is_download_url(url: str) -> bool:
     return any(h in url for h in DOWNLOAD_HINTS) or url.endswith(MODEL_SUFFIXES)
 
 
+# Adjacent C string literals are one string to the compiler:
+#     "https://huggingface.co/cstr/foo-GGUF/resolve/main/"
+#     "foo-q4_k.gguf",
+# is a single URL. Matching line by line saw only the first half and HEADed the
+# bare directory (404) — the dolphin row, 2026-09-23. Join them the way the
+# compiler does before looking for URLs.
+ADJACENT_LITERALS_RE = re.compile(r'"[ \t]*\n[ \t]*"')
+
+
+def join_adjacent_literals(text: str) -> str:
+    return ADJACENT_LITERALS_RE.sub("", text)
+
+
 def parse_registry(path: Path):
     """Yield (backend, url) in file order."""
-    text = path.read_text(errors="replace")
+    text = join_adjacent_literals(path.read_text(errors="replace"))
     out, current = [], None
     for line in text.splitlines():
         stripped = line.strip()
@@ -71,6 +85,24 @@ def parse_registry(path: Path):
             url = um.group(1).rstrip(").,;")
             if is_download_url(url):
                 out.append((current or "?", url))
+    return out
+
+
+def parse_manifest(path: Path):
+    """Yield ("regression:<name>", url) for every pinned GGUF in the regression
+    manifest. Three pins were 12 real hex characters padded to 40 by hand, so
+    they 404'd and their backends never ran in the Kaggle suite (2026-10-06)."""
+    import json
+    out = []
+    if not path.is_file():
+        return out
+    for entry in json.loads(path.read_text()).get("backends", []):
+        g = entry.get("gguf") or {}
+        if not (g.get("repo") and g.get("revision") and g.get("file")):
+            continue
+        for f in [g["file"], *g.get("companion_files", [])]:
+            out.append((f"regression:{entry['name']}",
+                        f"https://huggingface.co/{g['repo']}/resolve/{g['revision']}/{f}"))
     return out
 
 
@@ -115,7 +147,7 @@ def main() -> int:
     if not REGISTRY.is_file():
         print(f"ERROR: {REGISTRY} not found", file=sys.stderr)
         return 1
-    pairs = parse_registry(REGISTRY)
+    pairs = parse_registry(REGISTRY) + parse_manifest(MANIFEST)
     if args.backend:
         pairs = [p for p in pairs if p[0] == args.backend]
     # De-duplicate: several entries legitimately share a URL (aliases).
@@ -125,7 +157,8 @@ def main() -> int:
             seen.add(u)
             uniq.append((b, u))
 
-    print(f"checking {len(uniq)} unique URLs from {REGISTRY.relative_to(ROOT)}\n")
+    print(f"checking {len(uniq)} unique URLs from {REGISTRY.relative_to(ROOT)} "
+          f"and {MANIFEST.relative_to(ROOT)}\n")
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         results = list(ex.map(lambda p: (p[0], p[1], *check(p[1], args.timeout)), uniq))
 

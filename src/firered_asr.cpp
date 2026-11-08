@@ -17,6 +17,8 @@
 #include "firered_asr.h"
 
 #include "core/cpu_attention.h" // cpu_dot + cpu_online_softmax_accumulate (shared)
+#include "core/parallel_for.h"
+#include "core/cpu_model_kernels.h"
 #include "core/fastconformer.h" // core_conformer::rel_shift (ggml rel-pos attention)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
@@ -40,6 +42,7 @@
 #include <unordered_map>
 #include <vector>
 #include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 // ===========================================================================
 // Bench instrumentation — `FIRERED_BENCH=1` for per-stage timings.
@@ -696,17 +699,18 @@ static void compute_fbank(const float* pcm, int n_samples, std::vector<float>& f
         auto mel2hz = [](float m) { return 700.0f * (expf(m / 1127.0f) - 1.0f); };
         float mel_lo = hz2mel(low_freq);
         float mel_hi = hz2mel(high_freq);
-        std::vector<float> center(n_mels + 2);
-        for (int i = 0; i < n_mels + 2; i++)
-            center[i] = mel2hz(mel_lo + i * (mel_hi - mel_lo) / (n_mels + 1));
-
+        (void)mel2hz;
+        // Triangles linear in MEL over the n_fft/2 bins below Nyquist, as
+        // kaldi-native-fbank (FireRedASR's reference front-end) builds them; the
+        // Hz-linear form used before drifted from it (log-mel mean |d| ~2.6e-3).
+        const float delta = (mel_hi - mel_lo) / (float)(n_mels + 1);
         for (int m = 0; m < n_mels; m++) {
-            for (int k = 0; k < n_fft_bins; k++) {
-                float freq = (float)k * sample_rate / n_fft;
-                if (freq > center[m] && freq <= center[m + 1] && center[m + 1] > center[m])
-                    mel_fb[m * n_fft_bins + k] = (freq - center[m]) / (center[m + 1] - center[m]);
-                else if (freq > center[m + 1] && freq < center[m + 2] && center[m + 2] > center[m + 1])
-                    mel_fb[m * n_fft_bins + k] = (center[m + 2] - freq) / (center[m + 2] - center[m + 1]);
+            const float left = mel_lo + (float)m * delta, center = left + delta, right = center + delta;
+            for (int k = 0; k < n_fft / 2; k++) {
+                const float mel = hz2mel((float)k * sample_rate / n_fft);
+                if (mel > left && mel < right)
+                    mel_fb[m * n_fft_bins + k] =
+                        mel <= center ? (mel - left) / (center - left) : (right - mel) / (right - center);
             }
         }
     }
@@ -827,23 +831,16 @@ static void read_f32_vec(ggml_tensor* t, std::vector<float>& out) {
 using crispasr::cpu_attn::cpu_dot;
 using crispasr::cpu_attn::cpu_online_softmax_accumulate;
 
+// Check if sequential baseline FireRed ASR is requested.
+static inline bool crispasr_firered_serial() {
+    const char* e = std::getenv("CRISPASR_FIRERED_SERIAL");
+    return (e && *e && std::strcmp(e, "0") != 0);
+}
+
 // CPU matmul: C = A @ B^T where A is [M,K], B is [N,K] → C is [M,N]
 // (B stored as [N,K] row-major, like ggml weight [K,N] with ne[0]=K)
-static void cpu_matmul_bt(const float* A, const float* B, float* C, int M, int K, int N) {
-    if (M == 1) {
-        // Single-vector × matrix: parallelize over output dimension N.
-        // This is the decoder hot path (one token per step).
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n++)
-            C[n] = cpu_dot(A, B + (size_t)n * K, K);
-    } else {
-#pragma omp parallel for schedule(static)
-        for (int m = 0; m < M; m++) {
-            const float* arow = A + (size_t)m * K;
-            for (int n = 0; n < N; n++)
-                C[(size_t)m * N + n] = cpu_dot(arow, B + (size_t)n * K, K);
-        }
-    }
+static void cpu_matmul_bt(const float* A, const float* B, float* C, int M, int K, int N, int n_threads = 1) {
+    core_cpu_kernels::matmul_bt(A, B, C, M, K, N, crispasr_firered_serial() ? 1 : n_threads);
 }
 
 // ggml vector-matrix multiply using quantized weight tensor directly.
@@ -878,7 +875,7 @@ static void ggml_matmat(ggml_backend_t be, ggml_backend_sched_t sc, ggml_tensor*
         ggml_backend_sched_set_tensor_backend(sc, bias_b, be);
     if (ggml_backend_sched_alloc_graph(sc, gf)) {
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vi"), input, 0, (size_t)M * K * sizeof(float));
-        if (ggml_backend_sched_graph_compute(sc, gf) == GGML_STATUS_SUCCESS)
+        if (core_sched_prof::compute(sc, gf, "firered-asr") == GGML_STATUS_SUCCESS)
             ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "vo"), output, 0, (size_t)M * N * sizeof(float));
     }
     ggml_free(c0);
@@ -1386,7 +1383,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             return;
         }
         ggml_backend_tensor_set(inp, subsampled, 0, flat_dim * T * sizeof(float));
-        ggml_backend_sched_graph_compute(sctx->sched, gf);
+        core_sched_prof::compute(sctx->sched, gf, "firered-asr");
         ggml_backend_tensor_get(out, x_buf.data(), 0, d * T * sizeof(float));
         ggml_free(ctx0);
     }
@@ -1501,7 +1498,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             }
             ggml_backend_tensor_set(x_in, x_buf.data(), 0, d * T * sizeof(float));
             ggml_backend_tensor_set(pe_in, pe_center.data(), 0, d * T_pe * sizeof(float));
-            ggml_backend_sched_graph_compute(sctx->sched, gf);
+            core_sched_prof::compute(sctx->sched, gf, "firered-asr");
 
             // Read outputs
             ggml_tensor* ffn1_t = ggml_graph_get_tensor(gf, "ffn1_out");
@@ -1534,57 +1531,82 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             if (!ggml_attn) {
                 float scale = 1.0f / sqrtf((float)hd);
 
-#pragma omp parallel
-                {
-                    std::vector<float> qbu(hd);
-                    std::vector<float> qbv(hd);
+                if (crispasr_firered_serial()) {
+                    {
+                        std::vector<float> qbu(hd);
+                        std::vector<float> qbv(hd);
 
-                    // NOTE: the two collapsed loops must be *perfectly* nested (no statements
-                    // between the `h` and `tq` headers), otherwise GCC/Clang reject the
-                    // `collapse(2)` clause. The per-head bias/query pointers are therefore
-                    // derived inside the inner loop — they are pure pointer arithmetic and cost
-                    // nothing.
-#pragma omp for collapse(2) schedule(static)
-                    for (int h = 0; h < nh; h++) {
-                        for (int tq = 0; tq < T; tq++) {
-                            const float* __restrict buh = biases[li].bu.data() + h * hd;
-                            const float* __restrict bvh = biases[li].bv.data() + h * hd;
-                            // Precompute query + biases once
-                            // q is fixed for this query position tq.
-                            // These are loop-invariant terms:
-                            //
-                            //   (q + bu) * k
-                            //   (q + bv) * p
-                            //
-                            // Originally these additions happened inside the tk loop.
-                            // Hoisting them removes 2*hd additions per key timestep.
-                            const float* __restrict q = Q_buf.data() + h * hd + tq * d;
-                            for (int dd = 0; dd < hd; dd++) {
-                                qbu[dd] = q[dd] + buh[dd];
-                                qbv[dd] = q[dd] + bvh[dd];
+                        for (int h = 0; h < nh; h++) {
+                            for (int tq = 0; tq < T; tq++) {
+                                const float* __restrict buh = biases[li].bu.data() + h * hd;
+                                const float* __restrict bvh = biases[li].bv.data() + h * hd;
+                                // Precompute query + biases once
+                                // q is fixed for this query position tq.
+                                // These are loop-invariant terms:
+                                //
+                                //   (q + bu) * k
+                                //   (q + bv) * p
+                                //
+                                // Originally these additions happened inside the tk loop.
+                                // Hoisting them removes 2*hd additions per key timestep.
+                                const float* __restrict q = Q_buf.data() + h * hd + tq * d;
+                                for (int dd = 0; dd < hd; dd++) {
+                                    qbu[dd] = q[dd] + buh[dd];
+                                    qbv[dd] = q[dd] + bvh[dd];
+                                }
+
+                                cpu_online_softmax_accumulate(
+                                    T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd,
+                                    [&](int tk) -> float {
+                                        // Compute attention score:
+                                        //
+                                        // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
+                                        //
+                                        // Keep the two terms separate because the model has both
+                                        // content attention and relative-position attention.
+                                        float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
+
+                                        float position = 0.0f;
+                                        int pos_idx = T - 1 - tq + tk;
+                                        if ((unsigned)pos_idx < (unsigned)T_pe) {
+                                            position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
+                                        }
+
+                                        return (content + position) * scale;
+                                    });
                             }
-
-                            cpu_online_softmax_accumulate(
-                                T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd,
-                                [&](int tk) -> float {
-                                    // Compute attention score:
-                                    //
-                                    // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
-                                    //
-                                    // Keep the two terms separate because the model has both
-                                    // content attention and relative-position attention.
-                                    float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
-
-                                    float position = 0.0f;
-                                    int pos_idx = T - 1 - tq + tk;
-                                    if ((unsigned)pos_idx < (unsigned)T_pe) {
-                                        position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
-                                    }
-
-                                    return (content + position) * scale;
-                                });
                         }
                     }
+                } else {
+                    const int total_queries = nh * T;
+                    core_parallel::for_each_chunk_work(
+                        total_queries, sctx->n_threads, (uint64_t)T * hd * 3, 65536, [&](int q_start, int q_end) {
+                            std::vector<float> qbu(hd);
+                            std::vector<float> qbv(hd);
+                            for (int q_idx = q_start; q_idx < q_end; q_idx++) {
+                                const int h = q_idx / T;
+                                const int tq = q_idx % T;
+                                const float* __restrict buh = biases[li].bu.data() + h * hd;
+                                const float* __restrict bvh = biases[li].bv.data() + h * hd;
+                                const float* __restrict q = Q_buf.data() + h * hd + tq * d;
+                                for (int dd = 0; dd < hd; dd++) {
+                                    qbu[dd] = q[dd] + buh[dd];
+                                    qbv[dd] = q[dd] + bvh[dd];
+                                }
+
+                                cpu_online_softmax_accumulate(
+                                    T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd,
+                                    [&](int tk) -> float {
+                                        float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
+                                        float position = 0.0f;
+                                        int pos_idx = T - 1 - tq + tk;
+                                        if ((unsigned)pos_idx < (unsigned)T_pe) {
+                                            position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
+                                        }
+                                        return (content + position) * scale;
+                                    });
+                            }
+                        });
                 }
             } // end if (!ggml_attn) — CPU reference attention
 
@@ -1632,7 +1654,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
                 }
                 ggml_backend_tensor_set(x_in, x_buf.data(), 0, d * T * sizeof(float));
                 ggml_backend_tensor_set(attn_in, attn_out.data(), 0, d * T * sizeof(float));
-                ggml_backend_sched_graph_compute(sctx->sched, gf);
+                core_sched_prof::compute(sctx->sched, gf, "firered-asr");
 
                 ggml_tensor* out_t = ggml_graph_get_tensor(gf, "layer_out");
                 ggml_backend_tensor_get(out_t, x_buf.data(), 0, d * T * sizeof(float));
@@ -2144,7 +2166,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     ggml_backend_sched_reset(ctx->sched);
                     if (ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
                         ggml_backend_tensor_set(enc_inp, enc_output.data(), 0, T_sub * d * sizeof(float));
-                        if (ggml_backend_sched_graph_compute(ctx->sched, gf) == GGML_STATUS_SUCCESS) {
+                        if (core_sched_prof::compute(ctx->sched, gf, "firered-asr") == GGML_STATUS_SUCCESS) {
                             ggml_backend_tensor_get(k_proj, K_enc[li].data(), 0, T_sub * d * sizeof(float));
                             ggml_backend_tensor_get(v_proj, V_enc[li].data(), 0, T_sub * d * sizeof(float));
                             kv_done = true;
@@ -2182,7 +2204,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     if (ggml_backend_sched_alloc_graph(ctx->sched, gf2)) {
                         ggml_backend_tensor_set(ggml_graph_get_tensor(gf2, "ei"), enc_output.data(), 0,
                                                 T_sub * d * sizeof(float));
-                        if (ggml_backend_sched_graph_compute(ctx->sched, gf2) == GGML_STATUS_SUCCESS) {
+                        if (core_sched_prof::compute(ctx->sched, gf2, "firered-asr") == GGML_STATUS_SUCCESS) {
                             ggml_backend_tensor_get(ggml_graph_get_tensor(gf2, "kp"), K_enc[li].data(), 0,
                                                     T_sub * d * sizeof(float));
                             ggml_backend_tensor_get(ggml_graph_get_tensor(gf2, "vp"), V_enc[li].data(), 0,
@@ -2227,7 +2249,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             ggml_backend_sched_reset(ctx->sched);
             if (ggml_backend_sched_alloc_graph(ctx->sched, dec_proj_gf)) {
                 ggml_backend_tensor_set(dec_proj_inp, xn, 0, d * sizeof(float));
-                if (ggml_backend_sched_graph_compute(ctx->sched, dec_proj_gf) == GGML_STATUS_SUCCESS) {
+                if (core_sched_prof::compute(ctx->sched, dec_proj_gf, "firered-asr") == GGML_STATUS_SUCCESS) {
                     logits_out.resize(odim);
                     ggml_backend_tensor_get(dec_proj_logits, logits_out.data(), 0, odim * sizeof(float));
                     ok = true;
@@ -2532,7 +2554,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     fr_matmat(ctx, w, b, in, out, n_active, K, N);
                     return;
                 }
-                cpu_matmul_bt(in, w_f32.data(), out, n_active, K, N);
+                cpu_matmul_bt(in, w_f32.data(), out, n_active, K, N, ctx->n_threads);
                 if (!b_f32.empty())
                     for (int a = 0; a < n_active; a++)
                         for (int i = 0; i < N; i++)
@@ -2605,17 +2627,34 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                            d, d);
 
                 // Per-beam cross-attention scoring (shared K_enc/V_enc)
-#pragma omp parallel for collapse(2) schedule(static)
-                for (int a = 0; a < n_active; ++a) {
-                    for (int h = 0; h < nh_dec; ++h) {
-                        cpu_online_softmax_accumulate(T_sub, hd_dec, V_enc[li].data() + h * hd_dec, d,
-                                                      xattn_out_batch.data() + a * d + h * hd_dec, [&](int t) -> float {
-                                                          return cpu_dot(Qx_batch.data() + a * d + h * hd_dec,
-                                                                         K_enc[li].data() + t * d + h * hd_dec,
-                                                                         hd_dec) *
-                                                                 inv_sqrt_hd_dec;
-                                                      });
+                if (crispasr_firered_serial() || n_active * nh_dec <= 1) {
+                    for (int a = 0; a < n_active; ++a) {
+                        for (int h = 0; h < nh_dec; ++h) {
+                            cpu_online_softmax_accumulate(
+                                T_sub, hd_dec, V_enc[li].data() + h * hd_dec, d,
+                                xattn_out_batch.data() + a * d + h * hd_dec, [&](int t) -> float {
+                                    return cpu_dot(Qx_batch.data() + a * d + h * hd_dec,
+                                                   K_enc[li].data() + t * d + h * hd_dec, hd_dec) *
+                                           inv_sqrt_hd_dec;
+                                });
+                        }
                     }
+                } else {
+                    const int total_cross = n_active * nh_dec;
+                    core_parallel::for_each_chunk_work(
+                        total_cross, ctx->n_threads, (uint64_t)T_sub * hd_dec * 2, 65536, [&](int c_start, int c_end) {
+                            for (int c_idx = c_start; c_idx < c_end; c_idx++) {
+                                const int a = c_idx / nh_dec;
+                                const int h = c_idx % nh_dec;
+                                cpu_online_softmax_accumulate(
+                                    T_sub, hd_dec, V_enc[li].data() + h * hd_dec, d,
+                                    xattn_out_batch.data() + a * d + h * hd_dec, [&](int t) -> float {
+                                        return cpu_dot(Qx_batch.data() + a * d + h * hd_dec,
+                                                       K_enc[li].data() + t * d + h * hd_dec, hd_dec) *
+                                               inv_sqrt_hd_dec;
+                                    });
+                            }
+                        });
                 }
 
                 // Batched cross-attention FC + residual (bias applied in proj_batch)
@@ -2826,7 +2865,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
     // So we can feed it directly!
     ggml_backend_tensor_set(enc_inp, enc_output.data(), 0, T_sub * hp.d_model * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "firered-asr") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "firered_asr: CTC compute failed\n");
         ggml_free(ctx0);
         return nullptr;

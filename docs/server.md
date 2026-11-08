@@ -106,7 +106,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `target_lang` | Target language for AST backends |
 | `punctuation` | `true`/`false` — enable/disable punctuation (default: `true`; `false` strips punctuation from output) |
 | `diarize` | `true`/`false` — enable speaker diarization |
-| `diarize_method` | `energy`, `xcorr`, `vad-turns`, `sherpa`, `pyannote`, `ecapa`, `foxnose` (default: `energy`) |
+| `diarize_method` | `energy`, `xcorr`, `vad-turns`, `sherpa`, `pyannote`, `ecapa`, `foxnose`, `sortformer` (default: `energy`) |
 | `diarize_embedder` | Speaker-embedding model for cross-slice clustering (path or `auto`) |
 | `diarize_cluster_threshold` | Cosine merge threshold for embedding clustering (default: 0.5) |
 | `diarize_max_speakers` | Upper bound on speaker cluster count (default: 8) |
@@ -146,6 +146,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `split_on_punct` | `true`/`false` — split segments on punctuation (default: `false`) |
 | `max_context` | Maximum decoder text-context tokens carried across chunks (default: `-1` = model default) |
 | `audio_ctx` | Truncated audio context (whisper; default: `0` = full) |
+| `hikari_refresh_stride` | Strided window refresh interval for Hikari streaming (0 = exact sliding, K > 0 = strided; alias `hikari_stride`) |
 | `word_thold` | Word-timestamp probability threshold (default: 0.01) |
 | `carry_initial_prompt` | `true`/`false` — re-inject the initial prompt on every chunk (default: `false`) |
 | `lcs_dedup` | NeMo-style LCS hypothesis stitching at chunk boundaries: `auto` (default, fires when chunking with overlap is active), `on`, `off` |
@@ -351,7 +352,7 @@ curl http://localhost:8080/v1/audio/speech \
 |---|---|---|
 | `input` | (required) | Text to synthesize. Capped at `--tts-max-input-chars` (default 4096); set to 0 to disable the cap. Long input is automatically split on sentence boundaries before synthesis (see [long-form chunking](#long-form-chunking-for-v1audiospeech) below). |
 | `model` | (ignored) | Read but not validated — we serve whatever was loaded via `-m` or `POST /load`. Surfaced in the synth log line. |
-| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` reference is cloned on the fly (needs `ref_text` + the encoder/aligner GGUFs) when the server runs with `CRISPASR_TADA_WAV_CLONE=1` — otherwise convert it to a `tada-ref.gguf` first. |
+| `voice` | server's `--voice` | Passed to the backend's `params.tts_voice`. A bare name naming `<voice-dir>/<name>.wav` reaches every voice-cloning backend as that recording plus `<name>.txt` as `ref_text` (#584, see [Voice file conventions](#voice-file-conventions)); otherwise it is passed through verbatim and each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` reference is cloned on the fly (needs `ref_text` + the encoder/aligner GGUFs) when the server runs with `CRISPASR_TADA_WAV_CLONE=1` — otherwise convert it to a `tada-ref.gguf` first. |
 | `instructions` | empty | Voice-direction prose for backends that support it (qwen3-tts VoiceDesign). Silently ignored on other backends so OpenAI clients targeting `gpt-4o-mini-tts` don't see 4xx errors. |
 | `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
 | `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
@@ -376,6 +377,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `pad_silence_ms` | `0` | Pad this many ms of silence at the start of the output (per-request form of `--tts-pad-silence-ms`). |
 | `stream` | `false` | Stream the audio back with chunked transfer encoding instead of buffering the whole clip. See [Streaming synthesized audio](streaming.md#server-stream-true). Only the PCM formats are accepted (`wav`/`pcm`/`f32`); `mp3`/`aac`/`opus` return `400`. The body is always raw int16 LE PCM at the backend's native rate with `Content-Type: audio/pcm` — no RIFF header even when `response_format` was `wav`. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
+| `duration` | `0` | Exact output length in seconds, `0 .. 600` (omnivoice; upstream `duration` parity). `0` = the backend's estimate. Out-of-range returns 400 with `code=invalid_duration`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). Note that "no attestation" is not "nothing to disclose": a preset whose voice is a real person still owes the audible label, via `speaker_identity` below. |
 | `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
@@ -412,7 +414,7 @@ curl http://localhost:8080/v1/audio/speech \
 | 200 | `audio/pcm` | Raw int16 LE bytes (OpenAI `pcm`) |
 | 200 | `application/octet-stream` | Raw float32 PCM (`f32`) |
 | 200 | `audio/mpeg` / `audio/aac` / `audio/ogg` | Compressed `mp3` / `aac` / `opus` (Ogg Opus) via glint |
-| 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `unsupported_response_format`, `consent_required`, `invalid_voice`, `invalid_speaker_identity`, `invalid_instructions`, `unsupported_phonemes`. Also plain (code-less) 400s for a backend without `CAP_TTS` and for `stream=true` with a compressed `response_format`. |
+| 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `invalid_duration`, `unsupported_response_format`, `consent_required`, `invalid_voice`, `invalid_speaker_identity`, `invalid_instructions`, `unsupported_phonemes`. Also plain (code-less) 400s for a backend without `CAP_TTS` and for `stream=true` with a compressed `response_format`. |
 | 500 | `application/json` | Synthesis returned empty (e.g. unknown voice) — `code=synthesis_failed`; or the chosen container failed to encode — `code=encoding_failed`. |
 | 503 | `application/json` | Model still loading. |
 
@@ -479,8 +481,19 @@ The `.txt` companion is auto-loaded as `tts_ref_text` if the request
 doesn't carry one. Path traversal in the name (`..`, `/`, `\\`, NUL) is
 rejected before the filesystem is touched.
 
-Other backends (kokoro, vibevoice, orpheus) interpret `voice` according
-to their own conventions — see `docs/tts.md` for per-backend specifics.
+Every other voice-cloning backend (cosyvoice3, chatterbox, f5-tts,
+omnivoice, voxcpm2, zonos, indextts, …) gets the same treatment from one
+shared step before dispatch (#584): a bare name that resolves to
+`<voice-dir>/<name>.wav` is handed to the backend as that path, with
+`<name>.txt` as `ref_text` when the request carries none — exactly what
+`--voice <voice-dir>/<name>.wav --ref-text "…"` does on the CLI, and the same
+file the consent gate hashes. If `<name>.gguf` also exists the name is left
+for the backend (a `.gguf` profile wins, as in the consent gate), and a name
+with no file in `--voice-dir` stays a preset/bank name. pocket-tts, tada and
+vibevoice keep their own documented resolution.
+
+Preset-only backends (kokoro, orpheus) interpret `voice` according to their
+own conventions — see `docs/tts.md` for per-backend specifics.
 
 ### Long-form chunking for /v1/audio/speech
 
@@ -730,12 +743,15 @@ key when keys are configured (only `/health` is public).
 
 ## Request limits & error handling
 
-- **Upload cap: 512 MB.** A larger `Content-Length` is rejected with `413`
-  before the body is buffered (so an oversized multipart cannot OOM the
-  process ahead of auth/routing).
-- **Chunked uploads are refused.** cpp-httplib's chunked reader does not honour
-  the payload cap, so a `POST`/`PUT` carrying `Transfer-Encoding` gets `411
-  Length Required` — resend with a `Content-Length`.
+- **Upload cap: 512 MB.** An upload whose body crosses the cap — by
+  `Content-Length` or while streaming — is rejected with `413`, and the server
+  buffers at most the cap (so an oversized multipart cannot OOM the process
+  ahead of auth/routing).
+- **Chunked uploads work.** `Transfer-Encoding: chunked` request bodies are
+  read and bounded by the same 512 MB cap as `Content-Length` ones (the
+  vendored cpp-httplib 0.57 chunked reader enforces the payload limit), so
+  OpenAI SDK calls that stream a file handle (`fs.createReadStream(...)`,
+  `fs.openSync` + `Readable`) upload directly.
 - An unmatched route returns `{"error": "not found. Use POST /v1/audio/transcriptions"}`;
   an exception inside a handler returns a structured `500` naming the reason
   rather than being mislabelled as a 404.
@@ -787,6 +803,14 @@ only newly stable encoder frames, and emits genuine pre-commit
 final short chunk and resets all per-turn state. Other backends use a safe
 commit-only fallback; `session.created.partial_transcription` tells the client
 which contract is active.
+
+Qwen3-ASR models converted with `--streaming-recipe r2t2` (Confucius4-R2T2, `-m
+confucius4-r2t2`) also get a realtime session: every append re-decodes the audio
+so far with the previous transcript, minus its last token, as the assistant
+prefix. That's R2T2's prefix-rollback algorithm, on its `example.py` schedule
+(160 ms steps). Deltas are append-only. `CRISPASR_QWEN3_STREAM=1` enables the
+session for other Qwen3-ASR models, and `CRISPASR_QWEN3_STREAM_STEP_MS`,
+`_LOOKAHEAD_MS` and `_UNFIXED_TOKENS` tune it.
 
 `--vad --vad-model MODEL` enables server-side turn detection on this endpoint.
 PCM is held outside ASR until speech is detected, a bounded onset buffer protects

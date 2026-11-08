@@ -7,10 +7,10 @@ policy avoids the O(T²) single-pass rel-pos-bias OOM (issue #257) and that the
 ## Run
 ```bash
 # 1. Merge the code to main (or push the feature branch) so the kernel can clone it.
-# 2. Ensure the private dataset chr1str/crispasr-hf-token exists (HF_TOKEN secret).
+# 2. Ensure the private dataset ${KAGGLE_ACCOUNT}/crispasr-hf-token exists (HF_TOKEN secret).
 bash push.sh
-kaggle kernels status  chr1str/crispasr-parakeet-mem-policy-cuda
-kaggle kernels output  chr1str/crispasr-parakeet-mem-policy-cuda -p ./out
+kaggle kernels status  ${KAGGLE_ACCOUNT}/crispasr-parakeet-mem-policy-cuda
+kaggle kernels output  ${KAGGLE_ACCOUNT}/crispasr-parakeet-mem-policy-cuda -p ./out
 ```
 
 ## Knobs (env, set in the kernel or as Kaggle params)

@@ -17,6 +17,9 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string>
+#include <tuple>
 
 // core_cpu_backend:: is used unconditionally below (the zero-copy CPU mmap
 // path), so this include must NOT sit in the POSIX arm of the block that
@@ -39,6 +42,17 @@
 #endif
 
 namespace core_gguf {
+
+void apply_weight_usage(ggml_tensor* tensor, WeightUsagePolicy policy) {
+    if (!policy.classify)
+        return;
+    const auto usage = policy.classify(ggml_get_name(tensor), policy.user);
+    tensor->flags &= ~(GGML_TENSOR_FLAG_WEIGHT_MATMUL_ONLY | GGML_TENSOR_FLAG_WEIGHT_GENERAL);
+    if (usage == WeightUsage::MatmulOnly && ggml_n_dims(tensor) == 2 && !tensor->view_src)
+        tensor->flags |= GGML_TENSOR_FLAG_WEIGHT_MATMUL_ONLY;
+    else if (usage != WeightUsage::Unspecified)
+        tensor->flags |= GGML_TENSOR_FLAG_WEIGHT_GENERAL;
+}
 
 // ---------------------------------------------------------------------------
 // Pass 1: metadata
@@ -444,6 +458,40 @@ static std::vector<ggml_backend_buffer_t> take_split_extra(ggml_backend_buffer_t
     return extra;
 }
 
+namespace {
+struct FitSet {
+    std::set<std::string> cpu;
+};
+bool fit_is_gpu(const char* name, void* user) {
+    return static_cast<FitSet*>(user)->cpu.count(name) == 0;
+}
+// Names of the tensors in `path` that `backend` cannot bind: its own
+// supports_op() on each weight leaf, the check ggml_backend_sched aborts on.
+// Empty when the file cannot be read (the real load then reports the error).
+FitSet scan_unbindable(const char* path, ggml_backend_t backend) {
+    FitSet fit;
+    ggml_context* mctx = nullptr;
+    gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&mctx};
+    gguf_context* g = gguf_init_from_file(path, gp);
+    if (g && mctx) {
+        for (ggml_tensor* t = ggml_get_first_tensor(mctx); t; t = ggml_get_next_tensor(mctx, t)) {
+            if (!ggml_backend_supports_op(backend, t))
+                fit.cpu.insert(ggml_get_name(t));
+        }
+    }
+    if (g)
+        gguf_free(g);
+    if (mctx)
+        ggml_free(mctx);
+    return fit;
+}
+void log_unbindable(const char* tag, const FitSet& fit, ggml_backend_t backend) {
+    for (const auto& n : fit.cpu)
+        fprintf(stderr, "%s: '%s' exceeds what %s can bind; keeping it on the CPU\n", tag, n.c_str(),
+                ggml_backend_name(backend));
+}
+} // namespace
+
 // Issue #94 (chatterbox-turbo segfault during init on macOS / Apple
 // Silicon): the legacy alloc+copy load path takes 30-60 s for the
 // chatterbox-turbo T3 (658 MB Q8_0) on slow disks and reproducibly
@@ -523,7 +571,7 @@ static void try_mlock(const char* tag, void* base, size_t size) {
 } // namespace
 
 static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
-                              const char* model_tag, WeightLoad& out) {
+                              const char* model_tag, WeightLoad& out, WeightUsagePolicy usage) {
     const char* tag = model_tag ? model_tag : "core_gguf";
 
     // Issue #405: under GGML_BACKEND_DL every backend init can legitimately
@@ -605,6 +653,9 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
     } else {
         out.ctx = source_ctx;
     }
+
+    for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t))
+        apply_weight_usage(t, usage);
 
     // PLAN #51a: zero-copy CPU path. Skip ggml_backend_alloc_ctx_tensors
     // (which would allocate a fresh backend-side buffer) and instead bind
@@ -974,18 +1025,48 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
     return true;
 }
 
-bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out) {
-    return load_weights_impl(path, backend, nullptr, nullptr, model_tag, out);
+bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out,
+                  WeightUsagePolicy usage) {
+    // A GPU backend that cannot bind some weights (Vulkan: a tensor past
+    // maxStorageBufferRange - allocatable, not bindable) would otherwise load
+    // "fine" and abort later in ggml_backend_sched. Those weights go to a CPU
+    // buffer instead (see load_weights_fit). Callers of load_weights own only
+    // out.buf, so the CPU partition is registered as an extra of it and is
+    // released with it by release_weight_buffer(). CRISPASR_GGUF_NO_FIT=1 turns
+    // this off. A no-op on CUDA / Metal, whose supports_op accepts any leaf.
+    if (backend && !core_cpu_backend::is_cpu(backend) && !std::getenv("CRISPASR_GGUF_NO_FIT")) {
+        FitSet fit = scan_unbindable(path, backend);
+        if (!fit.cpu.empty()) {
+            const char* tag = model_tag ? model_tag : "core_gguf";
+            log_unbindable(tag, fit, backend);
+            ggml_backend_t cpu = core_cpu_backend::init();
+            const bool ok = cpu && load_weights_split(path, backend, cpu, fit_is_gpu, &fit, model_tag, out, usage);
+            if (cpu)
+                ggml_backend_free(cpu); // the CPU buffers do not depend on the backend instance
+            if (ok && out.buf_cpu) {
+                if (out.buf) {
+                    std::vector<ggml_backend_buffer_t> owned = take_split_extra(out.buf_cpu);
+                    owned.insert(owned.begin(), out.buf_cpu);
+                    register_split_extra(out.buf, owned);
+                } else {
+                    out.buf = out.buf_cpu; // every tensor was unbindable
+                }
+                out.buf_cpu = nullptr;
+            }
+            return ok;
+        }
+    }
+    return load_weights_impl(path, backend, nullptr, nullptr, model_tag, out, usage);
 }
 
 bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
-                           const char* model_tag, WeightLoad& out) {
+                           const char* model_tag, WeightLoad& out, WeightUsagePolicy usage) {
     if (!include_tensor) {
         fprintf(stderr, "%s: load_weights_filtered requires a non-null tensor predicate\n",
                 model_tag ? model_tag : "core_gguf");
         return false;
     }
-    return load_weights_impl(path, backend, include_tensor, user, model_tag, out);
+    return load_weights_impl(path, backend, include_tensor, user, model_tag, out, usage);
 }
 
 void release_weight_buffer(ggml_backend_buffer_t& buf) {
@@ -1056,8 +1137,25 @@ bool is_gpu_tensor_blk(const char* tensor_name, void* user) {
     return il < threshold;
 }
 
+bool load_weights_fit(const char* path, ggml_backend_t backend, ggml_backend_t cpu_backend, const char* model_tag,
+                      WeightLoad& out, int* n_offloaded, WeightUsagePolicy usage) {
+    const char* tag = model_tag ? model_tag : "core_gguf";
+    if (n_offloaded)
+        *n_offloaded = 0;
+    if (!backend || !cpu_backend || backend == cpu_backend)
+        return load_weights_impl(path, backend ? backend : cpu_backend, nullptr, nullptr, model_tag, out, usage);
+    const FitSet fit = scan_unbindable(path, backend);
+    if (fit.cpu.empty())
+        return load_weights_impl(path, backend, nullptr, nullptr, model_tag, out, usage);
+    log_unbindable(tag, fit, backend);
+    if (n_offloaded)
+        *n_offloaded = (int)fit.cpu.size();
+    FitSet f = fit;
+    return load_weights_split(path, backend, cpu_backend, fit_is_gpu, &f, model_tag, out, usage);
+}
+
 bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backend_t cpu_backend, IsGpuTensor is_gpu,
-                        void* user, const char* model_tag, WeightLoad& out) {
+                        void* user, const char* model_tag, WeightLoad& out, WeightUsagePolicy usage) {
     const char* tag = model_tag ? model_tag : "core_gguf";
 
     if (!gpu_backend || !cpu_backend) {
@@ -1084,6 +1182,7 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     size_t gpu_size = 0, cpu_size = 0;
     for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
         const char* tname = ggml_get_name(t);
+        apply_weight_usage(t, usage);
         const bool to_gpu = is_gpu(tname, user);
         if (to_gpu) {
             gpu_tensors.push_back(t);
@@ -1276,6 +1375,268 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
 
     fprintf(stderr, "%s: weight residency: gpu=%zu MiB (%zu tensors), cpu=%zu MiB (%zu tensors)\n", tag,
             gpu_size / 1048576, gpu_tensors.size(), cpu_size / 1048576, cpu_tensors.size());
+
+    gguf_free(gctx);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ggml CPU repack buffer type (docs/ggml-optimisation-playbook.md §4)
+// ---------------------------------------------------------------------------
+
+// The CPU device's extra buffer types, or an empty list. Cached: the ggml side
+// builds them once in a function-local static anyway.
+static const std::vector<ggml_backend_buffer_type_t>& cpu_extra_bufts() {
+    static const std::vector<ggml_backend_buffer_type_t> bufts = [] {
+        std::vector<ggml_backend_buffer_type_t> v;
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!dev)
+            return v;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg)
+            return v;
+        auto fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_dev_get_extra_bufts");
+        if (!fn)
+            return v;
+        for (ggml_backend_buffer_type_t* b = fn(dev); b && *b; ++b)
+            v.push_back(*b);
+        return v;
+    }();
+    return bufts;
+}
+
+// Pick the extra buffer type to use.
+//
+// ⚠ NOT v[0]. The CPU device can offer more than one extra buffer type, and
+// the order is fixed by ggml_backend_cpu_get_extra_buffer_types()
+// (ggml-cpu.cpp:42), which pushes AMX FIRST when the build has
+// __AMX_INT8__ && __AVX512VNNI__ — i.e. on any GGML_NATIVE build on Sapphire
+// Rapids or Emerald Rapids. Taking v[0] there silently selects AMX instead of
+// repack. That is not a hypothetical: GitHub's ubuntu-24.04 pool is
+// heterogeneous and hands out both AMD EPYC 7763 (AVX2, no VNNI) and Intel
+// Xeon Platinum 8573C (AVX-512 VNNI + AMX-INT8), and on the latter the first
+// version of this function selected AMX, repacked q8_0 on x86 — which has no
+// q8_0 *repack* kernel at all — and measured hFT 1.4–1.5× SLOWER than f32.
+//
+// So select by name, and let the name be overridden for A/B work.
+static ggml_backend_buffer_type_t repack_buft() {
+    static ggml_backend_buffer_type_t chosen = []() -> ggml_backend_buffer_type_t {
+        const char* want = std::getenv("CRISPASR_GGUF_EXTRA_BUFT");
+        const char* name = (want && *want) ? want : "CPU_REPACK";
+        for (auto* b : cpu_extra_bufts()) {
+            const char* n = ggml_backend_buft_name(b);
+            if (n && std::strcmp(n, name) == 0)
+                return b;
+        }
+        return nullptr;
+    }();
+    return chosen;
+}
+
+// Opt-out, so a field failure can be bisected without a rebuild.
+static bool repack_enabled() {
+    const char* v = std::getenv("CRISPASR_GGUF_REPACK");
+    return !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'));
+}
+
+bool repack_buft_accepts(ggml_type type, int64_t ne0, int64_t ne1) {
+    ggml_backend_buffer_type_t buft = repack_buft();
+    if (!buft || ne0 <= 0 || ne1 <= 0)
+        return false;
+
+    // Ask ggml rather than reimplementing ggml_repack_get_optimal_repack_type,
+    // whose table is ISA- and shape-dependent and changes upstream. The buffer
+    // type's init_tensor sets tensor->extra to the chosen traits, or leaves it
+    // null when it has no kernel. Costs one tensor's worth of memory, briefly.
+    ggml_init_params ip = {/*.mem_size=*/ggml_tensor_overhead() * 2, /*.mem_buffer=*/nullptr, /*.no_alloc=*/true};
+    ggml_context* c = ggml_init(ip);
+    if (!c)
+        return false;
+    ggml_tensor* t = ggml_new_tensor_2d(c, type, ne0, ne1);
+    bool ok = false;
+    if (t) {
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+        if (b) {
+            ok = (t->extra != nullptr);
+            ggml_backend_buffer_free(b);
+        }
+    }
+    ggml_free(c);
+    return ok;
+}
+
+bool load_weights_repack(const char* path, ggml_backend_t cpu_backend, IsMatmulWeight is_matmul_weight, void* user,
+                         const char* model_tag, WeightLoad& out, int* n_repacked) {
+    const char* tag = model_tag ? model_tag : "core_gguf";
+    if (n_repacked)
+        *n_repacked = 0;
+
+    if (!cpu_backend) {
+        fprintf(stderr, "%s: load_weights_repack requires a backend\n", tag);
+        return false;
+    }
+    // Repack is a CPU-backend concept. On anything else, and when the host
+    // offers no extra buffer type, fall straight back to the normal loader so
+    // callers can adopt this unconditionally.
+    struct UsageContext {
+        IsMatmulWeight classify;
+        void* user;
+    } usage_context{is_matmul_weight, user};
+    const WeightUsagePolicy usage{
+        is_matmul_weight ? +[](const char* name, void* value) {
+            const auto& context = *static_cast<UsageContext*>(value);
+            return context.classify(name, context.user) ? WeightUsage::MatmulOnly : WeightUsage::General;
+        } : nullptr, &usage_context};
+    if (!is_matmul_weight || !repack_enabled() || !repack_buft() || !core_cpu_backend::is_cpu(cpu_backend))
+        return load_weights(path, cpu_backend, model_tag, out, usage);
+
+    gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&out.ctx};
+    gguf_context* gctx = gguf_init_from_file(path, gp);
+    if (!gctx || !out.ctx) {
+        fprintf(stderr, "%s: failed to load tensor metadata from '%s'\n", tag, path);
+        if (gctx)
+            gguf_free(gctx);
+        return false;
+    }
+
+    ggml_backend_buffer_type_t rbuft = repack_buft();
+    ggml_backend_buffer_type_t dbuft = ggml_backend_get_default_buffer_type(cpu_backend);
+
+    // Pass 1: partition. A tensor is repacked only if the MODEL says it is a
+    // matmul weight (the loader cannot know) AND ggml says it has a kernel for
+    // that type/shape on this host (repack's set_tensor would otherwise null-
+    // dereference). Cache the acceptance answer per (type, ne0, ne1) — a
+    // transformer has many identically shaped weights and each probe costs an
+    // allocation.
+    std::vector<ggml_tensor*> rep_tensors, def_tensors;
+    size_t rep_size = 0, def_size = 0;
+    std::map<std::tuple<int, int64_t, int64_t>, bool> accept_cache;
+    for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+        const char* tname = ggml_get_name(t);
+        apply_weight_usage(t, usage);
+        const bool matmul_only = (t->flags & GGML_TENSOR_FLAG_WEIGHT_MATMUL_ONLY) != 0;
+        bool to_repack = false;
+        if (ggml_n_dims(t) == 2 && matmul_only) {
+            const auto key = std::make_tuple((int)t->type, t->ne[0], t->ne[1]);
+            auto it = accept_cache.find(key);
+            if (it == accept_cache.end())
+                it = accept_cache.emplace(key, repack_buft_accepts(t->type, t->ne[0], t->ne[1])).first;
+            to_repack = it->second;
+        }
+        if (to_repack) {
+            rep_tensors.push_back(t);
+            rep_size += ggml_nbytes(t);
+        } else {
+            def_tensors.push_back(t);
+            def_size += ggml_nbytes(t);
+        }
+        out.tensors[tname] = t;
+    }
+
+    if (rep_tensors.empty()) {
+        // Nothing to gain. Throw the partition away and take the normal path,
+        // which keeps the zero-copy mmap this one would have cost.
+        gguf_free(gctx);
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        out.tensors.clear();
+        return load_weights(path, cpu_backend, model_tag, out, usage);
+    }
+
+    auto round_up = [](size_t n, size_t a) { return (n + a - 1) & ~(a - 1); };
+    auto bind_partition = [&](ggml_backend_buffer_type_t buft, const std::vector<ggml_tensor*>& tensors,
+                              ggml_backend_buffer_t& out_buf) -> bool {
+        if (tensors.empty())
+            return true;
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+        size_t total = 0;
+        for (ggml_tensor* t : tensors)
+            total = round_up(total, align) + ggml_backend_buft_get_alloc_size(buft, t);
+        out_buf = ggml_backend_buft_alloc_buffer(buft, total);
+        if (!out_buf) {
+            fprintf(stderr, "%s: failed to allocate %zu MiB %s buffer\n", tag, total / 1048576,
+                    ggml_backend_buft_name(buft));
+            return false;
+        }
+        char* base = (char*)ggml_backend_buffer_get_base(out_buf);
+        size_t cursor = 0;
+        for (ggml_tensor* t : tensors) {
+            cursor = round_up(cursor, align);
+            ggml_backend_tensor_alloc(out_buf, t, base + cursor);
+            cursor += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+        return true;
+    };
+
+    if (!bind_partition(rbuft, rep_tensors, out.buf) || !bind_partition(dbuft, def_tensors, out.buf_cpu)) {
+        free_weights(out);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Copy. Every tensor goes through ggml_backend_tensor_set, which is a
+    // memcpy for the default partition and the repack rewrite for the other.
+    // There is no zero-copy variant of that second one — see the header.
+    MappedFile mf(path);
+    const size_t data_off = gguf_get_data_offset(gctx);
+    if (!mf.ok) {
+        FILE* fp = fopen(path, "rb");
+        if (!fp) {
+            fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
+            free_weights(out);
+            gguf_free(gctx);
+            return false;
+        }
+        std::vector<uint8_t> tbuf;
+        for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+            const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+            if (tid < 0)
+                continue;
+            const size_t off = gguf_get_tensor_offset(gctx, tid);
+            const size_t nbytes = ggml_nbytes(t);
+            if (tbuf.size() < nbytes)
+                tbuf.resize(nbytes);
+#if defined(_WIN32)
+            if (_fseeki64(fp, (int64_t)(data_off + off), SEEK_SET) != 0)
+                break;
+#else
+            if (fseeko(fp, (off_t)(data_off + off), SEEK_SET) != 0)
+                break;
+#endif
+            if (fread(tbuf.data(), 1, nbytes, fp) != nbytes)
+                break;
+            ggml_backend_tensor_set(t, tbuf.data(), 0, nbytes);
+        }
+        fclose(fp);
+    } else {
+        for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+            const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+            if (tid < 0)
+                continue;
+            const size_t off = gguf_get_tensor_offset(gctx, tid);
+            const size_t nbytes = ggml_nbytes(t);
+            // Same overflow-safe bounds check as the split mmap path.
+            if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
+                fprintf(stderr,
+                        "%s: repack path: tensor '%s' exceeds file bounds "
+                        "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
+                        tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
+                free_weights(out);
+                gguf_free(gctx);
+                return false;
+            }
+            ggml_backend_tensor_set(t, (const char*)mf.base + data_off + off, 0, nbytes);
+        }
+    }
+
+    if (n_repacked)
+        *n_repacked = (int)rep_tensors.size();
+    // Name the buffer type. An A/B that does not say which extra buffer type
+    // it selected is not reproducible — see the note on repack_buft().
+    fprintf(stderr, "%s: extra buffer type '%s': %zu MiB (%zu tensors) repacked, %zu MiB (%zu tensors) default\n", tag,
+            ggml_backend_buft_name(rbuft), rep_size / 1048576, rep_tensors.size(), def_size / 1048576,
+            def_tensors.size());
 
     gguf_free(gctx);
     return true;

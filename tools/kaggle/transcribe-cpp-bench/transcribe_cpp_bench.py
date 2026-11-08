@@ -20,9 +20,9 @@
 # References: tools/kaggle-benchmark-all-backends.py (CrispASR full sweep),
 # transcribe.cpp docs/models/*, scripts/wer/run.py
 #
-# Account:  chr1s4 (GPU quota, separate from chr1str's 30 h/week)
-# Datasets: chr1s4/crispasr-hf-token  (HF auth)
-#           chr1s4/crispasr-ccache     (warm CrispASR build, ~3 min vs ~20 min)
+# Account:  $KAGGLE_ACCOUNT (GPU quota, separate from $KAGGLE_ACCOUNT's 30 h/week)
+# Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token  (HF auth)
+#           ${KAGGLE_ACCOUNT}/crispasr-ccache     (warm CrispASR build, ~3 min vs ~20 min)
 
 import io
 import json

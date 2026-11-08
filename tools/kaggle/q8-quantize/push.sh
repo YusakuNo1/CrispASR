@@ -1,4 +1,4 @@
 #!/bin/bash
-# Push under chr1str (CrispASR kernel convention).
-export KAGGLE_API_TOKEN=KGAT_cb3f25c81b9e65d706ebcf655f1daa42
-cd "$(dirname "$0")" && cp ../kaggle_harness.py . && kaggle kernels push -p .
+# Push under ${KAGGLE_ACCOUNT} (CrispASR kernel convention).
+# Kaggle CLI auth: ~/.kaggle/access_token (never commit a token; see tests/test_no_secrets.py)
+cd "$(dirname "$0")" && cp ../kaggle_harness.py . && python3 "$(git rev-parse --show-toplevel)/tools/kaggle/kpush.py" .

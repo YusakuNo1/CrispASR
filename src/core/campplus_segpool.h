@@ -24,8 +24,54 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 
 namespace campplus_segpool {
+
+// WHICH REFERENCE a consumer must match on the PARTIAL TAIL window.
+//
+// FOUR of the five consumers are settled: chatterbox, confucius4, dots-tts and
+// fireredtts3 all have PyTorch upstreams and all measure TOWARD_REFERENCE on
+// window_width, with the fbank pinned identical across arms so pooling is the
+// only variable, and fireredtts3 reproducing its known 0.99999-vs-0.264
+// signature to prove the instrument:
+//
+//     chatterbox/confucius4  cos 0.999999 vs 0.998062   |ref| 13.6330
+//     dots-tts               cos 0.999996 vs 0.999839   |ref| 20.4277
+//     fireredtts3            cos 0.999997 vs 0.264410   |ref| 20.9117
+//
+// COSYVOICE3 IS NOT SETTLED. Its upstream is campplus.onnx, and two runs on the
+// SAME clip (jfk.wav, T_cam=549, tail=49) disagree:
+//
+//     onnxruntime on Kaggle   |onnx| 13.6330  -> agrees with window_width
+//     onnxruntime 1.23.2      |onnx| 14.0386  -> agrees with kernel_size exactly
+//
+// i.e. onnxruntime builds disagree with each other on AveragePool(ceil_mode=1),
+// so "what does ONNX do" has no single answer to look up.
+//
+// One fact is independent of that, and it is the uncomfortable one: the eight
+// speaker embeddings BAKED INTO the shipped cosyvoice3-voices.gguf match
+// kernel_size exactly (cos 1.000000, |x| 14.1197 on zero_shot). That artifact
+// was produced by this project's own converter on another machine. So with
+// window_width the runtime `--voice ref.wav` path and the baked voice bank
+// describe the same voice slightly differently (cos ~0.998).
+//
+// We ship window_width for cosyvoice3 anyway, for now: it is what the other
+// four use, end-to-end passes 8/8 on BOTH arms, and flipping on a contested
+// measurement is how this already produced one regression. Tracked, not closed.
+// Resolving it needs the onnxruntime version pinned on both sides, and probably
+// a re-bake of the voice bank against whichever convention wins.
+//
+// Two lessons paid for here:
+//   * an ISOLATED operator with the same attributes is NOT the graph -- probing
+//     an exported AveragePool alone gave the opposite answer and put a
+//     regression on main;
+//   * end-to-end cannot decide this at all. Every backend passes on both arms.
+enum class tail_divisor {
+    window_width, // settled for 4 of 5; the default, incl. cosyvoice3 for now.
+    kernel_size,  // no production caller; A/B, and the cosyvoice3 candidate.
+};
+
 
 // ceil_mode=True: the trailing partial window still produces a segment.
 inline int n_segments(int T, int seg_len) {
@@ -35,10 +81,14 @@ inline int n_segments(int T, int seg_len) {
 }
 
 // `in` is (C, T) row-major; `out` is (C, n_segments(T, seg_len)) row-major.
-inline void avg(const float* in, int C, int T, int seg_len, float* out) {
+inline void avg(const float* in, int C, int T, int seg_len, float* out,
+                tail_divisor tail = tail_divisor::window_width) {
     if (!in || !out || C <= 0 || T <= 0 || seg_len <= 0)
         return;
     const int n_seg = n_segments(T, seg_len);
+    // Read once per call, not per element.
+    const char* lg = std::getenv("CRISPASR_CAMPP_LEGACY_SEGPOOL");
+    const bool legacy = lg && lg[0] && lg[0] != '0';
     for (int c = 0; c < C; c++) {
         const float* row = in + (size_t)c * (size_t)T;
         for (int s = 0; s < n_seg; s++) {
@@ -49,7 +99,12 @@ inline void avg(const float* in, int C, int T, int seg_len, float* out) {
                 ss += row[t0 + t];
             // Divide by the frames ACTUALLY in this window. n_in_seg ==
             // seg_len for every full segment, so only the tail differs.
-            out[(size_t)c * (size_t)n_seg + (size_t)s] = ss / (float)n_in_seg;
+            //
+            // The caller names its upstream; the env var forces kernel_size
+            // globally for A/B measurement.
+            const bool use_kernel = legacy || tail == tail_divisor::kernel_size;
+            const float divisor = use_kernel ? (float)seg_len : (float)n_in_seg;
+            out[(size_t)c * (size_t)n_seg + (size_t)s] = ss / divisor;
         }
     }
 }

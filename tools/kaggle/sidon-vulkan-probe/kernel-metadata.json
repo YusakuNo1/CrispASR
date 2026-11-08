@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-sidon-vulkan-probe",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-sidon-vulkan-probe",
   "title": "CrispASR sidon vulkan probe",
   "code_file": "sidon_vulkan_probe.py",
   "language": "python",

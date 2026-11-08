@@ -91,7 +91,7 @@ print("=== Uploading to HF ===", flush=True)
 # Get HF token from dataset
 hf_token = None
 for p in ["/kaggle/input/crispasr-hf-token/hf_token.txt",
-          "/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"]:
+          "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt"]:
     if os.path.exists(p):
         with open(p) as f:
             hf_token = f.read().strip()

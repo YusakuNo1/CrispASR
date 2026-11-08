@@ -17,7 +17,7 @@
 //
 // Classifier-Free Guidance (CFG):
 //   Batch size is always 2 (conditional + unconditional).
-//   logits = uncond + cfg_scale * (cond - uncond)
+//   logits = cond + cfg_scale * (cond - uncond)
 //
 // The DAC codec weights can be in the same GGUF or a separate file
 // (--codec-model). When separate, the DAC GGUF from the Zonos port
@@ -68,8 +68,14 @@ void dia_tts_free(struct dia_tts_context* ctx);
 
 void dia_tts_set_n_threads(struct dia_tts_context* ctx, int n_threads);
 void dia_tts_set_temperature(struct dia_tts_context* ctx, float temperature);
+void dia_tts_set_top_p(struct dia_tts_context* ctx, float top_p);
+// Zero/non-positive disables top-k filtering, as in the sampler.
+void dia_tts_set_top_k(struct dia_tts_context* ctx, int top_k);
 void dia_tts_set_cfg_scale(struct dia_tts_context* ctx, float cfg_scale);
 void dia_tts_set_seed(struct dia_tts_context* ctx, uint64_t seed);
+// Zero/non-positive restores the model default; positive limits are bounded
+// by model capacity. Limits must exceed the 15-step audio delay.
+void dia_tts_set_max_tokens(struct dia_tts_context* ctx, int max_tokens);
 
 #ifdef __cplusplus
 }

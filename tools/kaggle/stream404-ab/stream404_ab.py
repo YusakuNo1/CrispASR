@@ -30,7 +30,7 @@
 # rounds for wall.
 #
 # Model: cohere-transcribe-q4_k (~550 MB) via the registry auto-download.
-# Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
+# Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache.
 
 # ─────────────────────────── cell 1 (code) — config ──────────────────────
 import json

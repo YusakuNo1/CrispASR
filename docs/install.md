@@ -17,7 +17,7 @@ The GitHub releases carry several Linux x86-64 tarballs.
 | `crispasr-linux-x86_64-avx512.tar.gz` | none (AVX-512 CPU) | n/a |
 | `crispasr-linux-x86_64-cuda.tar.gz` | NVIDIA GPU (CUDA 12) | **yes** — runs on CPU if CUDA libs are absent |
 | `crispasr-linux-x86_64-cuda13.tar.gz` | NVIDIA GPU (CUDA 13) | **yes** — runs on CPU if CUDA libs are absent |
-| `crispasr-linux-x86_64-hip.tar.gz` | AMD GPU (ROCm) | **no** |
+| `crispasr-linux-x86_64-hip.tar.gz` | AMD GPU (ROCm 6.3+ with hipBLAS) | **yes** — runs on CPU if ROCm libs are absent (since #586) |
 | `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan GPU | **no** |
 
 Since v0.8.30 the CUDA tarballs use dynamic backend loading
@@ -50,9 +50,17 @@ the host (or injected into the container via `--gpus` / `runtime: nvidia`).
 > about — download the tarball you need from the releases page directly, or
 > configure your installer's asset selection if it supports one.
 
-The HIP and Vulkan tarballs still require their respective runtimes at
-link time (no CPU fallback). Use the plain CPU tarball if you need a
-GPU-less fallback for those.
+The HIP tarball is built the same way since #586: `ggml-hip.so` is a
+`dlopen`-ed module, so the binary always starts. GPU use needs ROCm 6.x
+with hipBLAS and rocBLAS installed (`libhipblas.so.2`, e.g. the `hipblas`
+package next to the ROCm runtime). If `ggml-hip.so` cannot load — no ROCm,
+no hipBLAS, or ROCm 7, whose hipBLAS is `libhipblas.so.3` — crispasr runs on
+the CPU; `ldd ggml-hip.so` (or `libggml-hip.so`) in the extracted folder shows
+which library is missing. Before #586 the same situation aborted at startup
+with `error while loading shared libraries: libhipblas.so.2`.
+
+The Vulkan tarball still requires the Vulkan loader at link time (no CPU
+fallback). Use the plain CPU tarball if you need a GPU-less fallback there.
 
 Verify what a given tarball actually requires before deploying it:
 
@@ -66,8 +74,8 @@ readelf -d crispasr | grep NEEDED
 > unregistered instead of killing the process. This works and is verified on
 > Metal and CPU — see [the #355 section](#graceful-degradation-via-ggml_backend_dl-355)
 > for the measured transcripts and the two throughput caveats. The two CUDA
-> tarballs above are already built this way; the HIP and Vulkan tarballs are
-> still statically linked, because flipping those release legs needs an A/B on
+> tarballs and (since #586) the HIP tarball are already built this way; the
+> Vulkan tarball is still statically linked, because flipping those release legs needs an A/B on
 > real AMD and Vulkan hardware first.
 
 ## Windows CPU: which zip? (#380)
@@ -332,6 +340,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON    # Apple Silicon
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON   # cross-vendor
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_MUSA=ON     # Moore Threads
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON     # Intel oneAPI
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CANN=ON     # Huawei Ascend
 ```
 
 You can compile multiple backends into one binary; ggml will pick the
@@ -342,8 +351,15 @@ with `--gpu-backend <name>`, and pin a device with `-dev N`:
 
 ```bash
 crispasr --gpu-backend vulkan -dev 1 -m model.gguf -f audio.wav
+crispasr --gpu-backend cann -dev 0 -m model.gguf -f audio.wav
 crispasr --gpu-backend cpu -m model.gguf -f audio.wav        # benchmarking
 ```
+
+The manual [CANN compile workflow](../.github/workflows/cann-build.yml) builds
+CLI, shared library, diff and quantizer with the official CANN SDK images on
+x86_64/910B (ACL graphs enabled) and arm64/310P (ACL graphs disabled). Run it
+with `gh workflow run cann-build.yml --ref <branch>`. Hosted runners have no
+Ascend NPU, so a successful build does not establish inference or performance.
 
 ## Opus / AAC support (default, no ffmpeg, no libopus)
 

@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-tts-vulkan-audit-304",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-tts-vulkan-audit-304",
   "title": "CrispASR TTS Vulkan Audit 304",
   "code_file": "tts_vulkan_audit.py",
   "language": "python",
@@ -8,7 +8,9 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "competition_sources": [],
-  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "dataset_sources": [
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
+  ],
   "kernel_sources": [],
   "model_sources": []
 }

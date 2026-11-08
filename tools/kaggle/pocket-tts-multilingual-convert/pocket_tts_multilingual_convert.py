@@ -28,7 +28,7 @@ def run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None 
 def token() -> str:
     for path in (
         Path("/kaggle/input/crispasr-hf-token/hf_token.txt"),
-        Path("/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"),
+        Path("/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt"),
     ):
         if path.is_file():
             return path.read_text().strip()

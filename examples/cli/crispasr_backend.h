@@ -322,6 +322,17 @@ public:
     // override this, or its clones ship unattested and undisclosed.
     virtual std::string voice_bank_path() const { return {}; }
 
+    // True when this adapter resolves a bare `--voice` name against
+    // --voice-dir ITSELF, with a policy the shared step cannot reproduce
+    // (pocket-tts prefers a .safetensors embedding, qwen3-tts a .wav over a
+    // .gguf, tada's .wav clone is opt-in, vibevoice picks per-language packs).
+    //
+    // Every other CAP_VOICE_CLONING backend gets the shared resolution in
+    // crispasr_voice_reference.h before dispatch: `{"voice": "lanyan"}` with
+    // <voice-dir>/lanyan.wav (+ lanyan.txt) reaches it exactly as
+    // `--voice <voice-dir>/lanyan.wav --ref-text "..."` would. #584.
+    virtual bool resolves_voice_dir_itself() const { return false; }
+
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
     // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)
     // produce 24 kHz. Backends that emit a different rate (e.g. voxcpm2-tts at
@@ -425,6 +436,12 @@ public:
     // preserve their native frontend/encoder/decoder state per connection.
     virtual std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params&) { return nullptr; }
 
+    // A backend whose model is itself a simultaneous (streaming) policy —
+    // hikari decides once per 80 ms — makes no sense re-decoding a rolling
+    // window; `--stream` then drives create_realtime_session() directly, with
+    // or without a live translator behind it.
+    virtual bool prefers_realtime_session() const { return false; }
+
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape
     // setup).  Called once after init(), before the first real audio.
@@ -450,9 +467,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 // an empty string if detection fails.
 std::string crispasr_detect_backend_from_gguf(const std::string& model_path);
 
-// True if the GGUF at model_path is a pure-CTC FastConformer model (no RNN-T
-// decoder/joint tensors) — i.e. a parakeet-ctc / stt_*_fastconformer_ctc that must
-// run on the fastconformer-ctc backend, not the parakeet (transducer) backend.
+// True only for a compatible FastConformer encoder + CTC head without a native
+// predictor. Missing native predictor names alone does not identify CTC (#551).
 // Cheap: reads tensor infos only (no weights). Returns false on any read failure.
 bool crispasr_gguf_is_pure_ctc(const std::string& model_path);
 
@@ -483,3 +499,5 @@ void crispasr_print_backend_matrix_json();
 // Invoked from cli.cpp main() when params.backend is set to a non-whisper
 // backend. The whisper path in cli.cpp is left completely untouched.
 int crispasr_run_backend(const whisper_params& params);
+// Standalone --detect-language: audio LID without resolving or loading an ASR backend.
+int crispasr_run_lid_only(const whisper_params& params);

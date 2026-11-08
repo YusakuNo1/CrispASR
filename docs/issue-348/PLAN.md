@@ -24,7 +24,7 @@
   files (model commit `c45504bb8d55473a2213db17ec472ed11b69056a`), and verify
   registry quant/companion substitution against the SSD cache.
 - [x] Repeat conversion/parity/live roundtrips with CUDA in the dedicated
-  `chr1str/crispasr-chatterbox-v3-issue-348-cuda-parity` Kaggle kernel,
+  `${KAGGLE_ACCOUNT}/crispasr-chatterbox-v3-issue-348-cuda-parity` Kaggle kernel,
   preserving JSONL progress, logs, JSON summaries, and WAV artifacts.
 - [x] Rebase-merged PR #354 at `278e3fbf` after every required GitHub check
   passed; answer #348 with linked evidence.

@@ -15,7 +15,7 @@ the fixtures the local runtime port validates against:
 
 Then uploads to cstr/crispasr-regression-fixtures + cstr/raon-opentts-*-GGUF.
 
-Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache. GPU on
+Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache. GPU on
 (T4/P100) for the 1B; 0.3B fits either. Set RAON_SIZE=0.3B (default) or 1B.
 """
 

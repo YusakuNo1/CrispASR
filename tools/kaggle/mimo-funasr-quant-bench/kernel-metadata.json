@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-mimo-funasr-quant-gpu-bench",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-mimo-funasr-quant-gpu-bench",
   "title": "crispasr-mimo-funasr-quant-gpu-bench",
   "code_file": "crispasr-mimo-funasr-quant-gpu-bench.py",
   "language": "python",

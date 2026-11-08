@@ -20,7 +20,7 @@
 #
 # CPU-only build (the gates are CPU paths; they self-disable on GPU) inside
 # a GPU kernel — CPU-only workers get no internet (gotcha #3).
-# Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
+# Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache.
 
 # ─────────────────────────── cell 1 (code) — config ──────────────────────
 import json

@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-funasr-lang-verify",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-funasr-lang-verify",
   "title": "CrispASR funasr language flag verify",
   "code_file": "funasr-lang-verify.py",
   "language": "python",

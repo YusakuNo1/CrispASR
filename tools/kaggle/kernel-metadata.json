@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-regression-suite",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-regression-suite",
   "title": "CrispASR \u2014 regression suite",
   "code_file": "crispasr-regression.py",
   "language": "python",
@@ -8,7 +8,7 @@
   "enable_gpu": "false",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-issue126-cuda-verify",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-issue126-cuda-verify",
   "title": "CrispASR issue126 cuda verify",
   "code_file": "crispasr-issue126-cuda-verify.py",
   "language": "python",

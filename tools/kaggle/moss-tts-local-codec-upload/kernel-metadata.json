@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-mtl-codec-upload",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-mtl-codec-upload",
   "title": "CrispASR mtl codec upload",
   "code_file": "crispasr-moss-tts-local-codec-upload.py",
   "language": "python",
@@ -8,7 +8,7 @@
   "enable_gpu": "false",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

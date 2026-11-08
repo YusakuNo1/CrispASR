@@ -1,10 +1,12 @@
 #include "moonshine.h"
+#include "core/pause_split.h"
 #include "moonshine-impl.h"
 #include "moonshine-tokenizer.h"
 
 #include "core/attention.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/model_weight_usage.h"
 #include "core/repeat_break.h"     // fix/moonshine-repeat-break: decode-time loop break
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
@@ -25,6 +27,8 @@
 #include <string>
 #include <vector>
 #include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
+#include "core/backend_validation.h"
 
 // ===========================================================================
 // Bench instrumentation — `MOONSHINE_BENCH=1` for per-stage timings.
@@ -69,12 +73,14 @@ struct moonshine_context {
 
     int n_threads = 4;
     bool use_gpu = false;
+    bool validate_backend = false;
     float temperature = 0.0f; // 0 = greedy argmax; > 0 = multinomial sampling
     int beam_size = 1;        // 1 = greedy/sampled; >1 = beam search (deterministic)
     // #292: ceiling on generated tokens. Moonshine is a short-form model, so the
     // default 194 (~30 s) is architectural; --max-new-tokens raises the ceiling
     // for callers who force single-pass long audio.
     int max_new_tokens = 194;
+    int pause_split_ms = 0; // > 0: decode the pieces between pauses separately (moonshine_set_pause_split_ms)
     // Sticky per-call seed override for best-of-N. 0 = derive deterministically
     // from the input audio buffer (the historical default — repeated calls
     // with the same input give identical samples). Non-zero values let the
@@ -209,10 +215,20 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     }
     core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
+    const core_backend_validation::Request required(std::getenv("CRISPASR_MOONSHINE_REQUIRE_BACKEND"),
+                                                    std::getenv("CRISPASR_MOONSHINE_REQUIRE_DEVICE"));
+    ctx->validate_backend = required.active();
+    ctx->backend = required.active() ? core_backend_validation::init(required, params.use_gpu)
+                                     : (params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu);
+    if (!ctx->backend && required.active()) {
+        moonshine_free(ctx);
+        return nullptr;
+    }
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
-    ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
+    ctx->use_gpu = !core_cpu_backend::is_cpu(ctx->backend);
+    if (!ctx->use_gpu)
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // ── Pass 2: load weights via core_gguf (mmap, backend buffer) ──
     //
@@ -232,9 +248,10 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     bool loaded;
     if (ctx->use_gpu && !all_gpu) {
         loaded = core_gguf::load_weights_split(model_path, ctx->backend, ctx->backend_cpu, moonshine_is_gpu_tensor,
-                                               nullptr, "moonshine", wl);
+                                               nullptr, "moonshine", wl, {core_gguf::moonshine_weight_usage, nullptr});
     } else {
-        loaded = core_gguf::load_weights(model_path, ctx->backend, "moonshine", wl);
+        loaded = core_gguf::load_weights(model_path, ctx->backend, "moonshine", wl,
+                                         {core_gguf::moonshine_weight_usage, nullptr});
     }
     if (!loaded) {
         fprintf(stderr, "%s: failed to load weights from '%s'\n", __func__, model_path);
@@ -370,7 +387,12 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     if (params.tokenizer_path) {
         tokenizer_path = params.tokenizer_path;
     } else {
-        tokenizer_path = dir_of(model_path) + "/tokenizer.bin";
+        tokenizer_path = std::string(model_path) + ".tokenizer.bin";
+        FILE* specific = fopen(tokenizer_path.c_str(), "rb");
+        if (specific)
+            fclose(specific);
+        else
+            tokenizer_path = dir_of(model_path) + "/tokenizer.bin";
     }
     if (!ctx->tokenizer.load(tokenizer_path.c_str())) {
         fprintf(stderr, "%s: failed to load tokenizer from '%s'\n", __func__, tokenizer_path.c_str());
@@ -684,11 +706,36 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     }
     ggml_backend_tensor_set(pos, pos_data.data(), 0, seq_len * sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
+    // Query assignments only after alloc_graph. Keep the original graph and
+    // scheduler execution intact; eval callbacks would perturb execution.
+    core_backend_validation::Placement placement =
+        ctx->validate_backend ? core_backend_validation::Placement(ctx->sched, graph, ctx->backend)
+                              : core_backend_validation::Placement{};
+    if (ctx->validate_backend && !placement.valid()) {
+        placement.dump("moonshine.encoder", false);
+        fprintf(stderr, "%s: required backend has no complete encoder assignment; refusing validation\n", __func__);
+        if (transient_ctx)
+            ggml_free(transient_ctx);
+        return -1;
+    }
+    if (core_sched_prof::compute(ctx->sched, graph, "moonshine") != GGML_STATUS_SUCCESS) {
+        if (ctx->validate_backend)
+            placement.dump("moonshine.encoder", false);
         fprintf(stderr, "%s: graph compute failed\n", __func__);
         if (transient_ctx)
             ggml_free(transient_ctx);
         return -1;
+    }
+
+    if (ctx->validate_backend) {
+        placement.dump("moonshine.encoder", true);
+        const char* require_nz = std::getenv("CRISPASR_MOONSHINE_REQUIRE_NZ_CACHE");
+        if (require_nz && std::strcmp(require_nz, "1") == 0 && placement.nz_usage().selected_weights == 0) {
+            fprintf(stderr, "%s: required NZ cache was not selected; refusing validation\n", __func__);
+            if (transient_ctx)
+                ggml_free(transient_ctx);
+            return -1;
+        }
     }
 
     struct ggml_tensor* enc_output = ggml_graph_get_tensor(graph, "encoder_output");
@@ -805,7 +852,7 @@ static int moonshine_precompute_cross_kv(struct moonshine_context* ctx) {
 
     ggml_backend_tensor_set(enc_out, ctx->encoder_out.data(), 0, (size_t)hidden * enc_len * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, graph, "moonshine") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
         ggml_free(ctx0);
         return -1;
@@ -1004,7 +1051,7 @@ static int moonshine_decode_step_greedy(struct moonshine_context* ctx, int32_t t
     int32_t pos_val = cur_pos;
     ggml_backend_tensor_set(inp_pos, &pos_val, 0, sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, graph, "moonshine") != GGML_STATUS_SUCCESS) {
         ggml_free(ctx0);
         return -1;
     }
@@ -1061,7 +1108,7 @@ static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id
     int32_t pos_val = cur_pos;
     ggml_backend_tensor_set(inp_pos, &pos_val, 0, sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, graph, "moonshine") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
         ggml_free(ctx0);
         return -1;
@@ -1082,8 +1129,8 @@ static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id
 // `out_tokens`. When `out_token_probs` is non-null, also fills it with the
 // softmax probability of the picked token at each step (parallel to
 // `out_tokens`). Returns 0 on success.
-static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float* audio, int n_samples,
-                                     std::vector<int32_t>& out_tokens, std::vector<float>* out_token_probs) {
+static int moonshine_transcribe_one(struct moonshine_context* ctx, const float* audio, int n_samples,
+                                    std::vector<int32_t>& out_tokens, std::vector<float>* out_token_probs) {
     out_tokens.clear();
     if (out_token_probs)
         out_token_probs->clear();
@@ -1364,6 +1411,32 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     return 0;
 }
 
+// With pause splitting on, each stretch between pauses is decoded on its
+// own and the token streams are joined (see core/pause_split.h for why).
+static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float* audio, int n_samples,
+                                     std::vector<int32_t>& out_tokens, std::vector<float>* out_token_probs) {
+    if (!ctx || ctx->pause_split_ms <= 0)
+        return moonshine_transcribe_one(ctx, audio, n_samples, out_tokens, out_token_probs);
+    const auto pieces = core_pause_split::pieces(audio, n_samples, 16000, ctx->pause_split_ms);
+    if (pieces.size() <= 1)
+        return moonshine_transcribe_one(ctx, audio, n_samples, out_tokens, out_token_probs);
+    out_tokens.clear();
+    if (out_token_probs)
+        out_token_probs->clear();
+    std::vector<int32_t> tok;
+    std::vector<float> prob;
+    for (const auto& p : pieces) {
+        const int rc =
+            moonshine_transcribe_one(ctx, audio + p.first, p.second - p.first, tok, out_token_probs ? &prob : nullptr);
+        if (rc != 0)
+            return rc;
+        out_tokens.insert(out_tokens.end(), tok.begin(), tok.end());
+        if (out_token_probs)
+            out_token_probs->insert(out_token_probs->end(), prob.begin(), prob.end());
+    }
+    return 0;
+}
+
 const char* moonshine_transcribe(struct moonshine_context* ctx, const float* audio, int n_samples) {
     if (!ctx)
         return "";
@@ -1400,6 +1473,24 @@ extern "C" struct moonshine_result* moonshine_transcribe_with_probs(struct moons
         }
     }
     return r;
+}
+
+extern "C" int moonshine_default_pause_split_ms(const char* model_path, int fine_tune) {
+    if (const char* e = std::getenv("CRISPASR_MOONSHINE_PAUSE_SPLIT_MS"))
+        return std::max(0, std::atoi(e));
+    // The German fine-tunes stop at the first sentence-final pause; English
+    // moonshine does not (no sentence dropped on a 37 s clip with 0.9-1.5 s
+    // pauses), so it keeps whole-input decoding. The GGUF has no language
+    // field, so the variant is recognised by its name, as the language guard
+    // in crispasr_c_api.cpp does.
+    const std::string p = model_path ? model_path : "";
+    const bool de = fine_tune || p.find("-de") != std::string::npos || p.find("_de") != std::string::npos;
+    return de ? 200 : 0;
+}
+
+extern "C" void moonshine_set_pause_split_ms(struct moonshine_context* ctx, int ms) {
+    if (ctx)
+        ctx->pause_split_ms = ms > 0 ? ms : 0;
 }
 
 extern "C" void moonshine_result_free(struct moonshine_result* r) {

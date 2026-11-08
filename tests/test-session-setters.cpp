@@ -78,6 +78,14 @@ TEST_CASE("session setter: set_max_new_tokens null-handle → -1", "[unit][sette
     REQUIRE(crispasr_session_set_max_new_tokens(nullptr, 256) == -1);
 }
 
+TEST_CASE("session setter: set_autochunk null-handle → -1", "[unit][setters]") {
+    REQUIRE(crispasr_session_set_autochunk(nullptr, 1, 30) == -1);
+}
+
+TEST_CASE("session setter: set_max_new_tokens_per_second null-handle → -1", "[unit][setters]") {
+    REQUIRE(crispasr_session_set_max_new_tokens_per_second(nullptr, 10.0f, 16) == -1);
+}
+
 TEST_CASE("session setter: set_max_speech_tokens null-handle → -1", "[unit][setters]") {
     REQUIRE(crispasr_session_set_max_speech_tokens(nullptr, 1000) == -1);
 }
@@ -108,6 +116,25 @@ TEST_CASE("session setter: set_grammar_text null-handle → -1", "[unit][setters
     REQUIRE(crispasr_session_set_grammar_text(nullptr, nullptr, nullptr, 100.0f) == -1);
 }
 
+TEST_CASE("session setter: set_grammar_strict null-handle → -1", "[unit][setters]") {
+    REQUIRE(crispasr_session_set_grammar_strict(nullptr, 1) == -1);
+}
+
+TEST_CASE("whisper params: grammar_strict is off by default", "[unit][setters]") {
+    // Existing grammar users must see no change: strict end-of-text is opt-in.
+    REQUIRE_FALSE(whisper_full_default_params(CRISPASR_SAMPLING_GREEDY).grammar_strict);
+    REQUIRE_FALSE(whisper_full_default_params(CRISPASR_SAMPLING_BEAM_SEARCH).grammar_strict);
+}
+
+TEST_CASE("score_texts: bad arguments → -1", "[unit][setters]") {
+    const float pcm[16] = {};
+    const char* texts[] = {"e4"};
+    float lp[1];
+    int nt[1];
+    REQUIRE(crispasr_session_score_texts(nullptr, pcm, 16, "en", nullptr, texts, 1, lp, nt) == -1);
+    REQUIRE(whisper_score_texts(nullptr, pcm, 16, "en", nullptr, texts, 1, lp, nt, 1) == -1);
+}
+
 TEST_CASE("session setter: set_fallback_thresholds null-handle → -1", "[unit][setters]") {
     REQUIRE(crispasr_session_set_fallback_thresholds(nullptr, 2.4f, -1.0f, 0.6f, 0.2f) == -1);
 }
@@ -135,4 +162,54 @@ TEST_CASE("session open: GPU-default open of missing model loads plugins and ret
     REQUIRE(s1 == nullptr);
     crispasr_session* s2 = crispasr_session_open_explicit("/nonexistent/crispasr-282.gguf", "whisper", 1);
     REQUIRE(s2 == nullptr);
+}
+
+// ─── standalone punctuation API: wrong GGUFs fail at init (#460) ──────────
+// A GGUF that is not a complete punctuation model used to load as
+// FireRedPunc, log "required tensor ... not found", report success and then
+// segfault in ggml_mul_mat on the first process() call.
+
+#include "ggml.h"
+#include "gguf.h"
+
+#include <cstdio>
+#include <filesystem>
+#include <string>
+
+static std::string write_tiny_gguf(const char* arch, const char* tensor_name, const char* file) {
+    const std::string path = (std::filesystem::temp_directory_path() / file).string();
+    ggml_init_params ip = {1024 * 1024, nullptr, false};
+    ggml_context* ctx = ggml_init(ip);
+    gguf_context* g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", arch);
+    ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_name(t, tensor_name);
+    for (int i = 0; i < 4; i++)
+        ((float*)t->data)[i] = 0.5f * i;
+    gguf_add_tensor(g, t);
+    gguf_write_to_file(g, path.c_str(), false);
+    gguf_free(g);
+    ggml_free(ctx);
+    return path;
+}
+
+TEST_CASE("punc init: FireRedPunc-arch GGUF missing tensors -> NULL, not a later crash", "[unit][punc]") {
+    const std::string p = write_tiny_gguf("fireredpunc", "emb.tok_emb.weight", "crispasr-460-incomplete.gguf");
+    void* h = crispasr_punc_init(p.c_str());
+    REQUIRE(h == nullptr);
+    std::remove(p.c_str());
+}
+
+TEST_CASE("punc init: a GGUF of another architecture -> NULL", "[unit][punc]") {
+    const std::string p = write_tiny_gguf("whisper", "encoder.conv1.weight", "crispasr-460-foreign.gguf");
+    REQUIRE(crispasr_punc_init(p.c_str()) == nullptr);
+    std::remove(p.c_str());
+}
+
+TEST_CASE("punc init: missing file / empty / null handle are safe", "[unit][punc]") {
+    REQUIRE(crispasr_punc_init("/nonexistent/crispasr-460.gguf") == nullptr);
+    REQUIRE(crispasr_punc_init("") == nullptr);
+    REQUIRE(crispasr_punc_init(nullptr) == nullptr);
+    REQUIRE(crispasr_punc_process(nullptr, "hello") == nullptr);
+    crispasr_punc_free(nullptr); // must not crash
 }

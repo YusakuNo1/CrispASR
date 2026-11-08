@@ -47,6 +47,15 @@ static std::string probe_explicit_model_filename(const std::string& model_arg, c
     return crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
 }
 
+static bool unavailable_granite5_profile(const std::string& model_arg, const std::string& quant) {
+    const size_t slash = model_arg.find_last_of("/\\");
+    const std::string base = slash == std::string::npos ? model_arg : model_arg.substr(slash + 1);
+    if (base.rfind("granite-speech-5.0-2b-", 0) != 0)
+        return false;
+    CrispasrRegistryEntry entry;
+    return !crispasr_registry_lookup_by_filename(model_arg, entry, quant);
+}
+
 static CrispasrResolvePreview build_preview(const std::string& model_arg, const std::string& backend_name,
                                             const std::string& cache_dir_override, const std::string& preferred_quant,
                                             bool ignore_cache) {
@@ -88,6 +97,11 @@ static CrispasrResolvePreview build_preview(const std::string& model_arg, const 
 
     CrispasrRegistryEntry match;
     bool have_match = false;
+    if (unavailable_granite5_profile(effective_model_arg, effective_quant)) {
+        out.unresolved = true;
+        out.resolved_path = effective_model_arg;
+        return out;
+    }
     if (effective_model_arg == "auto" || effective_model_arg == "default") {
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
     } else {
@@ -201,6 +215,11 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     // Step 2 must precede step 3, otherwise the CLI's filename-inferred
     // backend (always "parakeet" for any "parakeet*" arg) would shadow
     // sub-variant keys like "parakeet-v2" / "parakeet-tdt-1.1b" / etc.
+    if (unavailable_granite5_profile(effective_model_arg, effective_quant)) {
+        fprintf(stderr, "crispasr: requested Granite5 profile is not qualified for download: %s\n",
+                effective_model_arg.c_str());
+        return effective_model_arg;
+    }
     CrispasrRegistryEntry match;
     bool have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
     if (!have_match)
@@ -242,13 +261,19 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     const std::string cached_path = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
     if (crispasr_cache::file_present(cached_path)) {
         if (!match.license.empty()) {
-            const bool is_nc = crispasr_license_requires_acceptance(match.license);
+            const bool is_nc = crispasr_license_tag(match.license).rfind("cc-by-nc", 0) == 0;
             if (is_nc)
                 fprintf(stderr,
                         "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
                         "  By loading this model you confirm you will not use it for commercial purposes.\n",
                         match.filename.c_str(), match.license.c_str());
+            else
+                fprintf(stderr, "crispasr: note: %s is licensed %s — review and comply with the upstream terms.\n",
+                        match.filename.c_str(), match.license.c_str());
         }
+        if (auto_download)
+            return crispasr_resolve_model(effective_model_arg, match.backend, quiet, cache_dir_override, true,
+                                          effective_quant, accepted_license);
         return cached_path;
     }
 
@@ -258,7 +283,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     else
         fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
     if (!match.license.empty()) {
-        const bool is_nc = crispasr_license_requires_acceptance(match.license);
+        const bool is_nc = crispasr_license_tag(match.license).rfind("cc-by-nc", 0) == 0;
         if (is_nc)
             fprintf(stderr, "  LICENSE: %s — NON-COMMERCIAL USE ONLY. Do not use for commercial purposes.\n",
                     match.license.c_str());
@@ -293,7 +318,8 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
 
     if (do_download) {
-        return crispasr_cache::ensure_cached_file(match.filename, match.url, quiet, "crispasr", cache_dir_override);
+        return crispasr_resolve_model(effective_model_arg, match.backend, quiet, cache_dir_override, true,
+                                      effective_quant, accepted_license);
     }
 
     return effective_model_arg;

@@ -1,3 +1,4 @@
+#include <chrono>
 #include "crispasr.h"
 #include "crispasr-arch.h"
 
@@ -7,7 +8,8 @@
 #include "ggml-backend.h"
 #include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
-#include "core/gpu_backend_pref.h"       // crispasr_init_gpu_backend (#214)
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/silero_context.h"
 #include "core/whisper_special_tokens.h" // serialized-vs-legacy special ids (#322)
 
 #ifdef CRISPASR_USE_COREML
@@ -31,6 +33,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <random>
 #include <regex>
 #include <set>
@@ -3476,9 +3479,19 @@ static bool whisper_decode_internal(whisper_context& wctx, whisper_state& wstate
 
         {
             struct ggml_tensor* position = ggml_graph_get_tensor(gf, "position");
-            for (int i = 0; i < n_tokens; ++i) {
-                const int32_t val = batch.pos[i];
-                ggml_backend_tensor_set(position, &val, i * sizeof(int32_t), sizeof(int32_t));
+            static const int contiguous_pos_gate = []() {
+                const char* e = getenv("CRISPASR_WHISPER_CONTIGUOUS_POS");
+                return e ? atoi(e) : 1;
+            }();
+            if (contiguous_pos_gate == 0) {
+                // Working path (pre-571cfa031): individual per-token driver calls
+                for (int i = 0; i < n_tokens; ++i) {
+                    const int32_t val = batch.pos[i];
+                    ggml_backend_tensor_set(position, &val, i * sizeof(int32_t), sizeof(int32_t));
+                }
+            } else {
+                // New path (571cfa031): single contiguous block copy
+                ggml_backend_tensor_set(position, batch.pos, 0, n_tokens * sizeof(whisper_pos));
             }
         }
 
@@ -4976,6 +4989,7 @@ struct whisper_vad_context {
     int n_window;
     int n_context;
     int n_threads;
+    bool source_context = false;
 
     std::vector<ggml_backend_t> backends;
     ggml_backend_buffer_t buffer = nullptr;
@@ -4992,6 +5006,13 @@ struct whisper_vad_context {
     std::vector<uint8_t> work_buf;          // pre-allocated ggml_cplan work buffer (#132)
     ggml_threadpool_t threadpool = nullptr; // persistent 1-thread pool for inner loop (#132)
 };
+
+bool crispasr_silero_enable_context(struct whisper_vad_context* ctx) {
+    if (!ctx || ctx->n_window != 512 || ctx->n_context != 64)
+        return false;
+    ctx->source_context = true;
+    return true;
+}
 
 struct whisper_vad_context_params whisper_vad_default_context_params(void) {
     whisper_vad_context_params result = {
@@ -5085,9 +5106,10 @@ static ggml_backend_buffer_type_t select_weight_buft(const whisper_vad_hparams& 
     return nullptr;
 }
 
-static ggml_tensor* whisper_vad_build_stft_layer(ggml_context* ctx0, const whisper_vad_model& model, ggml_tensor* cur) {
+static ggml_tensor* whisper_vad_build_stft_layer(ggml_context* ctx0, const whisper_vad_model& model, ggml_tensor* cur,
+                                                 bool source_context) {
     // Apply reflective padding to the input tensor
-    ggml_tensor* padded = ggml_pad_reflect_1d(ctx0, cur, 64, 64);
+    ggml_tensor* padded = ggml_pad_reflect_1d(ctx0, cur, source_context ? 0 : 64, 64);
 
     struct ggml_tensor* stft =
         ggml_conv_1d(ctx0, model.stft_forward_basis, padded, model.hparams.lstm_input_size, 0, 1);
@@ -5197,13 +5219,14 @@ static struct ggml_cgraph* whisper_vad_build_graph(whisper_vad_context& vctx) {
 
     ggml_cgraph* gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor* frame = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window, 1);
+    struct ggml_tensor* frame =
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window + (vctx.source_context ? vctx.n_context : 0), 1);
     ggml_set_name(frame, "frame");
     ggml_set_input(frame);
 
     struct ggml_tensor* cur = nullptr;
     {
-        cur = whisper_vad_build_stft_layer(ctx0, model, frame);
+        cur = whisper_vad_build_stft_layer(ctx0, model, frame, vctx.source_context);
 
         cur = whisper_vad_build_encoder_layer(ctx0, model, cur);
 
@@ -5349,6 +5372,10 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
 
     whisper_vad_context* vctx = new whisper_vad_context;
     vctx->n_threads = params.n_threads;
+    // The VAD scheduler currently runs on CPU (whisper_vad_init_context).
+    // Place its weights on the same backend even when the caller enables
+    // GPU inference for ASR; CUDA weights in a CPU-only scheduler abort.
+    params.use_gpu = false;
     vctx->params.use_gpu = params.use_gpu;
     vctx->params.gpu_device = params.gpu_device;
 
@@ -5644,7 +5671,8 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     return vctx;
 }
 
-bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+static bool whisper_vad_detect_speech_impl(struct whisper_vad_context* vctx, const float* samples, int n_samples,
+                                           bool reset) {
     int n_chunks = n_samples / vctx->n_window;
     if (n_samples % vctx->n_window != 0) {
         n_chunks += 1; // Add one more chunk for remaining samples.
@@ -5653,18 +5681,24 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     CRISPASR_LOG_INFO("%s: detecting speech in %d samples\n", __func__, n_samples);
     CRISPASR_LOG_INFO("%s: n_chunks: %d\n", __func__, n_chunks);
 
-    // Reset LSTM hidden/cell states
-    ggml_backend_buffer_clear(vctx->buffer, 0);
+    // Reset LSTM hidden/cell states (a continuation keeps them: the stream
+    // VAD scores each new frame once, in order).
+    if (reset)
+        ggml_backend_buffer_clear(vctx->buffer, 0);
 
     vctx->probs.resize(n_chunks);
     CRISPASR_LOG_INFO("%s: props size: %u\n", __func__, n_chunks);
 
     // Use pre-allocated window buffer to avoid per-call heap allocation
     // that fragments memory across repeated server requests (#132).
-    if ((int)vctx->window_buf.size() != vctx->n_window) {
-        vctx->window_buf.resize(vctx->n_window, 0.0f);
+    const int carry = vctx->source_context ? vctx->n_context : 0;
+    if ((int)vctx->window_buf.size() != vctx->n_window + carry) {
+        vctx->window_buf.resize(vctx->n_window + carry, 0.0f);
     }
     auto& window = vctx->window_buf;
+    // The released wrapper resets waveform context along with LSTM state.
+    if (reset)
+        std::fill(window.begin(), window.begin() + carry, 0.0f);
 
     auto& sched = vctx->sched.sched;
 
@@ -5714,11 +5748,11 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
         if (chunk_len < vctx->n_window) {
             CRISPASR_LOG_INFO("%s: chunk_len: %d < n_window: %d\n", __func__, chunk_len, vctx->n_window);
             // Zero-pad the last partial chunk directly into window.
-            std::copy(samples + idx_start, samples + idx_end, window.begin());
-            std::fill(window.begin() + chunk_len, window.end(), 0.0f);
+            std::copy(samples + idx_start, samples + idx_end, window.begin() + carry);
+            std::fill(window.begin() + carry + chunk_len, window.end(), 0.0f);
         } else {
             // Copy current frame samples to the window.
-            std::copy(samples + idx_start, samples + idx_start + vctx->n_window, window.begin());
+            std::copy(samples + idx_start, samples + idx_start + vctx->n_window, window.begin() + carry);
         }
 
         // Set the frame tensor data with the samples.
@@ -5732,6 +5766,8 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
 
         // Get the probability for this chunk.
         ggml_backend_tensor_get(prob, &vctx->probs[i], 0, sizeof(float));
+        if (carry)
+            std::copy(window.end() - carry, window.end(), window.begin());
 
         //CRISPASR_LOG_DEBUG("chunk %d: p = %7.3f\n", i, probs[i]);
     }
@@ -5743,6 +5779,18 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     ggml_backend_sched_reset(sched);
 
     return true;
+}
+
+bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+    return whisper_vad_detect_speech_impl(vctx, samples, n_samples, /*reset=*/true);
+}
+
+bool whisper_vad_detect_speech_continue(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+    return whisper_vad_detect_speech_impl(vctx, samples, n_samples, /*reset=*/false);
+}
+
+void whisper_vad_set_probs(struct whisper_vad_context* vctx, const float* probs, int n_probs) {
+    vctx->probs.assign(probs, probs + std::max(0, n_probs));
 }
 
 int whisper_vad_segments_n_segments(struct whisper_vad_segments* segments) {
@@ -6420,6 +6468,20 @@ static void whisper_suppress_invalid_grammar(whisper_context& ctx, const whisper
     //if (!allow_eot) {
     //    logits[eot] -= params.grammar_penalty;
     //}
+    // Opt-in (grammar_strict): the check above, enabled. End-of-text is only
+    // allowed once some parse of the grammar has been completed.
+    if (params.grammar_strict) {
+        bool allow_eot = false;
+        for (const auto& stack : grammar.stacks) {
+            if (stack.empty()) {
+                allow_eot = true;
+                break;
+            }
+        }
+        if (!allow_eot) {
+            logits[eot] -= params.grammar_penalty;
+        }
+    }
     //fprintf(stderr, "Allowed: (%zu tokens)\n", size - rejects.size());
 }
 
@@ -6486,6 +6548,268 @@ struct whisper_context* whisper_init_from_file_with_params_by_ref(const char* pa
 struct whisper_context* whisper_init_from_file_with_params_no_state_by_ref(const char* path_model,
                                                                            struct whisper_context_params* params) {
     return whisper_init_from_file_with_params_no_state(path_model, *params);
+}
+
+int whisper_score_texts(struct whisper_context* ctx, const float* samples, int n_samples, const char* language,
+                        const char* initial_prompt, const char** texts, int n_texts, float* out_logprobs,
+                        int* out_n_tokens, int n_threads) {
+    if (!ctx || !samples || n_samples <= 0 || !texts || n_texts <= 0 || !out_logprobs) {
+        return -1;
+    }
+    // CRISPASR_WHISPER_SCORE_PROFILE=1 prints where the time goes.
+    const bool prof = getenv("CRISPASR_WHISPER_SCORE_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t_start = now();
+    whisper_state* state = whisper_init_state(ctx);
+    const auto t_init = now();
+    if (!state) {
+        return -2;
+    }
+    struct state_guard {
+        whisper_state* s;
+        ~state_guard() { whisper_free_state(s); }
+    } guard{state};
+
+    if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, n_threads) != 0) {
+        return -3;
+    }
+    const auto t_mel = now();
+    if (whisper_encode_with_state(ctx, state, 0, n_threads) != 0) {
+        return -4;
+    }
+    const auto t_enc = now();
+
+    const int n_vocab = whisper_n_vocab(ctx);
+    const int n_ctx = whisper_n_text_ctx(ctx);
+
+    // The prompt whisper_full uses for a plain transcription without
+    // timestamps, optionally preceded by previous text (initial_prompt, as in
+    // whisper_full_params.initial_prompt) to prime the vocabulary.
+    std::vector<whisper_token> prompt;
+    if (initial_prompt && initial_prompt[0]) {
+        std::vector<whisper_token> prev(n_ctx);
+        const std::string text = std::string(" ") + initial_prompt;
+        const int n_prev = whisper_tokenize(ctx, text.c_str(), prev.data(), (int)prev.size());
+        if (n_prev > 0) {
+            prompt.push_back(whisper_token_prev(ctx));
+            // Keep the most recent tokens, as whisper_full does (n_text_ctx / 2).
+            const int keep = std::min(n_prev, n_ctx / 2 - 1);
+            prompt.insert(prompt.end(), prev.begin() + (n_prev - keep), prev.begin() + n_prev);
+        }
+    }
+    prompt.push_back(whisper_token_sot(ctx));
+    if (whisper_is_multilingual(ctx)) {
+        const int lang_id = whisper_lang_id(language && language[0] ? language : "en");
+        if (lang_id < 0) {
+            return -5;
+        }
+        prompt.push_back(whisper_token_lang(ctx, lang_id));
+        prompt.push_back(whisper_token_transcribe(ctx));
+    }
+    prompt.push_back(whisper_token_not(ctx));
+    const int n_prompt = (int)prompt.size();
+    const whisper_token eot = whisper_token_eot(ctx);
+
+    auto log_softmax_at = [n_vocab](const float* row, whisper_token target) {
+        float mx = row[0];
+        for (int v = 1; v < n_vocab; ++v) {
+            mx = std::max(mx, row[v]);
+        }
+        double sum = 0.0;
+        for (int v = 0; v < n_vocab; ++v) {
+            sum += std::exp((double)(row[v] - mx));
+        }
+        return (double)(row[target] - mx) - std::log(sum);
+    };
+
+    // Decode the shared prompt once; its cache is kept and every candidate
+    // continues from it.
+    whisper_batch_prep_legacy(state->batch, prompt.data(), n_prompt, 0, 0);
+    whisper_kv_cache_seq_rm(state->kv_self, 0, 0, -1);
+    if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+        return -6;
+    }
+    const auto t_prompt = now();
+    int n_steps = 0;
+    double t_dec = 0.0, t_sm = 0.0;
+    const std::vector<float> prompt_logits(state->logits.begin() + (size_t)(n_prompt - 1) * n_vocab,
+                                           state->logits.begin() + (size_t)n_prompt * n_vocab);
+
+    // Tokenize every candidate, then visit them in token order so that
+    // neighbours share prefixes ("knight", "knight to ..."): the cache and
+    // the per-position log-probabilities of the shared part are kept and
+    // only the rest is decoded. Tokens are fed one at a time, like
+    // whisper_full's own decoding, so the decoder graph keeps its shape
+    // instead of being re-planned for every candidate length.
+    std::vector<std::vector<whisper_token>> seqs(n_texts);
+    std::vector<whisper_token> buf(n_ctx);
+    for (int t = 0; t < n_texts; ++t) {
+        out_logprobs[t] = -INFINITY;
+        if (out_n_tokens) {
+            out_n_tokens[t] = 0;
+        }
+        const std::string text = std::string(" ") + (texts[t] ? texts[t] : ""); // leading space, as Whisper emits
+        const int n = whisper_tokenize(ctx, text.c_str(), buf.data(), (int)buf.size());
+        if (n > 0 && n_prompt + n < n_ctx) {
+            seqs[t].assign(buf.begin(), buf.begin() + n);
+        }
+    }
+    std::vector<int> order(n_texts);
+    for (int t = 0; t < n_texts; ++t) {
+        order[t] = t;
+    }
+    std::sort(order.begin(), order.end(), [&](int x, int y) { return seqs[x] < seqs[y]; });
+
+    // Batched path (default; CRISPASR_WHISPER_SCORE_SEQUENTIAL=1 restores the
+    // one-token-per-call path below): the candidates' tokens form a prefix
+    // tree, and every node of it is decoded in ONE batch. Tree attention comes
+    // from sequence ids: candidate t is sequence t + 1, a node's cell carries
+    // every candidate that passes through it, and a token attends with one of
+    // its own candidates - so it sees exactly the prompt and its ancestors (a
+    // cell off its path shares no candidate with it). A/B on 30 Piper/Kokoro
+    // utterances, whisper tiny: same best candidate 30/30, 1.8x faster overall;
+    // log-probabilities differ by batched-matmul rounding (a single phrase with
+    // no tree already moves 0.03-0.09).
+    const char* sequential_env = getenv("CRISPASR_WHISPER_SCORE_SEQUENTIAL");
+    if (!(sequential_env && sequential_env[0] == '1')) {
+        struct tree_node {
+            whisper_token tok;
+            int depth;
+        };
+        std::vector<tree_node> nodes;
+        std::map<std::pair<int, whisper_token>, int> child_of;
+        std::vector<std::vector<int>> node_path(n_texts);
+        for (int t = 0; t < n_texts; ++t) {
+            int parent = -1;
+            for (size_t i = 0; i < seqs[t].size(); ++i) {
+                const auto key = std::make_pair(parent, seqs[t][i]);
+                auto it = child_of.find(key);
+                if (it == child_of.end()) {
+                    it = child_of.emplace(key, (int)nodes.size()).first;
+                    nodes.push_back({seqs[t][i], (int)i});
+                }
+                node_path[t].push_back(it->second);
+                parent = it->second;
+            }
+        }
+        const int n_nodes = (int)nodes.size();
+        if (n_nodes > 0 && n_nodes <= n_ctx && n_prompt + n_nodes <= (int)state->kv_self.size) {
+            std::vector<std::vector<whisper_seq_id>> members(n_nodes);
+            for (int t = 0; t < n_texts; ++t) {
+                for (int id : node_path[t]) {
+                    members[id].push_back(t + 1);
+                }
+                whisper_kv_cache_seq_cp(state->kv_self, 0, t + 1, -1, -1); // the prompt, for every candidate
+            }
+            whisper_batch tree = whisper_batch_init(n_nodes, n_texts);
+            tree.n_tokens = n_nodes;
+            for (int i = 0; i < n_nodes; ++i) { // parents precede children: creation order
+                tree.token[i] = nodes[i].tok;
+                tree.pos[i] = n_prompt + nodes[i].depth;
+                tree.n_seq_id[i] = (int32_t)members[i].size();
+                std::copy(members[i].begin(), members[i].end(), tree.seq_id[i]);
+                tree.logits[i] = 1;
+            }
+            const auto t0 = now();
+            const bool ok = whisper_decode_internal(*ctx, *state, tree, n_threads, false, nullptr, nullptr);
+            whisper_batch_free(tree);
+            for (int t = 0; t < n_texts; ++t) {
+                whisper_kv_cache_seq_rm(state->kv_self, t + 1, -1, -1);
+            }
+            if (!ok) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            n_steps = 1;
+            const auto t1 = now();
+            // log-softmax(x)[v] = x[v] - logsumexp(x): one logsumexp per node.
+            std::vector<double> lse(n_nodes);
+            for (int i = 0; i < n_nodes; ++i) {
+                const float* row = state->logits.data() + (size_t)i * n_vocab;
+                const float mx = *std::max_element(row, row + n_vocab);
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab; ++v) {
+                    sum += std::exp((double)(row[v] - mx));
+                }
+                lse[i] = mx + std::log(sum);
+            }
+            for (int t = 0; t < n_texts; ++t) {
+                const auto& seq = seqs[t];
+                if (seq.empty()) {
+                    continue;
+                }
+                double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    const int id = node_path[t][i];
+                    const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+                    logprob += state->logits[(size_t)id * n_vocab + target] - lse[id];
+                }
+                out_logprobs[t] = (float)logprob;
+                if (out_n_tokens) {
+                    out_n_tokens[t] = (int)seq.size() + 1;
+                }
+            }
+            t_sm += ms(t1, now());
+            if (prof) {
+                fprintf(stderr,
+                        "score_texts (batched): %d texts, %d tree nodes, encode %.0f ms, prompt(%d) %.0f ms, "
+                        "decode %.0f ms, softmax %.0f ms, total %.0f ms\n",
+                        n_texts, n_nodes, ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt), t_dec, t_sm,
+                        ms(t_start, now()));
+            }
+            return 0;
+        }
+        // Too many nodes for one batch or the cache: score one token at a time.
+    }
+
+    // path[i] = token i of the candidate whose tokens are in the cache;
+    // lp_after[i] = log-probabilities (full row) after path[0..i].
+    std::vector<whisper_token> path;
+    std::vector<std::vector<float>> logits_after;
+    for (int t : order) {
+        const auto& seq = seqs[t];
+        if (seq.empty()) {
+            continue;
+        }
+        size_t common = 0;
+        while (common < path.size() && common < seq.size() && path[common] == seq[common]) {
+            ++common;
+        }
+        path.resize(common);
+        logits_after.resize(common);
+        whisper_kv_cache_seq_rm(state->kv_self, 0, n_prompt + (int)common, -1);
+        for (size_t i = common; i < seq.size(); ++i) {
+            whisper_batch_prep_legacy(state->batch, &seq[i], 1, n_prompt + (int)i, 0);
+            const auto t0 = now();
+            if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            ++n_steps;
+            path.push_back(seq[i]);
+            logits_after.emplace_back(state->logits.begin(), state->logits.begin() + n_vocab);
+        }
+        const auto t1 = now();
+        double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+            logprob += log_softmax_at(logits_after[i].data(), target);
+        }
+        t_sm += ms(t1, now());
+        out_logprobs[t] = (float)logprob;
+        if (out_n_tokens) {
+            out_n_tokens[t] = (int)seq.size() + 1; // text tokens and end-of-text
+        }
+    }
+    if (prof) {
+        fprintf(stderr,
+                "score_texts: %d texts, init %.0f ms, mel %.0f ms, encode %.0f ms, prompt(%d) %.0f ms, "
+                "%d decode steps %.0f ms (%.1f ms/step), softmax %.0f ms, total %.0f ms\n",
+                n_texts, ms(t_start, t_init), ms(t_init, t_mel), ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt),
+                n_steps, t_dec, n_steps ? t_dec / n_steps : 0.0, t_sm, ms(t_start, now()));
+    }
+    return 0;
 }
 
 int whisper_full_by_ref(struct whisper_context* ctx, struct whisper_full_params* params, const float* samples,
@@ -6583,6 +6907,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /* vad_params =*/whisper_vad_default_params(),
 
         /*.alt_n =*/0,
+
+        /*.grammar_strict =*/false,
     };
 
     switch (strategy) {
@@ -7471,14 +7797,19 @@ static void whisper_sequence_score(const struct whisper_full_params& params, whi
     }
 }
 
-static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params,
+static void whisper_reset_vad_mapping(struct whisper_state* state) {
+    state->vad_mapping_table.clear();
+    state->vad_segments.clear();
+    state->has_vad_segments = false;
+}
+
+static bool whisper_vad(struct whisper_context* /*ctx*/, struct whisper_state* state, struct whisper_full_params params,
                         const float* samples, int n_samples, std::vector<float>& filtered_samples) {
     CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
     int filtered_n_samples = 0;
 
-    // Clear any existing mapping table
-    state->vad_mapping_table.clear();
-    state->has_vad_segments = false;
+    // Each prepass owns the mapping for this state's current audio only.
+    whisper_reset_vad_mapping(state);
 
     if (state->vad_context == nullptr) {
         struct whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
@@ -7502,8 +7833,8 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
 
     if (vad_segments->data.size() > 0) {
         state->has_vad_segments = true;
-        ctx->state->vad_segments.clear();
-        ctx->state->vad_segments.reserve(vad_segments->data.size());
+        state->vad_segments.clear();
+        state->vad_segments.reserve(vad_segments->data.size());
 
         // Initialize the time mapping table
         state->vad_mapping_table.clear();
@@ -7580,7 +7911,7 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
                     "%s: vad_segment_info: orig_start: %.2f, orig_end: %.2f, vad_start: %.2f, vad_end: %.2f\n",
                     __func__, segment.orig_start / 100.0, segment.orig_end / 100.0, segment.vad_start / 100.0,
                     segment.vad_end / 100.0);
-                ctx->state->vad_segments.push_back(segment);
+                state->vad_segments.push_back(segment);
 
                 // Copy this speech segment
                 memcpy(filtered_samples.data() + offset, samples + segment_start_samples,
@@ -7636,6 +7967,29 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
 
 int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params,
                             const float* samples, int n_samples) {
+    if (!ctx || !state || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
+    // A state reused without VAD must not apply its previous audio's time map.
+    // VAD wrappers set params.vad and prepare the current map before this call.
+    if (!params.vad) {
+        whisper_reset_vad_mapping(state);
+    }
+    // Bound PCM before feature extraction, including sequential/direct-state
+    // decode. A seek limit alone still exposes later speech to the encoder.
+    // Zero PCM remains valid for callers decoding a precomputed mel buffer.
+    if (n_samples > 0) {
+        const int64_t offset_samples = int64_t(CRISPASR_SAMPLE_RATE) * params.offset_ms / 1000;
+        if (offset_samples >= n_samples) {
+            state->result_all.clear();
+            return 0;
+        }
+        if (params.duration_ms > 0) {
+            const int64_t end_samples = offset_samples + int64_t(CRISPASR_SAMPLE_RATE) * params.duration_ms / 1000;
+            n_samples = int(std::min<int64_t>(n_samples, end_samples));
+        }
+    }
     // Reset all schedulers so a second whisper_full() call on the same
     // context doesn't hit GGML_ASSERT(!sched->is_alloc) if a previous
     // call left a scheduler in the allocated state (e.g. early return,
@@ -7701,8 +8055,9 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
     }
 
     const int seek_start = params.offset_ms / 10;
-    const int seek_end =
-        params.duration_ms == 0 ? whisper_n_len_from_state(state) : seek_start + params.duration_ms / 10;
+    const int seek_end = params.duration_ms == 0
+                             ? whisper_n_len_from_state(state)
+                             : std::min(whisper_n_len_from_state(state), seek_start + params.duration_ms / 10);
 
     // if length of spectrogram is less than 100ms (10 frames), then return
     // basically don't process anything that is less than 100ms
@@ -8559,6 +8914,30 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             // [EXPERIMENTAL] Token-level timestamps with DTW
             const auto n_segments_before = state->result_all.size();
 
+            // Predicted timestamps can extend into the padded encoder window.
+            // Publish only times within the audio supplied to this window, even
+            // when token energy expansion, wrapping or DTW adjusts them later.
+            const int64_t window_end = std::min<int64_t>(seek_end, int64_t(seek) + CRISPASR_CHUNK_SIZE * 100);
+            const auto bound_time = [&](int64_t t) { return std::max<int64_t>(seek, std::min(t, window_end)); };
+            const auto bound_segments = [&](size_t first) {
+                for (size_t i = first; i < result_all.size(); ++i) {
+                    auto& segment = result_all[i];
+                    segment.t0 = bound_time(segment.t0);
+                    segment.t1 = std::max(segment.t0, bound_time(segment.t1));
+                    for (auto& token : segment.tokens) {
+                        const auto bound_token_time = [&](int64_t t) {
+                            return t < 0 ? t : std::max(segment.t0, std::min(t, segment.t1));
+                        };
+                        token.t0 = bound_token_time(token.t0);
+                        token.t1 = bound_token_time(token.t1);
+                        token.t_dtw = bound_token_time(token.t_dtw);
+                        if (token.t0 >= 0 && token.t1 >= 0) {
+                            token.t1 = std::max(token.t0, token.t1);
+                        }
+                    }
+                }
+            };
+
             const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
                                        best_decoder.sequence.avg_logprobs < params.logprob_thold);
 
@@ -8607,8 +8986,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                         const auto t1 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
 
                         if (!text.empty()) {
-                            const auto tt0 = t0;
-                            const auto tt1 = t1;
+                            const auto tt0 = bound_time(t0);
+                            const auto tt1 = std::max(tt0, bound_time(t1));
 
                             if (params.print_realtime) {
                                 if (params.print_timestamps) {
@@ -8640,6 +9019,7 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                     n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                                 }
                             }
+                            bound_segments(result_all.size() - n_new);
                             if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                                 params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                             }
@@ -8680,8 +9060,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                 if (!text.empty()) {
                     const auto t1 = seek + seek_delta;
 
-                    const auto tt0 = t0;
-                    const auto tt1 = t1;
+                    const auto tt0 = bound_time(t0);
+                    const auto tt1 = std::max(tt0, bound_time(t1));
 
                     if (params.print_realtime) {
                         if (params.print_timestamps) {
@@ -8711,6 +9091,7 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                             n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                         }
                     }
+                    bound_segments(result_all.size() - n_new);
                     if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                         params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                     }
@@ -8725,10 +9106,9 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                     const int n_frames = std::min(std::min(CRISPASR_CHUNK_SIZE * 100, seek_delta), seek_end - seek);
                     whisper_exp_compute_token_level_timestamps_dtw(ctx, state, params, result_all.size() - n_segments,
                                                                    n_segments, seek, n_frames, 7, params.n_threads);
+                    bound_segments(n_segments_before);
                     if (params.new_segment_callback) {
-                        for (int seg = (int)result_all.size() - n_segments; seg < n_segments; seg++) {
-                            params.new_segment_callback(ctx, state, seg, params.new_segment_callback_user_data);
-                        }
+                        params.new_segment_callback(ctx, state, n_segments, params.new_segment_callback_user_data);
                     }
                 }
             }
@@ -8780,14 +9160,21 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
 }
 
 int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples) {
+    if (!ctx || !ctx->state || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
     std::vector<float> vad_samples;
     if (params.vad) {
         CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return -1;
         }
         if (vad_samples.empty()) {
+            whisper_reset_vad_mapping(ctx->state);
             ctx->state->result_all.clear();
             return 0;
         }
@@ -8799,6 +9186,15 @@ int whisper_full(struct whisper_context* ctx, struct whisper_full_params params,
 
 int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_params params, const float* samples,
                           int n_samples, int n_processors) {
+    if (!ctx || !ctx->state || n_processors < 1 || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
+    if (n_samples == 0) {
+        whisper_reset_vad_mapping(ctx->state);
+        ctx->state->result_all.clear();
+        return 0;
+    }
     if (n_processors == 1) {
         return whisper_full(ctx, params, samples, n_samples);
     }
@@ -8808,65 +9204,98 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
         CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return -1;
         }
         if (vad_samples.empty()) {
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return 0;
         }
         samples = vad_samples.data();
         n_samples = vad_samples.size();
     }
-    int ret = 0;
-
-    // prepare separate states for each thread
-    std::vector<whisper_state*> states;
-
-    const int offset_samples = (CRISPASR_SAMPLE_RATE * params.offset_ms) / 1000;
+    // Validate in sample units before narrowing. Even a 134-second offset
+    // overflows the old sample_rate * offset_ms int intermediate.
+    const int64_t offset_samples_wide = int64_t(CRISPASR_SAMPLE_RATE) * params.offset_ms / 1000;
+    if (offset_samples_wide >= n_samples) {
+        ctx->state->result_all.clear();
+        return 0;
+    }
+    // duration_ms limits the entire requested interval, not each worker.
+    // Bound PCM before splitting so encoders cannot see the unrequested tail.
+    // Offsets/duration retain the existing post-VAD (processed-audio) units.
+    if (params.duration_ms > 0) {
+        const int64_t end_samples = offset_samples_wide + int64_t(CRISPASR_SAMPLE_RATE) * params.duration_ms / 1000;
+        n_samples = int(std::min<int64_t>(n_samples, end_samples));
+        params.duration_ms = 0; // The PCM bound now owns the global limit.
+    }
+    const int offset_samples = int(offset_samples_wide);
     const int n_samples_per_processor = (n_samples - offset_samples) / n_processors;
+    if (n_samples_per_processor == 0) {
+        // Avoid empty workers. VAD has already run, so use the state decoder.
+        return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
+    }
 
-    // the calling thread will process the first chunk
-    // while the other threads will process the remaining chunks
-
-    std::vector<std::thread> workers(n_processors - 1);
-    for (int i = 0; i < n_processors - 1; ++i) {
-        // create a new state for each thread
-        states.push_back(whisper_init_state(ctx));
-
-        const int start_samples = offset_samples + (i + 1) * n_samples_per_processor;
-        const int n_samples_cur = (i == n_processors - 2) ? n_samples - start_samples : n_samples_per_processor;
-
+    int ret = 0;
+    using state_owner = std::unique_ptr<whisper_state, decltype(&whisper_free_state)>;
+    std::vector<state_owner> states;
+    std::vector<std::thread> workers;
+    std::vector<int> worker_status;
+    try {
+        worker_status.resize(n_processors - 1, 0);
+        states.reserve(n_processors - 1);
+        workers.reserve(n_processors - 1);
+        // Allocate every state before launching threads, so a null state never
+        // reaches a decoder and earlier states are freed on allocation failure.
+        for (int i = 0; i < n_processors - 1; ++i) {
+            states.emplace_back(whisper_init_state(ctx), whisper_free_state);
+            if (!states.back()) {
+                ctx->state->result_all.clear();
+                return -1;
+            }
+        }
+        for (int i = 0; i < n_processors - 1; ++i) {
+            const int start_samples = offset_samples + (i + 1) * n_samples_per_processor;
+            const int n_samples_cur = (i == n_processors - 2) ? n_samples - start_samples : n_samples_per_processor;
+            auto params_cur = params;
+            params_cur.offset_ms = 0;
+            params_cur.print_progress = false;
+            params_cur.print_realtime = false;
+            params_cur.new_segment_callback = nullptr;
+            params_cur.new_segment_callback_user_data = nullptr;
+            params_cur.progress_callback = nullptr;
+            params_cur.progress_callback_user_data = nullptr;
+            workers.emplace_back([&, i, params_cur, start_samples, n_samples_cur]() {
+                try {
+                    worker_status[i] = whisper_full_with_state(ctx, states[i].get(), params_cur,
+                                                               samples + start_samples, n_samples_cur);
+                } catch (...) {
+                    // Exceptions must not escape a std::thread entry point.
+                    worker_status[i] = -1;
+                }
+            });
+        }
         auto params_cur = params;
-
-        params_cur.offset_ms = 0;
-        params_cur.print_progress = false;
         params_cur.print_realtime = false;
-
-        params_cur.new_segment_callback = nullptr;
-        params_cur.new_segment_callback_user_data = nullptr;
-
-        params_cur.progress_callback = nullptr;
-        params_cur.progress_callback_user_data = nullptr;
-
-        workers[i] = std::thread(whisper_full_with_state, ctx, states[i], std::move(params_cur),
-                                 samples + start_samples, n_samples_cur);
+        ret = whisper_full_with_state(ctx, ctx->state, params_cur, samples, offset_samples + n_samples_per_processor);
+    } catch (...) {
+        // Includes thread creation failure: join every thread already started.
+        ret = -1;
     }
-
-    {
-        auto params_cur = params;
-
-        // We need to disable the print real-time for this one as well, otherwise it will show only for the first chunk.
-        params_cur.print_realtime = false;
-
-        // Run the first transformation using default state but only for the first chunk.
-        ret = whisper_full_with_state(ctx, ctx->state, std::move(params_cur), samples,
-                                      offset_samples + n_samples_per_processor);
+    for (auto& worker : workers) {
+        worker.join();
     }
-
-    for (int i = 0; i < n_processors - 1; ++i) {
-        workers[i].join();
+    for (int status : worker_status) {
+        if (ret == 0 && status != 0) {
+            ret = status;
+        }
     }
-
-    const int64_t offset_t = (int64_t)params.offset_ms / 10.0;
+    if (ret != 0) {
+        ctx->state->result_all.clear();
+        return ret;
+    }
 
     // combine results into result_state->result_all from all other states
     for (int i = 0; i < n_processors - 1; ++i) {
@@ -8874,8 +9303,20 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
 
         for (auto& result : results_i) {
             // correct the segment timestamp taking into account the offset
-            result.t0 += 100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t;
-            result.t1 += 100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t;
+            const int64_t shift = 100LL * (offset_samples + (i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE;
+            result.t0 += shift;
+            result.t1 += shift;
+            for (auto& token : result.tokens) {
+                if (token.t0 >= 0) {
+                    token.t0 += shift;
+                }
+                if (token.t1 >= 0) {
+                    token.t1 += shift;
+                }
+                if (token.t_dtw >= 0) {
+                    token.t_dtw += shift;
+                }
+            }
 
             // make sure that segments are not overlapping
             if (!ctx->state->result_all.empty()) {
@@ -8903,8 +9344,6 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
         ctx->state->n_decode += states[i]->n_decode;
         ctx->state->n_batchd += states[i]->n_batchd;
         ctx->state->n_prompt += states[i]->n_prompt;
-
-        whisper_free_state(states[i]);
     }
 
     // average the timings
@@ -8919,7 +9358,7 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
     for (int i = 0; i < n_processors - 1; ++i) {
         CRISPASR_LOG_WARN(
             "%s: split %d - %s\n", __func__, (i + 1),
-            to_timestamp(100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t).c_str());
+            to_timestamp(100LL * (offset_samples + (i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE).c_str());
     }
     CRISPASR_LOG_WARN("%s: the transcription quality may be degraded near these boundaries\n", __func__);
 
@@ -9073,11 +9512,26 @@ whisper_token whisper_full_get_token_id(struct whisper_context* ctx, int i_segme
 
 struct whisper_token_data whisper_full_get_token_data_from_state(struct whisper_state* state, int i_segment,
                                                                  int i_token) {
-    return state->result_all[i_segment].tokens[i_token];
+    // Return original-audio times just like the segment getters. Keep stored
+    // tokens in processed time so repeated reads and parallel merge cannot
+    // apply the mapping twice; negative values remain unavailable sentinels.
+    auto token = state->result_all[i_segment].tokens[i_token];
+    if (state->has_vad_segments && !state->vad_mapping_table.empty()) {
+        if (token.t0 >= 0) {
+            token.t0 = map_processed_to_original_time(token.t0, state->vad_mapping_table);
+        }
+        if (token.t1 >= 0) {
+            token.t1 = map_processed_to_original_time(token.t1, state->vad_mapping_table);
+        }
+        if (token.t_dtw >= 0) {
+            token.t_dtw = map_processed_to_original_time(token.t_dtw, state->vad_mapping_table);
+        }
+    }
+    return token;
 }
 
 struct whisper_token_data whisper_full_get_token_data(struct whisper_context* ctx, int i_segment, int i_token) {
-    return ctx->state->result_all[i_segment].tokens[i_token];
+    return whisper_full_get_token_data_from_state(ctx->state, i_segment, i_token);
 }
 
 float whisper_full_get_token_p_from_state(struct whisper_state* state, int i_segment, int i_token) {

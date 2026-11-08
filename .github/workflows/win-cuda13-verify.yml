@@ -22,6 +22,14 @@ name: Win CUDA13 Verify
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    paths:
+      - '.github/workflows/win-cuda13-verify.yml'
+      - '.github/workflows/release.yml'
+      - 'CMakeLists.txt'
+      - 'examples/cli/CMakeLists.txt'
+      - 'examples/cli/crispasr_diagnostics.cpp'
+  pull_request:
     paths:
       - '.github/workflows/win-cuda13-verify.yml'
       - '.github/workflows/release.yml'
@@ -29,8 +37,40 @@ on:
       - 'examples/cli/CMakeLists.txt'
       - 'examples/cli/crispasr_diagnostics.cpp'
 
+# PRs: a newer push to the same PR cancels the older run. main pushes and
+# manual runs get their own group (run_id), so they are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Cheap gate: on a branch push, run the heavy job only when the BRANCH ITSELF
+  # changes a watched path (vs its merge-base with main). A rebase onto a main
+  # that touched CMakeLists.txt no longer queues one heavy run per branch.
+  # main, pull requests and manual dispatch always run. See the script's header.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.scope.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "push" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            git fetch --no-tags origin main || true   # no base -> script answers true
+            python3 .github/scripts/branch_touches_paths.py "$GITHUB_WORKFLOW_REF_PATH" origin/main >> "$GITHUB_OUTPUT" \
+              || echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_WORKFLOW_REF_PATH: .github/workflows/win-cuda13-verify.yml
+
   win-cuda13-verify:
+    needs: scope
+    if: needs.scope.outputs.relevant == 'true'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
@@ -55,7 +95,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;120-virtual" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 

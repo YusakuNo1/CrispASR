@@ -71,7 +71,7 @@ try:
     hf_token = None
     for path in [
         "/kaggle/input/crispasr-hf-token/hf_token.txt",
-        "/kaggle/input/datasets/chr1str/crispasr-hf-token/hf_token.txt",
+        "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt",
     ]:
         if os.path.exists(path):
             hf_token = open(path).read().strip()

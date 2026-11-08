@@ -5,7 +5,7 @@
 #     (requires os.environ["HF_TOKEN"] so the push fires) -> externally watchable.
 #   - kh.step() at EVERY phase; kh.build_heartbeat() around the build.
 #   - hf_transfer for downloads (no http_get CLOSE_WAIT hang).
-#   - ccache warmed from chr1s4/crispasr-ccache, MOVED off /kaggle/working (§22).
+#   - ccache warmed from ${KAGGLE_ACCOUNT}/crispasr-ccache, MOVED off /kaggle/working (§22).
 #   - everything large under /kaggle/temp (or /tmp), /kaggle/working stays small.
 #
 # Acceptance (HARD RULE #3): the decoded ASR round-trip. All fixes in place:

@@ -1,4 +1,4 @@
 #!/bin/bash
-# Push under chr1s4 (chr1str is running the requant kernel).
-export KAGGLE_API_TOKEN=KGAT_95d684fe44dd004ae6e78f9b32edaf3c
-cd "$(dirname "$0")" && cp ../kaggle_harness.py . && kaggle kernels push -p .
+# Push under ${KAGGLE_ACCOUNT} (${KAGGLE_ACCOUNT} is running the requant kernel).
+# Kaggle CLI auth: ~/.kaggle/access_token (never commit a token; see tests/test_no_secrets.py)
+cd "$(dirname "$0")" && cp ../kaggle_harness.py . && python3 "$(git rev-parse --show-toplevel)/tools/kaggle/kpush.py" .

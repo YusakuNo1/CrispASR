@@ -17,11 +17,11 @@ internet — and we must download E4B from HF and upload the GGUFs back. Large
 artifacts go to /kaggle/temp (not /kaggle/working, capped at ~20 GB).
 
 REQUIREMENTS:
-  - chr1str/crispasr-hf-token dataset mounted (HF token); the token's HF
+  - ${KAGGLE_ACCOUNT}/crispasr-hf-token dataset mounted (HF token); the token's HF
     account must have accepted the google/gemma-4-E4B-it gated license.
 
-Push (under chr1str):
-  export KAGGLE_API_TOKEN=<chr1str token>
+Push (under $KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/gemma4-e4b-convert
 """
 

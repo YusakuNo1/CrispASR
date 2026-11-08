@@ -47,6 +47,8 @@ void voxcpm2_free(struct voxcpm2_context* ctx);
 
 void voxcpm2_set_n_threads(struct voxcpm2_context* ctx, int n_threads);
 void voxcpm2_set_seed(struct voxcpm2_context* ctx, uint32_t seed);
+// Update the next synthesis call; non-positive values leave the current setting unchanged.
+void voxcpm2_set_inference_steps(struct voxcpm2_context* ctx, int steps);
 
 // Synthesize text → 48 kHz mono float32 PCM (zero-shot, no voice cloning).
 // Returns malloc'd buffer; caller frees with voxcpm2_pcm_free.
@@ -82,4 +84,12 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
 
 #ifdef __cplusplus
 }
+
+#include <vector>
+
+namespace voxcpm2_test {
+std::vector<float> test_wn_reconstruct(const float* weight_g, const float* weight_v, int out_ch, int in_ch, int ksize);
+void test_snake1d(const float* alpha, const float* x_in, float* x_out, int C, int T);
+bool test_is_gpu_unlimited_backend_name(const char* backend_name);
+} // namespace voxcpm2_test
 #endif

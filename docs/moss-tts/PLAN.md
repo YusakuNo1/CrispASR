@@ -12,7 +12,7 @@ Spec: `docs/moss-tts/STUDY-4B.md`. Engineering lessons: `LEARNINGS.md` (4B entry
 + `HISTORY.md`. Branch `feat/moss-tts-local-4b` rebased (29 commits, clean) + ff'd
 into `main`; rebuilt + wiring PASS + unit test 30/30 + feature-matrix current.
 
-**Validated end-to-end (Kaggle chr1s4 P100, HARD RULE #3).** With the card-correct
+**Validated end-to-end (Kaggle $KAGGLE_ACCOUNT P100, HARD RULE #3).** With the card-correct
 sampling defaults, F16 synth STOPS naturally (short 15, long 124 frames — not the
 4096 runaway) and the long clip round-trips through whisper at **word-overlap
 0.969**. Full chain proven: Qwen3-4B backbone → 1-layer depth transformer →
@@ -49,7 +49,7 @@ unit test) · P5 GPU round-trip.
    The ONE item that reds CI on the merge commit (hand-added `-lmoss_tts_local`;
    macOS regen pollutes the `#cgo linux` line with Metal/BLAS). Do first to green CI.
 2. Release via `scripts/bump-version.sh` once CI green; **close #249** (shipped).
-3. Non-blocking: ref-dumper (advisory 12-pt gap); refresh `chr1s4/crispasr-ccache`
+3. Non-blocking: ref-dumper (advisory 12-pt gap); refresh `${KAGGLE_ACCOUNT}/crispasr-ccache`
    seed (warm ~3 min builds vs ~23 cold); short-clip ASR 0.0 (likely
    whisper-on-~1 s artifact — the long clip proved the audio correct); optional
    Q5_K/Q6_K probe for a smaller-than-F16 stable target; v2 codec ENCODER for voice

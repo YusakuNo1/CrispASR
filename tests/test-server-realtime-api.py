@@ -75,6 +75,45 @@ def ws_frame(payload, opcode=0x1):
     return bytes(b)
 
 
+def read_one_frame(sock, timeout=4.0):
+    """Return (opcode, payload) of the next small server frame (under 126 bytes, like a pong),
+    or (None, b"") on timeout or a larger frame."""
+    sock.settimeout(timeout)
+    buf = b""
+    try:
+        while True:
+            if len(buf) >= 2:
+                ln = buf[1] & 0x7F
+                if ln >= 126:
+                    return None, b""
+                if len(buf) >= 2 + ln:
+                    return buf[0] & 0x0F, buf[2:2 + ln]
+            chunk = sock.recv(1)
+            if not chunk:
+                return None, b""
+            buf += chunk
+    except socket.timeout:
+        return None, b""
+
+
+def handshake(port, key_header="Sec-WebSocket-Key"):
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = ("GET /v1/realtime HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\n"
+           "Connection: Upgrade\r\n%s: %s\r\n"
+           "Sec-WebSocket-Version: 13\r\n\r\n" % (port, key_header, key))
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(1)
+        if not chunk:
+            break
+        resp += chunk
+    expected = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+    ok = resp.startswith(b"HTTP/1.1 101") and ("Sec-WebSocket-Accept: " + expected).encode() in resp
+    return s, ok
+
+
 def read_server_frames(sock, timeout=4.0):
     sock.settimeout(timeout)
     buf = b""
@@ -117,6 +156,10 @@ def main():
     explicit_model = ""
     language = "en"
     server_vad = "--server-vad" in sys.argv[1:]
+    long_turn = "--long-turn" in sys.argv[1:]
+    if long_turn:
+        assert not server_vad
+        os.environ["CRISPASR_NEMOTRON_MAX_TURN_SECONDS"] = "45"
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--port" and i + 1 < len(args):
@@ -242,8 +285,33 @@ def main():
             print("  ✗ session did not declare its turn/VAD contract: %r" % session_contract)
             failed += 1
 
+        if long_turn:
+            assert session_contract.get("max_turn_seconds") == 45, session_contract
+
+        # A Ping must get a Pong with the same payload.
+        s.sendall(ws_frame(b"abcd", opcode=0x9))
+        opcode, payload = read_one_frame(s, timeout=5.0)
+        if opcode == 0xA and payload == b"abcd":
+            print("  ✓ ping answered with matching pong")
+            passed += 1
+        else:
+            print("  ✗ no pong for ping: opcode=%r payload=%r" % (opcode, payload))
+            failed += 1
+
+        # Proxies may send the key header in another case.
+        s2, ok = handshake(rt_port, "Sec-Websocket-Key")
+        s2.close()
+        if ok:
+            print("  ✓ handshake accepts the key header spelled Sec-Websocket-Key")
+            passed += 1
+        else:
+            print("  ✗ handshake rejected Sec-Websocket-Key")
+            failed += 1
+
         # 2. Stream PCM, collect text frames.
         pcm, sr = load_pcm_16_bytes(sample)
+        if long_turn:
+            pcm *= 3
         chunk = 16000 * 2  # ~1s of PCM16
         msgs = []
         for i in range(0, len(pcm), chunk):
@@ -280,6 +348,10 @@ def main():
         else:
             print("  ✗ pre-commit behavior disagrees with session contract: %r" % premature[:2])
             failed += 1
+
+        if long_turn:
+            assert not any(json.loads(m).get("type") ==
+                           "conversation.item.input_audio_transcription.completed" for m in msgs), msgs
 
         commit_msg = json.dumps({"type": "input_audio_buffer.commit"})
         auto_completed = False
@@ -337,6 +409,14 @@ def main():
         else:
             print("  ✗ completion timing metadata missing: %r" % completed)
             failed += 1
+
+        if long_turn:
+            assert completed and abs(completed["audio_duration_ms"] - len(pcm) / 32) < 1, completed
+            completions = [m for m in msgs if json.loads(m).get("type") ==
+                           "conversation.item.input_audio_transcription.completed"]
+            assert len(completions) == 1, completions
+            print("  ✓ 33 s dictation remains one complete turn under configured 45 s cap")
+            passed += 1
 
         # 3. Reuse the same WebSocket for another turn. Its duration must be
         # just this append, proving commit cleared the prior audio prefix.

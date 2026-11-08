@@ -7,7 +7,7 @@
 # built against it. Optionally uploads the F16 GGUF to cstr/moss-tts-local-v1.5-GGUF.
 #
 # CPU kernel (no GPU needed for conversion). Stage under /tmp (~70 GB), not
-# /kaggle/working (~20 GB). HF auth via the chr1str/crispasr-hf-token dataset.
+# /kaggle/working (~20 GB). HF auth via the ${KAGGLE_ACCOUNT}/crispasr-hf-token dataset.
 
 import json
 import os

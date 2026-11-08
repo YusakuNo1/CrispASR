@@ -56,6 +56,13 @@ def kh(monkeypatch):
     sys.modules["kh_under_test"] = mod
     try:
         spec.loader.exec_module(mod)
+        # This suite tests mount lookup/precedence, not live credential validity.
+        # Keep synthetic tokens off the network and model optional downloader
+        # availability explicitly rather than relying on the host installation.
+        monkeypatch.setattr(mod, "kaggle_secret", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "hf_token_rejected", lambda token: False)
+        import types
+        monkeypatch.setitem(sys.modules, "hf_transfer", types.ModuleType("hf_transfer"))
         yield mod
     finally:
         sys.modules.pop("kh_under_test", None)
@@ -103,9 +110,9 @@ def test_short_path_layout_nonstandard_slug(kh, monkeypatch, tmp_path):
 # This is the layout the T19-E3 run-1 worker had ("/kaggle/input contains
 # 1 entries: ['datasets']") and the one the pre-fix resolver missed.
 
-def test_long_path_layout_chr1s4(kh, monkeypatch, tmp_path):
+def test_long_path_layout_someacct(kh, monkeypatch, tmp_path):
     root = fake_input_root(monkeypatch, tmp_path)
-    put_token(root, "datasets/chr1s4/crispasr-hf-token/hf_token.txt", TOK_LONG)
+    put_token(root, "datasets/someacct/crispasr-hf-token/hf_token.txt", TOK_LONG)
     assert kh.kaggle_token_from_dataset() == TOK_LONG
 
 
@@ -121,7 +128,7 @@ def test_long_path_layout_any_owner(kh, monkeypatch, tmp_path):
 def test_both_layouts_short_preferred(kh, monkeypatch, tmp_path):
     root = fake_input_root(monkeypatch, tmp_path)
     put_token(root, "crispasr-hf-token/hf_token.txt", TOK_SHORT)
-    put_token(root, "datasets/chr1s4/crispasr-hf-token/hf_token.txt", TOK_LONG)
+    put_token(root, "datasets/someacct/crispasr-hf-token/hf_token.txt", TOK_LONG)
     assert kh.kaggle_token_from_dataset() == TOK_SHORT
 
 
@@ -151,7 +158,7 @@ def test_resolve_require_aborts_up_front(kh, monkeypatch, tmp_path):
 
 def test_resolve_require_passes_when_token_present(kh, monkeypatch, tmp_path):
     root = fake_input_root(monkeypatch, tmp_path)
-    put_token(root, "datasets/chr1s4/crispasr-hf-token/hf_token.txt", TOK_LONG)
+    put_token(root, "datasets/someacct/crispasr-hf-token/hf_token.txt", TOK_LONG)
     assert kh.resolve_hf_token(require=True) == TOK_LONG
 
 
@@ -184,5 +191,35 @@ def test_short_empty_token_falls_through_to_long(kh, monkeypatch, tmp_path):
     # An empty/short token file must not shadow a real one elsewhere.
     root = fake_input_root(monkeypatch, tmp_path)
     put_token(root, "crispasr-hf-token/hf_token.txt", "")
-    put_token(root, "datasets/chr1s4/crispasr-hf-token/hf_token.txt", TOK_LONG)
+    put_token(root, "datasets/someacct/crispasr-hf-token/hf_token.txt", TOK_LONG)
     assert kh.kaggle_token_from_dataset() == TOK_LONG
+
+
+def test_named_credential_does_not_fall_back_to_hf(kh, monkeypatch, tmp_path):
+    root = fake_input_root(monkeypatch, tmp_path)
+    put_token(root, "datasets/someacct/secrets/hf_token.txt", TOK_LONG)
+    assert kh.kaggle_token_from_dataset("gh_token.txt") is None
+
+
+def test_named_credential_scans_later_dataset_before_hf_fallback(kh, monkeypatch, tmp_path):
+    root = fake_input_root(monkeypatch, tmp_path)
+    put_token(root, "datasets/someacct/a-hf/hf_token.txt", TOK_LONG)
+    expected = "gh_test_" + "0" * 16
+    put_token(root, "datasets/someacct/z-other/gh_token.txt", expected)
+    assert kh.kaggle_token_from_dataset("gh_token.txt") == expected
+
+
+def test_unavailable_fast_downloader_is_not_enabled(kh, monkeypatch, tmp_path):
+    root = fake_input_root(monkeypatch, tmp_path)
+    put_token(root, "crispasr-hf-token/hf_token.txt", TOK_SHORT)
+    monkeypatch.setitem(sys.modules, "hf_transfer", None)
+    assert kh.resolve_hf_token() == TOK_SHORT
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+
+
+def test_rejected_token_still_aborts_uploads(kh, monkeypatch, tmp_path):
+    root = fake_input_root(monkeypatch, tmp_path)
+    put_token(root, "crispasr-hf-token/hf_token.txt", TOK_SHORT)
+    monkeypatch.setattr(kh, "hf_token_rejected", lambda token: True)
+    with pytest.raises(SystemExit):
+        kh.resolve_hf_token(require=True)

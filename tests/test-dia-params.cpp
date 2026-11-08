@@ -4,6 +4,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "dia_tts.h"
+#include "dia_sampling.h"
 
 TEST_CASE("dia_params: default values are sensible", "[unit][dia]") {
     struct dia_tts_context_params p = dia_tts_context_default_params();
@@ -42,4 +43,60 @@ TEST_CASE("dia_init_from_file: empty path returns nullptr", "[unit][dia]") {
 TEST_CASE("dia_free: NULL context is a no-op", "[unit][dia]") {
     dia_tts_free(nullptr);
     SUCCEED("dia_tts_free tolerated a NULL ctx.");
+}
+
+// These inputs expose the previous all-zero nucleus weights and missing
+// threshold-crossing token. Expectations follow the pinned official sampler.
+TEST_CASE("dia_sampling: a dominant token survives nucleus filtering", "[unit][dia]") {
+    const float logits[] = {0.0f, -1.0f, 20.0f};
+    std::mt19937 rng(42);
+    for (int i = 0; i < 512; ++i)
+        REQUIRE(dia_sample_token(logits, 3, 1.2f, 0.95f, 0, rng) == 2);
+}
+
+TEST_CASE("dia_sampling: nucleus includes its crossing token", "[unit][dia]") {
+    const float logits[] = {std::log(0.6f), std::log(0.3f), std::log(0.1f)};
+    std::mt19937 rng(42);
+    int counts[3] = {};
+    for (int i = 0; i < 12000; ++i)
+        ++counts[dia_sample_token(logits, 3, 1.0f, 0.7f, 0, rng)];
+    REQUIRE(counts[2] == 0);
+    REQUIRE(counts[0] / 12000.0 == Catch::Approx(2.0 / 3.0).margin(0.02));
+    REQUIRE(counts[1] / 12000.0 == Catch::Approx(1.0 / 3.0).margin(0.02));
+}
+
+TEST_CASE("dia_sampling: top-k precedes nucleus and greedy bypasses both", "[unit][dia]") {
+    const float logits[] = {2.0f, 1.0f, 0.0f, -1.0f};
+    std::mt19937 rng(42);
+    int crossing = 0;
+    for (int i = 0; i < 1024; ++i) {
+        const auto token = dia_sample_token(logits, 4, 1.0f, 0.95f, 2, rng);
+        REQUIRE(token < 2);
+        crossing += token == 1;
+    }
+    REQUIRE(crossing > 0);
+    REQUIRE(dia_sample_token(logits, 4, 0.0f, 0.1f, 1, rng) == 0);
+}
+
+TEST_CASE("dia_params: null generation-limit setter is safe", "[unit][dia]") {
+    dia_tts_set_max_tokens(nullptr, 1024);
+    SUCCEED();
+}
+
+TEST_CASE("dia_sampling: top-k one preserves a unique maximum after softmax rounds to ties", "[unit][dia]") {
+    const float logits[] = {0.0f, 1.0e-8f};
+    for (unsigned seed = 0; seed < 64; ++seed) {
+        std::mt19937 rng(seed);
+        REQUIRE(dia_sample_token(logits, 2, 1.0f, 0.95f, 1, rng) == 1);
+    }
+}
+
+TEST_CASE("dia_sampling: top-k keeps only its selected logit indices", "[unit][dia]") {
+    const float logits[] = {0.0f, 1.0e-8f, 2.0e-8f, 3.0e-8f};
+    for (unsigned seed = 0; seed < 64; ++seed) {
+        std::mt19937 rng(seed);
+        const auto token = dia_sample_token(logits, 4, 1.0f, 1.0f, 2, rng);
+        REQUIRE(token >= 2);
+        REQUIRE(token < 4);
+    }
 }

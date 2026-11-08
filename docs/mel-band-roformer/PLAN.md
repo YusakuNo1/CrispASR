@@ -79,7 +79,7 @@ than an oversight:
   and takes the whole-buffer path, so it never segments.
 
 Kernel `tools/kaggle/melband-seg-evidence-v2/`, run
-`chr1s4/crispasr-melband-seg-evidence-v2`. 20 s of real music with vocals
+`${KAGGLE_ACCOUNT}/crispasr-melband-seg-evidence-v2`. 20 s of real music with vocals
 (librosa `fishin`, ccMixter/CC; ASR-verified to contain sung content, because
 solo speech is near pass-through through a vocals separator and instrumental
 music is degenerate the other way). Arm B gets 4 chunks / 3 internal

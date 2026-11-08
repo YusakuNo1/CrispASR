@@ -8,6 +8,16 @@ target_link_libraries(${TARGET} PRIVATE
     whisper
     )
 
+# Chat pulls the llama model registry into the link; keep the default browser
+# bundle unchanged until the opt-in full-module size/model gates have passed.
+option(CRISPASR_WASM_CHAT "Expose the text-chat C ABI through Embind" OFF)
+if(CRISPASR_WASM_CHAT AND NOT CRISPASR_WASM_SINGLE_THREAD)
+    message(FATAL_ERROR "WASM chat currently requires CRISPASR_WASM_SINGLE_THREAD=ON")
+endif()
+if(CRISPASR_WASM_CHAT)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_WASM_CHAT=1)
+endif()
+
 unset(EXTRA_FLAGS)
 
 if (CRISPASR_WASM_SINGLE_FILE)
@@ -59,12 +69,30 @@ else()
     set(WASM_THREAD_FLAGS "-s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=0 -s INITIAL_MEMORY=2GB")
 endif()
 
+# Opt-in browser memory experiments; retain upstream defaults until decoded
+# output and under-identical-load A/B measurements justify changing them.
+set(CRISPASR_WASM_INITIAL_MEMORY "" CACHE STRING "Override initial WASM heap, e.g. 128MB")
+set(CRISPASR_WASM_THREAD_POOL "" CACHE STRING "Override prestarted pthread pool size")
+if (CRISPASR_WASM_INITIAL_MEMORY)
+    string(REGEX REPLACE "INITIAL_MEMORY=[^ ]+" "INITIAL_MEMORY=${CRISPASR_WASM_INITIAL_MEMORY}" WASM_THREAD_FLAGS "${WASM_THREAD_FLAGS}")
+endif()
+if (CRISPASR_WASM_THREAD_POOL AND NOT CRISPASR_WASM_SINGLE_THREAD)
+    string(REGEX REPLACE "PTHREAD_POOL_SIZE=[^ ]+" "PTHREAD_POOL_SIZE=${CRISPASR_WASM_THREAD_POOL}" WASM_THREAD_FLAGS "${WASM_THREAD_FLAGS}")
+endif()
+
 # C2PA (opt-in) needs native wasm exceptions at LINK time too — but only when
 # enabled, since the module is compiled with -fwasm-exceptions only then (a
 # mismatch between compile and link EH modes would break the default build).
 set(WASM_C2PA_LINK_FLAGS "")
 if (CRISPASR_C2PA_ENABLED)
     set(WASM_C2PA_LINK_FLAGS "-fwasm-exceptions -s SUPPORT_LONGJMP=wasm")
+endif()
+
+# Adapter validation throws must unwind owned scratch buffers. Keep the opt-in
+# C2PA native-EH mode; otherwise enable JS exception handling for this adapter.
+if (NOT CRISPASR_C2PA_ENABLED)
+    target_compile_options(${TARGET} PRIVATE -fexceptions)
+    target_link_options(${TARGET} PRIVATE -fexceptions -sDISABLE_EXCEPTION_CATCHING=0)
 endif()
 
 set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \

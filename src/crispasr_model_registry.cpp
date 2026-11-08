@@ -2,6 +2,7 @@
 
 #include "crispasr_model_registry.h"
 #include "crispasr_cache.h"
+#include "core/backend_aliases.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #endif
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -25,8 +27,9 @@ struct Entry {
     const char* approx_size;
     const char* companion_file; // optional extra file (e.g. tokenizer.bin, primary voice). NULL if none.
     const char* companion_url;
-    const char* companion_size; // size of the companion file; NULL = falls back to approx_size
-    const char* license;        // NULL = permissive; otherwise SPDX-ish tag + source/license URL
+    const char* companion_size;   // size of the companion file; NULL = falls back to approx_size
+    const char* license;          // NULL = permissive; otherwise SPDX-ish tag + source/license URL
+    const char* supported_quants; // Optional comma-delimited allowlist; NULL preserves legacy rewriting.
 };
 
 // Extra companion files beyond the single inline `companion_file/url` slot.
@@ -69,6 +72,18 @@ constexpr Entry k_registry[] = {
     {"mel-band-roformer", "mel-band-roformer-vocals-f16.gguf",
      "https://huggingface.co/cstr/mel-band-roformer-vocals-GGUF/resolve/main/mel-band-roformer-vocals-f16.gguf",
      "~436 MB", nullptr, nullptr},
+    // HiDolen Mini-BS-RoFormer V2.5 source separation (--separate). 4-stem
+    // (bass, drums, other, vocals) at 44.1 kHz; MIT license. Q8_0 is the default
+    // balanced download; Q4_K and F16 are also qualified.
+    {"mini-bs-roformer", "mini-bs-roformer-q8_0.gguf",
+     "https://huggingface.co/cstr/mini-bs-roformer-GGUF/resolve/main/mini-bs-roformer-q8_0.gguf",
+     "~50 MB", nullptr, nullptr, nullptr, "MIT", ",f16,q8_0,q4_k,"},
+    {"mini-bs-roformer", "mini-bs-roformer-q4_k.gguf",
+     "https://huggingface.co/cstr/mini-bs-roformer-GGUF/resolve/main/mini-bs-roformer-q4_k.gguf",
+     "~37 MB", nullptr, nullptr, nullptr, "MIT", ",f16,q8_0,q4_k,"},
+    {"mini-bs-roformer", "mini-bs-roformer-f16.gguf",
+     "https://huggingface.co/cstr/mini-bs-roformer-GGUF/resolve/main/mini-bs-roformer-f16.gguf",
+     "~88 MB", nullptr, nullptr, nullptr, "MIT", ",f16,q8_0,q4_k,"},
     // Sidon v0.1 (SaruLab) speech restoration (--s2s). w2v-BERT predictor +
     // continuous DAC decoder; MIT. Q8_0 is the best-fidelity practical quant
     // (predictor cos 0.998 vs the upstream F32; ASR round-trip identical). #283.
@@ -88,9 +103,12 @@ constexpr Entry k_registry[] = {
     {"wespeaker", "wespeaker-resnet34-lm.gguf",
      "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf", "~24 MB",
      nullptr, nullptr, nullptr, "CC-BY-4.0 (weights; attribution required; see https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)"},
-    {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
-     "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
-     "~458 MB", nullptr, nullptr},
+    // Current plain Q4 fails the fixed original-transcript and stage controls
+    // on CPU and T4. Only the original-qualified F16 is a managed download;
+    // explicit existing quantized paths remain available for diagnostics.
+    {"nemotron", "nemotron-3.5-asr-streaming-0.6b-f16.gguf",
+     "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-GGUF/resolve/bbd95a9ca5fa0dfca3312a122dfc45a2b578b9c2/nemotron-3.5-asr-streaming-0.6b-f16.gguf",
+     "~1.3 GB", nullptr, nullptr, nullptr, "OpenMDW-1.1", ",f16,"},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)"},
     // Quds v4 (#387): Persian ASR, FastConformer-RNNT fine-tune of the
@@ -108,6 +126,27 @@ constexpr Entry k_registry[] = {
      nullptr,
      "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
      "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
+    // Haas-ja-v1.0 (#561): Japanese ASR (third-intelligence/Haas-ja-v1.0).
+    // FastConformer-TDT + 2-layer KDA predictor (Kimi Delta Attention).
+    // Apache-2.0. Runs on parakeet runtime. Q8_0 (~626 MB) recommended; Q4_K (~368 MB); F16 (~1.18 GB).
+    {"haas", "haas-ja-v1.0-q8_0.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-q8_0.gguf", "~626 MB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
+    {"haas", "haas-ja-v1.0-q4_k.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-q4_k.gguf", "~368 MB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
+    {"haas", "haas-ja-v1.0-f16.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-f16.gguf", "~1.18 GB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
+    {"haas-ja", "haas-ja-v1.0-q8_0.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-q8_0.gguf", "~626 MB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
+    {"haas-ja", "haas-ja-v1.0-q4_k.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-q4_k.gguf", "~368 MB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
+    {"haas-ja", "haas-ja-v1.0-f16.gguf",
+     "https://huggingface.co/cstr/Haas-ja-v1.0-GGUF/resolve/main/haas-ja-v1.0-f16.gguf", "~1.18 GB", nullptr, nullptr,
+     nullptr, "Apache-2.0 (see https://huggingface.co/third-intelligence/Haas-ja-v1.0)"},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-1b-v2)"},
     {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
@@ -139,11 +178,41 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
+    // Voxtral Mini 3B. Q4_K stays the auto-download default (first row wins
+    // for a bare backend lookup): identical transcript to F16 on jfk.wav at
+    // 2.2x the speed. `-m auto:f16` does not need the F16 row — it reaches the
+    // q4_k row and apply_quant_to_filename() rewrites the suffix — which is
+    // exactly how #437 stayed invisible: the rewrite happily SYNTHESISED a URL
+    // for an F16 that had never been uploaded, and only a 404 at download time
+    // said so. The F16/Q8_0 rows below are what
+    // crispasr_registry_lookup_by_filename() resolves, so a user naming the
+    // file gets its real size instead of an empty one, and
+    // tools/check-registry-urls.py now HEADs all three per backend — a
+    // published-or-not check the synthesised URL never got.
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
+    {"voxtral", "voxtral-mini-3b-2507-q8_0.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q8_0.gguf", "~4.6 GB", nullptr, nullptr},
+    {"voxtral", "voxtral-mini-3b-2507-f16.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-f16.gguf", "~8.7 GB", nullptr, nullptr},
+    // Voxtral Mini 4B Realtime, same layering. The q4_k size here read
+    // "~3.3 GB" until #437 measured the published file: it is 2.35 GiB.
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-q4_k.gguf",
-     "~3.3 GB", nullptr, nullptr},
+     "~2.4 GB", nullptr, nullptr},
+    {"voxtral4b", "voxtral-mini-4b-realtime-q8_0.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-q8_0.gguf",
+     "~4.4 GB", nullptr, nullptr},
+    {"voxtral4b", "voxtral-mini-4b-realtime-f16.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-f16.gguf",
+     "~8.3 GB", nullptr, nullptr},
+    // Qualified Granite5 profiles have explicit immutable rows and measured sizes.
+    {"granite", "granite-speech-5.0-2b-q4_k.gguf",
+     "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/granite-speech-5.0-2b-q4_k.gguf",
+     "~4.07 GB", nullptr, nullptr, nullptr, "Apache-2.0", ",f16,q4_k,"},
+    {"granite", "granite-speech-5.0-2b-f16.gguf",
+     "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/701f5529d8459412cc1b6053b5880c630125b138/granite-speech-5.0-2b-f16.gguf",
+     "~5.58 GB", nullptr, nullptr, nullptr, "Apache-2.0", ",f16,q4_k,"},
     {"granite", "granite-speech-4.0-1b-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.0-1b-GGUF/resolve/main/granite-speech-4.0-1b-q4_k.gguf", "~2.94 GB", nullptr, nullptr},
     {"granite-4.1", "granite-speech-4.1-2b-q4_k.gguf",
@@ -154,11 +223,42 @@ constexpr Entry k_registry[] = {
     {"granite-4.1-nar", "granite-speech-4.1-2b-nar-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF/resolve/main/granite-speech-4.1-2b-nar-q4_k.gguf",
      "~3.2 GB", nullptr, nullptr},
+    // Index-Echo S2TT 2B (#485): paired audio tower + hybrid Qwen3.5 decoder.
+    // Q8 passes the independent stage/cache/direct-output checks; Q4 is rejected.
+    {"index-echo", "index-echo-2b-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-q8_0.gguf", "~670 MiB",
+     "index-echo-2b-decoder-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-q8_0.gguf", "~1.93 GiB"},
+    {"index-echo", "index-echo-2b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-f16.gguf", "~1.22 GiB",
+     "index-echo-2b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-f16.gguf", "~3.63 GiB"},
+    {"index-echo", "index-echo-9b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-f16.gguf", "~1.22 GiB",
+     "index-echo-9b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-decoder-f16.gguf", "~16.69 GiB"},
+
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // confucius4-r2t2 (#445) — NetEase Youdao's streaming Qwen3-ASR-1.7B
+    // fine-tune (tied lm_head). Carries qwen3asr.streaming_recipe=r2t2, which
+    // enables the prefix-rollback realtime session (CrispasrRealtimeSession).
+    // Weights are under the NetEase Youdao Model Use License, not open source.
+    {"confucius4-r2t2", "confucius4-r2t2-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-r2t2-GGUF/resolve/main/confucius4-r2t2-q4_k.gguf", "~1.5 GB", nullptr,
+     nullptr, nullptr, "NetEase Youdao Model Use License (see https://huggingface.co/cstr/confucius4-r2t2-GGUF)"},
+    // raon-speech (#455) — KRAFTON/Raon-Speech-9B, speech-to-text subset only
+    // (Qwen3-Omni audio tower + EmbeddingAdaptor + Qwen3 36L LLM); runs on the
+    // qwen3-asr runtime (qwen3asr.variant = raon-speech). English + Korean.
+    // CC-BY-NC-4.0: NON-COMMERCIAL, like the raon TTS entries.
+    {"raon-speech", "raon-speech-9b-q4_k.gguf",
+     "https://huggingface.co/cstr/raon-speech-9b-GGUF/resolve/main/raon-speech-9b-q4_k.gguf", "~5.0 GB", nullptr,
+     nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-Speech-9B, "
+     "https://huggingface.co/KRAFTON/Raon-Speech-9B)"},
     // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
     // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
     {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
@@ -327,6 +427,13 @@ constexpr Entry k_registry[] = {
      "mimo-tokenizer-q4_k.gguf",
      "https://huggingface.co/cstr/mimo-tokenizer-GGUF/resolve/main/mimo-tokenizer-q4_k.gguf",
      "~395 MB"},
+    {"hojo-asr", "hojo-asr-multi-v1-q4_k.gguf",
+     "https://huggingface.co/cstr/Hojo-ASR-Multi-V1-GGUF/resolve/main/hojo-asr-multi-v1-q4_k.gguf",
+     "~4.4 GB", nullptr, nullptr},
+    // #438: HojoAI/Hojo-ASR-V1 (Apache-2.0), the English-capable sibling; same runtime
+    {"hojo-asr-v1", "hojo-asr-v1-q4_k.gguf",
+     "https://huggingface.co/cstr/Hojo-ASR-V1-GGUF/resolve/main/hojo-asr-v1-q4_k.gguf", "~4.1 GB", nullptr,
+     nullptr},
     {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
      "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
      nullptr, nullptr},
@@ -512,6 +619,13 @@ constexpr Entry k_registry[] = {
     {"wav2vec2-aligner-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "~222 MB", nullptr, nullptr},
+    {"moonshine-streaming-tiny-de-onnx", "moonshine-streaming-tiny-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/encoder_int8.onnx", "~8 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-onnx", "moonshine-streaming-small-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder_int8.onnx", "~43 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-small-de-onnx", "moonshine-streaming-small-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder_int8.onnx", "~43 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-tiny-de-dattazigzag", "moonshine-tiny-de-dattazigzag-q4_k/moonshine-tiny-de-dattazigzag-q4_k.gguf", "https://huggingface.co/cstr/moonshine-tiny-de-dattazigzag-GGUF/resolve/c5d7964c5284893b35fa937536b7187fe78a3f9e/moonshine-tiny-de-dattazigzag-q4_k.gguf", "~17 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-tiny-de-phreak87-onnx", "moonshine-tiny-de-phreak87-onnx/onnx/encoder_model.onnx", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/onnx/encoder_model.onnx", "~30 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-tiny-de-onnx-f32", "moonshine-streaming-tiny-de-onnx-f32/encoder.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/encoder.onnx", "~29 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-small-de-onnx-f32", "moonshine-streaming-small-de-onnx-f32/encoder.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder.onnx", "~167 MB", nullptr, nullptr, nullptr, "MIT"},
     {"moonshine-streaming", "moonshine-streaming-tiny-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/moonshine-streaming-tiny-q4_k.gguf", "~31 MB",
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/tokenizer.bin",
@@ -675,6 +789,47 @@ constexpr Entry k_registry[] = {
     {"parakeet-v2", "parakeet-tdt-0.6b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF/resolve/main/parakeet-tdt-0.6b-v2-q4_k.gguf",
      "~468 MB", nullptr, nullptr},
+    // parakeet-ultra (#454) — moondream/parakeet-ultra: parakeet-tdt-0.6b-v3
+    // architecture in transformers' ParakeetForTDT format (converter --hf).
+    // Transcripts equal transformers and moondream Photon at F16/Q8_0/Q4_K.
+    {"parakeet-ultra", "parakeet-ultra-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-ultra-GGUF/resolve/main/parakeet-ultra-q4_k.gguf", "~402 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-ultra)"},
+    // parakeet-redux (#454) — moondream/parakeet-redux: parakeet-tdt-0.6b-v3
+    // architecture shipped in transformers' ParakeetForTDT format with a
+    // base-3 packed ternary encoder; the converter dequantises it exactly
+    // (--hf). Transcripts equal transformers and moondream Photon at F16,
+    // Q8_0 and Q4_K on en + de.
+    {"parakeet-redux", "parakeet-redux-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-redux-GGUF/resolve/main/parakeet-redux-q4_k.gguf", "~402 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-redux)"},
+    // Phonon-2 (#481) — exact five-value/int6 expansion, existing Parakeet TDT
+    // runtime. Q8_0 is the fidelity/size default; Q4_K has more text drift.
+    {"phonon2", "phonon2-q8_0.gguf",
+     "https://huggingface.co/cstr/phonon2-GGUF/resolve/main/phonon2-q8_0.gguf", "~674 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/FermionResearch/Phonon-2)"},
+    // orukeet (#445) — oruk/orukeet r3, a fine-tune of parakeet-tdt-0.6b-v3
+    // with the architecture unchanged (half of the encoder's depthwise conv
+    // kernels replaced by fitted Gabor functions, then re-adapted). Same 25
+    // languages, same runtime; the backend is detected from the GGUF. Its
+    // final adaptation trained on LibriSpeech test-other, so its scores on
+    // that split are not a held-out measurement.
+    {"orukeet", "orukeet-q4_k.gguf", "https://huggingface.co/cstr/orukeet-GGUF/resolve/main/orukeet-q4_k.gguf",
+     "~402 MB", nullptr, nullptr, nullptr, "CC-BY-SA-4.0 (see https://huggingface.co/oruk/orukeet)"},
+    // Dolphin CN-Dialect small streaming (#436) — DataoceanAI, E-Branchformer +
+    // Transformer decoder + CTC, Mandarin plus 20+ Chinese dialects. Q4_K is the
+    // default: on 15 in-domain clips it matched F16 exactly on 13 and differed by
+    // one trailing particle on the other two, as Q8_0 did (tools/kaggle/dolphin-quant-text).
+    {"dolphin", "dolphin-cn-dialect-small-streaming-q4_k.gguf",
+     "https://huggingface.co/cstr/dolphin-cn-dialect-small-streaming-GGUF/resolve/main/"
+     "dolphin-cn-dialect-small-streaming-q4_k.gguf",
+     "~258 MB", nullptr, nullptr},
+    // X-ASR zh-en (#436) — GilgameshWind, icefall streaming Zipformer2
+    // transducer (zh + en, punctuation + casing). One GGUF serves all four
+    // upstream chunk sizes (CRISPASR_XASR_CHUNK_MS). Q8_0 by default: zh
+    // transcripts match F16 at Q8_0 and Q4_K; Q4_K drops English punctuation.
+    {"xasr", "x-asr-zh-en-q8_0.gguf", "https://huggingface.co/cstr/x-asr-zh-en-GGUF/resolve/main/x-asr-zh-en-q8_0.gguf",
+     "~168 MB", nullptr, nullptr},
     // parakeet-tdt-1.1b — larger TDT, English-only, 42-layer encoder
     // (vs 24 for 0.6b). Lowercase + no punctuation output. Slower but
     // wins on very long-tail vocabulary.
@@ -730,7 +885,7 @@ constexpr Entry k_registry[] = {
      "~986 MB",
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
-     "~60 MB"},
+     "~60 MB", "Apache-2.0"},
     // MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone + 32 RVQ audio codebooks
     // + a 1.6B transformer codec companion (kept F16 — quantising the codec
     // degrades audio earlier than the backbone). Default download is the Q4_K
@@ -740,11 +895,54 @@ constexpr Entry k_registry[] = {
     {"miocodec", "miocodec-v2-44k-q8_0.gguf",
      "https://huggingface.co/cstr/miocodec-v2-44k-GGUF/resolve/main/miocodec-v2-44k-q8_0.gguf",
      "~155 MB"},
-    // MioTTS-0.6B (Qwen3 LLM + MioCodec-25Hz-24kHz, Apache-2.0).
+    // MioTTS-0.6B (Qwen3 LLM + MioCodec-v2, 44.1 kHz, Apache-2.0).
     // Single GGUF, tokenizer.json loaded at runtime.
     {"miotts", "miotts-0.6b-q8_0.gguf",
      "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
-     "~723 MB"},
+     "~793 MB", "tokenizer.json",
+     "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/tokenizer.json", "~14 MB"},
+    // Onsets & Frames (Hawthorne et al. 2018, MIT): piano note events, from
+    // the ddPn08/onsets-and-frames checkpoint's ONNX export. q8_0 rather than
+    // f16 or q4_0 deliberately — measured on all ten MusicNet test pieces it
+    // is F1-identical to fp32 (49.6% overall, 69.0% solo piano) at a third of
+    // the size, while q4_0 costs 0.5 points of F1-with-offsets because it
+    // perturbs the frame head, which sets note durations, five times as hard
+    // as the onset head. q4_0 and f32 are in the same repo for callers that
+    // want them.
+    // hFT-Transformer (Toyama et al., ISMIR 2023, sony/hFT-Transformer, MIT):
+    // piano note events from a hierarchical frequency-time transformer.
+    // q4_0 deliberately, and unusually: measured on all ten MusicNet test
+    // pieces it LOSES nothing against fp32 (52.55% vs 52.21% overall, 70.71%
+    // vs 70.52% solo piano). The head q4_0 perturbs most here is velocity,
+    // and velocity feeds the decoder's ignore_zero gate rather than a note
+    // duration -- so its errors change which notes survive, not how long
+    // they last. Contrast onsets-and-frames above, where q4_0 damages the
+    // frame head and costs 0.5 points of F1-with-offsets.
+    // Read docs/music-transcription/HFT_TRANSFORMER.md before choosing this
+    // over onsets-and-frames: it is 1.4 points better on solo piano and
+    // roughly 5x the compute.
+    {"hft-transformer", "hft-transformer-q4_0.gguf",
+     "https://huggingface.co/cstr/hft-transformer-GGUF/resolve/main/hft-transformer-q4_0.gguf",
+     "~4.5 MB"},
+    {"onsets-and-frames", "onsets-and-frames-q8_0.gguf",
+     "https://huggingface.co/cstr/onsets-and-frames-GGUF/resolve/main/onsets-and-frames-q8_0.gguf",
+     "~31 MB"},
+    // hFT-Transformer (Toyama et al., ISMIR 2023, MIT): piano note events from
+    // a hierarchical frequency-time transformer, 5.5 M parameters. The
+    // smallest strong piano transcriber measured here — 70.5% note F1 on
+    // MusicNet's solo-piano pieces against Onsets & Frames' 69.0% — at 7 MiB
+    // of q8_0 weights, and quantisation is free on accuracy: 52.23% overall
+    // and 70.51% solo piano at q8_0 against fp32's 52.21% / 70.52%. It is also
+    // by far the most EXPENSIVE to run: 249 GFLOP of matrix multiply per 2 s
+    // of audio, and q8_0 costs 29% MORE cpu than f32 rather than less, on a
+    // CPU without int8 dot-product instructions. Read
+    // docs/music-transcription/HFT_TRANSFORMER.md before choosing it over
+    // onsets-and-frames. NOTE: the HF repo is not uploaded yet, so
+    // auto-download will 404; build the GGUF locally with
+    // models/convert-hft-transformer-to-gguf.py.
+    {"hft-transformer", "hft-transformer-q8_0.gguf",
+     "https://huggingface.co/cstr/hft-transformer-GGUF/resolve/main/hft-transformer-q8_0.gguf",
+     "~7 MB"},
     {"piano-transcription", "piano-transcription-f16.gguf",
      "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
      "~77 MB"},
@@ -817,7 +1015,7 @@ constexpr Entry k_registry[] = {
      "~1.9 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
-     "~60 MB"},
+     "~60 MB", "Apache-2.0"},
     // Qwen3-TTS-CustomVoice 1.7B: same fixed-speaker pattern as 0.6B-CV
     // (9 baked speakers, `--voice <name>`, no ECAPA / no reference WAV)
     // but on the 1.7B talker. Runtime applies small_to_mtp_projection
@@ -855,7 +1053,11 @@ constexpr Entry k_registry[] = {
      "~1.2 GB",
      "omnivoice-tokenizer-f16.gguf",
      "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-tokenizer-f16.gguf",
-     "~400 MB"},
+     "~400 MB",
+     "omnivoice-terms — main weights CC-BY-NC; HiggsAudioV2 tokenizer has additional Boson community terms. "
+     "Acceptance affirms eligibility and compliance with both, including the Boson 100,000 annual-active-user "
+     "condition and restriction on improving other LLMs with materials/outputs. "
+     "Full terms: https://huggingface.co/k2-fsa/OmniVoice#license"},
     //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
@@ -1112,6 +1314,28 @@ constexpr Entry k_registry[] = {
     // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). The HiFi-GAN
     // vocoder runs through the shared GPU-capable core_hifigan graph (#387);
     // the DiT ODE loop is the remaining cost and runs on-device in a GPU build.
+    // Breeze TTS 2 (#412): T5Gemma2 text encoder -> Qwen3 backbone -> 12L depth
+    // decoder over 16 codebooks at 12.5 Hz, en + zh. The codec is NOT in the
+    // model file — Breeze's bundled audio tokenizer is bit-identical to
+    // Qwen3-TTS-Tokenizer-12Hz, so it rides along as the companion below
+    // rather than being repacked.
+    //
+    // The licence string MUST begin with the bare word "other": license_tag()
+    // takes everything up to the first space, and "other" is on the restricted
+    // list, which is what makes crispasr_license_requires_acceptance() true and
+    // makes -m auto refuse without CRISPASR_ACCEPT_LICENSE=other. Rewording
+    // this to lead with anything else silently un-gates non-commercial weights.
+    // tests/test-registry.cpp pins that, including a control that the same
+    // predicate returns false for a permissive string.
+    {"bt2-tts", "breeze-tts-2-q4_k.gguf",
+     "https://huggingface.co/cstr/breeze-tts-2-GGUF/resolve/main/breeze-tts-2-q4_k.gguf",
+     "~2.2 GB",
+     "qwen3-tts-tokenizer-12hz.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB",
+     "other — NON-COMMERCIAL use only (BreezeBlue Research and Non-Commercial License Agreement v1.1, "
+     "RESONIA INC; quantization is a Derivative Model under §1.3 so this GGUF inherits the terms; "
+     "hosting-as-a-service is commercial under §1.7(b); https://huggingface.co/BreezeBlue/Breeze-TTS-2)"},
     {"raon", "raon-opentts-0.3b-f16.gguf",
      "https://huggingface.co/cstr/raon-opentts-0.3b-GGUF/resolve/main/raon-opentts-0.3b-f16.gguf",
      "~959 MB", nullptr, nullptr, nullptr,
@@ -1130,8 +1354,9 @@ constexpr Entry k_registry[] = {
     // Supertonic-3 (#434): Supertone/supertonic-3, non-AR flow-matching TTS,
     // 44.1 kHz, 31 languages, 10 preset voices baked into the single GGUF
     // (unicode indexer + NFKD tables included — no companions). Weights are
-    // OpenRAIL-M: permissive incl. commercial, but carries use restrictions +
-    // attribution, so the license field prints on first download.
+    // OpenRAIL-M permits commercial use but has additional use restrictions.
+    // Require explicit acceptance; this is not a permissive license or an
+    // ordinary NC model. Further support needs a separate policy review.
     {"supertonic", "supertonic3-f16.gguf",
      "https://huggingface.co/cstr/supertonic-3-GGUF/resolve/main/supertonic3-f16.gguf",
      "~200 MB", nullptr, nullptr, nullptr,
@@ -1178,6 +1403,13 @@ constexpr Entry k_registry[] = {
     {"qwen3-fa", "qwen3-forced-aligner-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
      "~500 MB", nullptr, nullptr},
+    // Qwen3-ForcedAligner-Ultra base (17slever17, Apache-2.0, #579): same
+    // architecture, F16 only. Base model only — the optional local boundary
+    // head is not converted. Matches upstream on JFK; nightly regression entry
+    // qwen3-forced-aligner-ultra-f16.
+    {"qwen3-forced-aligner-ultra", "qwen3-forced-aligner-ultra-f16.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-ultra-GGUF/resolve/992f8360e1e99cc5dae6bb162c530cd927e14a30/qwen3-forced-aligner-ultra-f16.gguf",
+     "~1.8 GB", nullptr, nullptr},
     // M2M-100 (facebook/m2m100_418M, MIT) — multilingual text-to-text
     // translation. 100 source/target languages via SentencePiece + lang
     // codes prefix. Encoder-decoder transformer with cross-attention
@@ -1215,6 +1447,114 @@ constexpr Entry k_registry[] = {
     {"madlad", "madlad400-3b-mt-q4_k.gguf",
      "https://huggingface.co/cstr/madlad400-3b-mt-GGUF/resolve/main/madlad400-3b-mt-q4_k.gguf",
      "~1.9 GB", nullptr, nullptr},
+    // hikari (sbintuitions/hikari-medium, MIT): simultaneous speech translation
+    // EN -> DE/JA/RU + English ASR. f16 is the default: it equals the reference
+    // and gives the same text on CPU and Metal. q4_k uses mixed quantization (causal
+    // encoder floored at Q8_0, decoder at Q4_K) for exact transcription parity at 636 MB.
+    // Silero rides along (k_extras).
+    {"hikari", "hikari-medium-f16.gguf",
+     "https://huggingface.co/cstr/hikari-medium-GGUF/resolve/main/hikari-medium-f16.gguf", "~1.5 GB", nullptr,
+     nullptr, nullptr, "MIT (https://huggingface.co/sbintuitions/hikari-medium)"},
+    {"hikari", "hikari-medium-q4_k.gguf",
+     "https://huggingface.co/cstr/hikari-medium-GGUF/resolve/main/hikari-medium-q4_k.gguf", "~636 MB", nullptr,
+     nullptr, nullptr, "MIT (https://huggingface.co/sbintuitions/hikari-medium)"},
+    {"hikari", "hikari-medium-q8_0.gguf",
+     "https://huggingface.co/cstr/hikari-medium-GGUF/resolve/main/hikari-medium-q8_0.gguf", "~873 MB", nullptr,
+     nullptr, nullptr, "MIT (https://huggingface.co/sbintuitions/hikari-medium)"},
+    // Opus-MT / MarianMT (Helsinki-NLP, CC-BY-4.0): one ~75M model per language
+    // pair, the fastest translator for live translation. `marian` is the
+    // `-m auto` default (de->en); `--translate-model auto --translate-backend
+    // marian` picks the row for the language pair. q8_0: 84 MB, near-parity
+    // with the reference (12/14 de->en, 8/8 en->de greedy); f16 is exact.
+    {"marian", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-en", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-de", "opus-mt-en-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-de-GGUF/resolve/main/opus-mt-en-de-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- generated: further Opus-MT pairs (tools: scratch batch) ---
+    {"opus-mt-ar-de", "opus-mt-ar-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-de-GGUF/resolve/main/opus-mt-ar-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-ar-en", "opus-mt-ar-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-en-GGUF/resolve/main/opus-mt-ar-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-ar", "opus-mt-de-ar-f16.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-ar-GGUF/resolve/main/opus-mt-de-ar-f16.gguf", "~159 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-es", "opus-mt-de-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-es-GGUF/resolve/main/opus-mt-de-es-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-fr", "opus-mt-de-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-fr-GGUF/resolve/main/opus-mt-de-fr-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-he", "opus-mt-de-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-he-GGUF/resolve/main/opus-mt-de-he-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-it", "opus-mt-de-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-it-GGUF/resolve/main/opus-mt-de-it-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-ar", "opus-mt-en-ar-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-ar-GGUF/resolve/main/opus-mt-en-ar-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-es", "opus-mt-en-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-es-GGUF/resolve/main/opus-mt-en-es-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-fr", "opus-mt-en-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-fr-GGUF/resolve/main/opus-mt-en-fr-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-he", "opus-mt-en-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-he-GGUF/resolve/main/opus-mt-en-he-q8_0.gguf", "~89 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-it", "opus-mt-en-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-it-GGUF/resolve/main/opus-mt-en-it-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-tr", "opus-mt-tc-big-en-tr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-en-tr-GGUF/resolve/main/opus-mt-tc-big-en-tr-q8_0.gguf", "~262 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-de", "opus-mt-es-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-de-GGUF/resolve/main/opus-mt-es-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-en", "opus-mt-es-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-en-GGUF/resolve/main/opus-mt-es-en-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-de", "opus-mt-fr-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-de-GGUF/resolve/main/opus-mt-fr-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-en", "opus-mt-fr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-en-GGUF/resolve/main/opus-mt-fr-en-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-de", "opus-mt-he-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-he-de-GGUF/resolve/main/opus-mt-he-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-en", "opus-mt-tc-big-he-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-he-en-GGUF/resolve/main/opus-mt-tc-big-he-en-q8_0.gguf", "~265 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-de", "opus-mt-it-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-de-GGUF/resolve/main/opus-mt-it-de-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-en", "opus-mt-it-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-en-GGUF/resolve/main/opus-mt-it-en-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-tr-en", "opus-mt-tr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tr-en-GGUF/resolve/main/opus-mt-tr-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- end generated Opus-MT pairs ---
+    // Translation chat LLMs for live translation (`--translate-model hy-mt2`
+    // / `index-translate`, see docs/streaming.md). NOT backends: they run in
+    // the vendored LLM runtime behind the crispasr_chat_* ABI and are listed
+    // here only so the names resolve and auto-download. Both are the
+    // publishers' own GGUFs, Apache-2.0. Each needs its own instruction
+    // wording — examples/cli/crispasr_run.cpp picks it by these names.
+    {"hy-mt2", "Hy-MT2-1.8B-Q4_K_M.gguf",
+     "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf",
+     "~1.1 GB", nullptr, nullptr},
+    {"index-translate", "Index-Translate-2B.Q4_K_M.gguf",
+     "https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/main/Index-Translate-2B.Q4_K_M.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // Kokoro-82M: official baseline + English default voice. The German
     // backbone + German default voice ride along via k_extras (see below)
     // so users running `-m auto --backend kokoro` get a working multilingual
@@ -1257,18 +1597,33 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/csm-1b-GGUF/resolve/main/csm-1b-q4_k.gguf",
      "~1.4 GB", nullptr, nullptr},
 
+    // ArkTTS (Audio8-TTS-Realistic-0.6b): 600M param dual-transformer TTS (44.1 kHz).
+    // Edge0/Audio8-TTS-Realistic-0.6b. Slow transformer + fast subnetwork with
+    // causal ConvNeXt + Snake vocoder. Default Q4_K (1.2 GB); Q8_0 (1.4 GB).
+    {"arktts", "arktts-q4_k.gguf",
+     "https://huggingface.co/cstr/Audio8-TTS-Realistic-0.6b-GGUF/resolve/main/arktts-q4_k.gguf",
+     "~1.2 GB", nullptr, nullptr},
+
+    // MeanVC2: 18M param streaming zero-shot voice conversion (16 kHz).
+    // ASLP-lab/MeanVC2 (Apache-2.0). Fast-U2++ ASR + UTTE + ChunkDiT + Vocos.
+    // Default Q4_K (~77 MB); Q8_0 (~111 MB); F16 (~175 MB).
+    {"meanvc2", "meanvc2-120ms-40ms-q4_k.gguf",
+     "https://huggingface.co/cstr/MeanVC2-GGUF/resolve/main/meanvc2-120ms-40ms-q4_k.gguf",
+     "~77 MB", nullptr, nullptr},
+
     // MeloTTS: VITS2 52M param TTS (myshell-ai/MeloTTS). 44.1 kHz mono.
     // MIT license. Single GGUF with embedded CMU dictionary + neural G2P.
     // V2: 4 English speakers (US/BR/India/AU), 112 symbols, 11 tones.
     // V3: 1 speaker (EN-Newest), 219 symbols, 16 tones (newest checkpoint).
-    // Companion: bert-base-uncased Q4_K (52 MB) for BERT conditioning.
-    // Also available: F16 (227 MB), Q8_0 (97 MB) on the same HF repo.
+    // V2 companion: original-qualified F16 BERT (Apache-2.0), pinned with
+    // the Melo checkpoint. The canonical filename is discovered by CLI/C ABI.
+    // Explicit quantized BERT paths remain supported; Q4 is not the default.
     {"melotts", "melotts-en-v2-f16.gguf",
-     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/melotts-en-v2-f16.gguf",
-     "~102+52 MB",
-     "bert-base-uncased-q4k.gguf",
-     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/bert-base-uncased-q4k.gguf",
-     "~52 MB"},
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/35522347b1bed9a913d6894803c5cab929ae42a5/melotts-en-v2-f16.gguf",
+     "~102+238 MB",
+     "bert-base-uncased.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/35522347b1bed9a913d6894803c5cab929ae42a5/bert-base-uncased.gguf",
+     "~238 MB", "MIT (MeloTTS); Apache-2.0 (BERT; see THIRD_PARTY_NOTICES.txt)"},
     {"melotts-v3", "melotts-en-v3-f16.gguf",
      "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/melotts-en-v3-f16.gguf",
      "~93+52 MB",
@@ -1330,6 +1685,24 @@ constexpr Entry k_registry[] = {
     // Apache 2.0. Tokenizer-free, voice cloning via reference audio.
     // Default: Q4_K (1.6 GB, practical for CPU). F16 at same repo.
     {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
+     "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
+    // #433: the SAME artifact, reachable under the VAE backend's own name.
+    //
+    // voxcpm2-vae is a second backend over one file, not a second model:
+    // voxcpm2_vae_init_from_file() calls the same voxcpm2_init_internal()
+    // loader with vae_only=true. Without an entry here `-m auto --backend
+    // voxcpm2-vae` could not resolve anything and the user had to know to pass
+    // the TTS GGUF by path — which is exactly the discoverability gap the
+    // reporter hit.
+    //
+    // Deliberately the same filename, not a separate VAE-only export. The cache
+    // keys on the filename, so anyone who already pulled it for TTS gets the VAE
+    // backend for free, and there is no second artifact to convert, host,
+    // version and keep in sync — a VAE-only GGUF cut from the same weights is a
+    // divergence risk for a saving that only matters to someone who wants the
+    // upscaler and nothing else. Split it out if that case turns up.
+    {"voxcpm2-vae", "voxcpm2-q4_k.gguf",
      "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
      "~1.6 GB", nullptr, nullptr},
     // CosyVoice3 0.5B-2512: FunAudioLLM streaming multilingual TTS,
@@ -1442,12 +1815,34 @@ constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
     {nullptr, nullptr},
 };
 
-// qwen3-tts Base variants need a default voice pack so synthesis works
-// without --voice. One pack covers both 0.6B and 1.7B Base since the
-// voice embedding format is model-size-agnostic (spk_embedding + ref_code).
+// Model-sized defaults from a fresh VoiceDesign reference, separately encoded
+// with each original Base model. CPU/CUDA speech and exact array readback pass.
+// Ship readable Apache/MIT notices and the complete provenance companion too.
 constexpr ExtraCompanion k_qwen3_tts_base_extras[] = {
-    {"qwen3-tts-voice-default.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/main/qwen3-tts-voice-default.gguf"},
+    {"qwen3-tts-voice-0.6b-designed.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voice-0.6b-designed.gguf"},
+    {"qwen3-tts-voices-LICENSE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-LICENSE.txt"},
+    {"qwen3-tts-voices-LICENSE-RECIPE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-LICENSE-RECIPE.txt"},
+    {"qwen3-tts-voices-NOTICE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-NOTICE.txt"},
+    {"qwen3-tts-designed-voices-provenance.zip",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-designed-voices-provenance.zip"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_qwen3_tts_17b_base_extras[] = {
+    {"qwen3-tts-voice-1.7b-designed.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voice-1.7b-designed.gguf"},
+    {"qwen3-tts-voices-LICENSE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-LICENSE.txt"},
+    {"qwen3-tts-voices-LICENSE-RECIPE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-LICENSE-RECIPE.txt"},
+    {"qwen3-tts-voices-NOTICE.txt",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-voices-NOTICE.txt"},
+    {"qwen3-tts-designed-voices-provenance.zip",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/9ab96c5ba3022bd2ed46306ded0489a24096f8b5/qwen3-tts-designed-voices-provenance.zip"},
     {nullptr, nullptr},
 };
 
@@ -1485,7 +1880,102 @@ constexpr ExtraCompanion k_confucius4_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// Source full-file recipe requires Silero's speech-boundary windows.
+constexpr ExtraCompanion k_index_echo_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
+// hikari: its streaming policy's wait penalty is driven by Silero's speech
+// probability; without it the model hardly ever emits (jfk 0-4 s: 48/48 WAIT).
+constexpr ExtraCompanion k_hikari_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_tiny_de_onnx_extras[] = {
+    {"moonshine-streaming-tiny-de-onnx/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/frontend.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/adapter_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/adapter_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/cross_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/cross_kv_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/decoder_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/decoder_kv_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/streaming_config.json"},
+    {"moonshine-streaming-tiny-de-onnx/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/tokenizer.json"},
+    {"moonshine-streaming-tiny-de-onnx/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/LICENSE"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_streaming_small_de_onnx_extras[] = {
+    {"moonshine-streaming-small-de-onnx/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/frontend.onnx"},
+    {"moonshine-streaming-small-de-onnx/adapter_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/adapter_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/cross_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/cross_kv_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/decoder_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/decoder_kv_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/streaming_config.json"},
+    {"moonshine-streaming-small-de-onnx/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/tokenizer.json"},
+    {"moonshine-streaming-small-de-onnx/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/LICENSE"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_tiny_de_dattazigzag_q4_k_extras[] = {
+    {"moonshine-tiny-de-dattazigzag-q4_k/tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-de-dattazigzag-GGUF/resolve/c5d7964c5284893b35fa937536b7187fe78a3f9e/tokenizer.bin"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_tiny_de_phreak87_onnx_extras[] = {
+    {"moonshine-tiny-de-phreak87-onnx/onnx/decoder_model_merged.onnx", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/onnx/decoder_model_merged.onnx"},
+    {"moonshine-tiny-de-phreak87-onnx/config.json", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/config.json"},
+    {"moonshine-tiny-de-phreak87-onnx/tokenizer.json", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/tokenizer.json"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_tiny_de_onnx_f32_extras[] = {
+    {"moonshine-streaming-tiny-de-onnx-f32/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/frontend.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/adapter.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/adapter.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/cross_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/cross_kv.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/decoder_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/decoder_kv.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/streaming_config.json"},
+    {"moonshine-streaming-tiny-de-onnx-f32/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/tokenizer.json"},
+    {"moonshine-streaming-tiny-de-onnx-f32/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/LICENSE"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_small_de_onnx_f32_extras[] = {
+    {"moonshine-streaming-small-de-onnx-f32/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/frontend.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/adapter.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/adapter.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/cross_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/cross_kv.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/decoder_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/decoder_kv.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/streaming_config.json"},
+    {"moonshine-streaming-small-de-onnx-f32/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/tokenizer.json"},
+    {"moonshine-streaming-small-de-onnx-f32/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/LICENSE"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_nemotron_extras[] = {
+    {"nemotron-3.5-asr-streaming-0.6b/LICENSE-OpenMDW-1.1.txt", "https://raw.githubusercontent.com/CrispStrobe/CrispASR/102cd6bfc233c3d5d211966718d3de0e4401f836/docs/nemotron-model-notices/LICENSE-OpenMDW-1.1.txt"},
+    {"nemotron-3.5-asr-streaming-0.6b/NOTICE.txt", "https://raw.githubusercontent.com/CrispStrobe/CrispASR/102cd6bfc233c3d5d211966718d3de0e4401f836/docs/nemotron-model-notices/NOTICE.txt"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_granite5_extras[] = {
+    {"granite-speech-5.0-2b/LICENSE", "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/LICENSE"},
+    {"granite-speech-5.0-2b/LICENSE-RECIPE.txt", "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/LICENSE-RECIPE.txt"},
+    {"granite-speech-5.0-2b/NOTICE", "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/NOTICE"},
+    {"granite-speech-5.0-2b/original-publisher-README.md", "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/original-publisher-README.md"},
+    {"granite-speech-5.0-2b/validation-evidence.json", "https://huggingface.co/cstr/granite-speech-5.0-2b-GGUF/resolve/e1df7d2cabb0ddba9863d7fc90cb6e78e8f19a6d/validation-evidence.json"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
+    {"nemotron", k_nemotron_extras},
+    {"granite", k_granite5_extras},
+    {"moonshine-streaming-small-de-onnx-f32", k_moonshine_streaming_small_de_onnx_f32_extras},
+    {"moonshine-streaming-tiny-de-onnx-f32", k_moonshine_streaming_tiny_de_onnx_f32_extras},
+    {"moonshine-streaming-tiny-de-onnx", k_moonshine_streaming_tiny_de_onnx_extras},
+    {"moonshine-onnx", k_moonshine_streaming_small_de_onnx_extras},
+    {"moonshine-streaming-small-de-onnx", k_moonshine_streaming_small_de_onnx_extras},
+    {"moonshine-tiny-de-dattazigzag", k_moonshine_tiny_de_dattazigzag_q4_k_extras},
+    {"moonshine-tiny-de-phreak87-onnx", k_moonshine_tiny_de_phreak87_onnx_extras},
+
+    {"index-echo", k_index_echo_extras},
+    {"hikari", k_hikari_extras},
     {"kokoro", k_kokoro_extras},
     {"dots-tts", k_dots_tts_extras},
     {"confucius4-tts", k_confucius4_tts_extras},
@@ -1493,7 +1983,7 @@ constexpr ExtraList k_extras[] = {
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"cosyvoice3-tts-rl", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},
-    {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
+    {"qwen3-tts-1.7b-base", k_qwen3_tts_17b_base_extras},
     {"tada", k_tada_3b_extras},
     {"tada-1b", k_tada_1b_extras},
     {"tada-tts-1b", k_tada_1b_extras},
@@ -1505,6 +1995,10 @@ const Entry* find_by_backend(const std::string& backend) {
     for (const auto& e : k_registry)
         if (backend == e.backend)
             return &e;
+    // Preserve exact registry identities, while allowing all runtime aliases
+    // to select the Haas checkpoint rather than Parakeet's default model.
+    if (core_backend::is_haas_alias(backend) && backend != "haas")
+        return find_by_backend("haas");
     // Fallback: the CLI passes the raw `--backend` alias (e.g. the short
     // `cosyvoice3` / `voxcpm2`) while the registry keys the canonical
     // `cosyvoice3-tts` / `voxcpm2-tts`. When the exact alias has no entry,
@@ -1607,7 +2101,20 @@ std::string replace_tail_filename(const std::string& url, const std::string& old
 
 static std::string effective_license(const Entry& e);
 
-void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferred_quant) {
+bool fill(CrispasrRegistryEntry& out, const Entry& input, const std::string& preferred_quant) {
+    if (input.supported_quants && !preferred_quant.empty() &&
+        std::string(input.supported_quants).find("," + preferred_quant + ",") == std::string::npos)
+        return false;
+    // Qualified profiles have explicit rows with measured sizes. Resolve the
+    // selected row rather than inventing a filename or losing its size.
+    const Entry* selected = &input;
+    if (input.supported_quants && !preferred_quant.empty()) {
+        const std::string target = apply_quant_to_filename(input.filename, preferred_quant);
+        selected = find_by_filename(target);
+        if (!selected || std::string(selected->backend) != input.backend || !selected->supported_quants)
+            return false;
+    }
+    const Entry& e = *selected;
     const std::string filename = apply_quant_to_filename(e.filename, preferred_quant);
     out.backend = e.backend;
     out.filename = filename;
@@ -1633,6 +2140,7 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
         out.companion_approx_size.clear();
     }
     out.license = effective_license(e);
+    return true;
 }
 
 // A few families have many quant/alias rows. Keep their license metadata
@@ -1670,8 +2178,11 @@ static std::string effective_license(const Entry& e) {
     return "";
 }
 
-const ExtraCompanion* find_extras(const char* backend) {
+const ExtraCompanion* find_extras(const char* backend, const char* filename) {
     if (!backend)
+        return nullptr;
+    if (std::string(backend) == "granite" &&
+        (!filename || std::string(filename).rfind("granite-speech-5.0-2b-", 0) != 0))
         return nullptr;
     for (const auto& x : k_extras) {
         if (!x.backend)
@@ -1680,15 +2191,6 @@ const ExtraCompanion* find_extras(const char* backend) {
             return x.items;
     }
     return nullptr;
-}
-
-void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_override) {
-    const ExtraCompanion* extras = find_extras(e.backend);
-    if (!extras)
-        return;
-    for (const ExtraCompanion* it = extras; it->file && it->url; ++it) {
-        crispasr_cache::ensure_cached_file(it->file, it->url, quiet, "crispasr", cache_dir_override);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,9 +2230,11 @@ static bool license_requires_acceptance_tag(const std::string& tag) {
         return true;
     if (tag.rfind("llama", 0) == 0)
         return true;
-    static const char* restricted[] = {"gemma",  "gemma-terms",  "qwen-research", "mistral-ai-research",
-                                       "lfm1.0", "lfm-open-1.0", "funasr-v1.1",   "pocket-tts-terms",
-                                       "other",  nullptr};
+    if (tag.rfind("openrail", 0) == 0 || tag.rfind("creativeml-openrail", 0) == 0)
+        return true;
+    static const char* restricted[] = {
+        "gemma",       "gemma-terms",      "qwen-research",   "mistral-ai-research",       "lfm1.0", "lfm-open-1.0",
+        "funasr-v1.1", "pocket-tts-terms", "omnivoice-terms", "nvidia-open-model-license", "other",  nullptr};
     for (const char** p = restricted; *p; ++p)
         if (tag == *p)
             return true;
@@ -1781,6 +2285,8 @@ static bool license_gate_allows_download(const CrispasrRegistryEntry& e, const s
     fprintf(stderr,
             "crispasr: refusing to download without explicit licence acceptance.\n"
             "  Pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE=%s).\n"
+            "  Supplying acceptance affirms that you accept the full terms, are eligible to use the model,\n"
+            "  and will comply with all conditions, including obtaining any separately required permission.\n"
             "  --auto-download / -m auto alone is NOT sufficient for a restricted licence.\n",
             tag.c_str(), tag.c_str());
     return false;
@@ -1834,8 +2340,7 @@ bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry&
     const Entry* e = find_by_backend(backend);
     if (!e)
         return false;
-    fill(out, *e, preferred_quant);
-    return true;
+    return fill(out, *e, preferred_quant);
 }
 
 bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegistryBundle& out) {
@@ -1855,7 +2360,7 @@ bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegist
                                  e->companion_size ? e->companion_size : (e->approx_size ? e->approx_size : "")});
     }
 
-    if (const ExtraCompanion* extras = find_extras(e->backend)) {
+    if (const ExtraCompanion* extras = find_extras(e->backend, e->filename)) {
         for (const ExtraCompanion* it = extras; it->file && it->url; ++it)
             out.artifacts.push_back({CrispasrRegistryArtifactKind::Extra, it->file, it->url, ""});
     }
@@ -1866,8 +2371,7 @@ bool crispasr_registry_lookup_by_filename(const std::string& filename, CrispasrR
                                           const std::string& preferred_quant) {
     const Entry* e = find_by_filename(filename);
     if (e) {
-        fill(out, *e, preferred_quant);
-        return true;
+        return fill(out, *e, preferred_quant);
     }
 
     const std::string base = basename_of(filename);
@@ -1898,8 +2402,7 @@ int crispasr_registry_count() {
 bool crispasr_registry_get_at(int i, CrispasrRegistryEntry& out, const std::string& preferred_quant) {
     if (i < 0 || i >= crispasr_registry_count())
         return false;
-    fill(out, k_registry[i], preferred_quant);
-    return true;
+    return fill(out, k_registry[i], preferred_quant);
 }
 
 bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& cache_dir_override,
@@ -1908,9 +2411,12 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
     // first entry wins, which matches the documented preference.
     const std::string dir = crispasr_cache::dir(cache_dir_override);
     for (const auto& e : k_registry) {
-        const std::string path = dir + "/" + apply_quant_to_filename(e.filename, preferred_quant);
+        CrispasrRegistryEntry candidate;
+        if (!fill(candidate, e, preferred_quant))
+            continue;
+        const std::string path = dir + "/" + candidate.filename;
         if (crispasr_cache::file_present(path)) {
-            fill(out, e, preferred_quant);
+            out = std::move(candidate);
             return true;
         }
     }
@@ -1920,6 +2426,26 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
 std::string crispasr_resolve_model(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                    const std::string& cache_dir_override, bool allow_download,
                                    const std::string& preferred_quant, const std::string& accepted_license) {
+    // Companions belong to the matched registry variant, which can differ
+    // from the runtime backend (e.g. German Tiny versus Small ONNX bundles).
+    auto ensure_companions = [&](const CrispasrRegistryEntry& entry) {
+        auto fetch = [&](const std::string& filename, const std::string& url) {
+            if (!crispasr_cache::file_present(crispasr_cache::dir(cache_dir_override) + "/" + filename) &&
+                !license_gate_allows_download(entry, accepted_license))
+                return false;
+            return !crispasr_cache::ensure_cached_file(filename, url, quiet, "crispasr", cache_dir_override).empty();
+        };
+        if (!entry.companion_filename.empty() && !entry.companion_url.empty() &&
+            !fetch(entry.companion_filename, entry.companion_url))
+            return false;
+        if (const ExtraCompanion* extras = find_extras(entry.backend.c_str(), entry.filename.c_str())) {
+            for (const ExtraCompanion* it = extras; it->file && it->url; ++it)
+                if (!fetch(it->file, it->url))
+                    return false;
+        }
+        return true;
+    };
+
     // Concrete path that exists on disk — pass through.
     if (model_arg != "auto" && model_arg != "default") {
         FILE* f = fopen(model_arg.c_str(), "rb");
@@ -1946,6 +2472,12 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         // sub-variant keys like "parakeet-v2" / "parakeet-tdt-1.1b" / etc.
         CrispasrRegistryEntry match;
         bool have_match = crispasr_registry_lookup_by_filename(model_arg, match, preferred_quant);
+        // Preserve an explicit Granite5 or Nemotron filename when its quant
+        // has no qualified registry row, rather than substituting the default.
+        const std::string requested_basename = basename_of(model_arg);
+        if (!have_match && (requested_basename.rfind("granite-speech-5.0-2b-", 0) == 0 ||
+                            requested_basename.rfind("nemotron-3.5-asr-streaming-0.6b-", 0) == 0))
+            return model_arg;
         if (!have_match)
             have_match = crispasr_registry_lookup(model_arg, match, preferred_quant);
         if (!have_match && !backend_name.empty())
@@ -1957,6 +2489,8 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
                 // A previously-downloaded restricted model used to load in
                 // total silence — state the licence on every load, not just
                 // the one where it happened to be fetched.
+                if (allow_download && !ensure_companions(match))
+                    return "";
                 print_license_note(match, quiet);
                 return cached;
             }
@@ -1972,13 +2506,9 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
             }
             std::string dl =
                 crispasr_cache::ensure_cached_file(match.filename, match.url, quiet, "crispasr", cache_dir_override);
-            if (!dl.empty() && !match.companion_filename.empty() && !match.companion_url.empty())
-                crispasr_cache::ensure_cached_file(match.companion_filename, match.companion_url, quiet, "crispasr",
-                                                   cache_dir_override);
             if (!dl.empty()) {
-                if (const Entry* match_entry =
-                        !backend_name.empty() ? find_by_backend(backend_name) : find_by_filename(model_arg))
-                    download_extras(*match_entry, quiet, cache_dir_override);
+                if (!ensure_companions(match))
+                    return "";
                 print_license_note(match, quiet);
             }
             return dl;
@@ -1991,8 +2521,8 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
 
     CrispasrRegistryEntry e;
     if (!crispasr_registry_lookup(backend_name, e, preferred_quant)) {
-        fprintf(stderr, "crispasr: -m auto not supported for backend '%s' (no default model registered)\n",
-                backend_name.c_str());
+        fprintf(stderr, "crispasr: no model registered for backend '%s' with quantization '%s'\n", backend_name.c_str(),
+                preferred_quant.empty() ? "default" : preferred_quant.c_str());
         return "";
     }
 
@@ -2006,16 +2536,9 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         fprintf(stderr, "crispasr: resolving %s (%s) via -m auto\n", e.filename.c_str(), e.approx_size.c_str());
     std::string result = crispasr_cache::ensure_cached_file(e.filename, e.url, quiet, "crispasr", cache_dir_override);
 
-    // Download companion file (e.g. tokenizer.bin for moonshine) if needed
-    if (!result.empty() && !e.companion_filename.empty() && !e.companion_url.empty()) {
-        crispasr_cache::ensure_cached_file(e.companion_filename, e.companion_url, quiet, "crispasr",
-                                           cache_dir_override);
-    }
-    // Backend-specific extras (e.g. kokoro German backbone + voice) — opt-in
-    // per backend via k_extras.
     if (!result.empty()) {
-        if (const Entry* entry = find_by_backend(backend_name))
-            download_extras(*entry, quiet, cache_dir_override);
+        if (!ensure_companions(e))
+            return "";
         print_license_note(e, quiet);
     }
 

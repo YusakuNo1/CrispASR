@@ -13,8 +13,12 @@
 //              8198 = 8192 vocab + 1 blank + 5 TDT durations {0,1,2,3,4}
 
 #include "parakeet.h"
+#include "core/parakeet_gguf.h"
+#include "core/parakeet_word_ranges.h"
 #include "core/crispasr_env.h"
+#include "core/sys_mem.h"
 #include "parakeet_ja_detect.h"
+#include "parakeet_memory_policy.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -60,11 +64,20 @@
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
-static bool parakeet_use_scalar() {
-    static int v = -1;
-    if (v < 0)
-        v = (crispasr_env::get("CRISPASR_PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
-    return v != 0;
+#elif defined(HAVE_PARAKEET_BLAS)
+#include <cblas.h>
+#endif
+
+#if defined(HAVE_PARAKEET_BLAS)
+static bool parakeet_use_blas() {
+    if (crispasr_env::get("CRISPASR_PARAKEET_FORCE_SCALAR"))
+        return false;
+#if defined(HAVE_ACCELERATE)
+    return true;
+#else
+    const char* e = crispasr_env::get("CRISPASR_PARAKEET_CPU_BLAS");
+    return e && e[0] == '1';
+#endif
 }
 #endif
 
@@ -107,6 +120,26 @@ struct parakeet_bench_stage {
 // ===========================================================================
 
 struct parakeet_predictor_weights {
+    struct kda_layer_weights {
+        std::vector<float> norm_w, norm_b;
+        std::vector<float> q_proj_w, k_proj_w, v_proj_w;
+        std::vector<float> q_conv_w, k_conv_w, v_conv_w;
+        std::vector<float> f_proj0_w, f_proj1_w;
+        std::vector<float> b_proj_w;
+        std::vector<float> a_log;
+        std::vector<float> dt_bias;
+        std::vector<float> g_proj0_w, g_proj1_w, g_proj1_b;
+        std::vector<float> o_norm_w;
+        std::vector<float> o_proj_w;
+    };
+    bool is_kda = false;
+    uint32_t kda_num_heads = 5;
+    uint32_t kda_head_dim = 64;
+    uint32_t kda_conv_size = 4;
+    std::vector<kda_layer_weights> kda_layers;
+    std::vector<float> kda_final_norm_w;
+    std::vector<float> kda_final_norm_b;
+
     std::vector<float> embed; // [vocab+1, H]
     std::vector<float> w_ih_0, w_hh_0, b_ih_0, b_hh_0;
     std::vector<float> w_ih_1, w_hh_1, b_ih_1, b_hh_1;
@@ -175,12 +208,34 @@ struct parakeet_enc_layer : core_conformer::BlockWeights {
 };
 
 struct parakeet_predictor {
+    bool is_kda = false;
+    uint32_t kda_num_heads = 5;
+    uint32_t kda_head_dim = 64;
+    uint32_t kda_conv_size = 4;
+    bool kda_final_norm = true;
+
     ggml_tensor* embed_w = nullptr; // (vocab+1, pred_hidden)
     // 2-layer LSTM (PyTorch convention: w_ih [4H, in], w_hh [4H, H], b_ih [4H], b_hh [4H])
     ggml_tensor *lstm0_w_ih = nullptr, *lstm0_w_hh = nullptr;
     ggml_tensor *lstm0_b_ih = nullptr, *lstm0_b_hh = nullptr;
     ggml_tensor *lstm1_w_ih = nullptr, *lstm1_w_hh = nullptr;
     ggml_tensor *lstm1_b_ih = nullptr, *lstm1_b_hh = nullptr;
+
+    // KDA (Kimi Delta Attention) predictor layers
+    struct kda_layer_tensors {
+        ggml_tensor *norm_w = nullptr, *norm_b = nullptr;
+        ggml_tensor *q_proj_w = nullptr, *k_proj_w = nullptr, *v_proj_w = nullptr;
+        ggml_tensor *q_conv_w = nullptr, *k_conv_w = nullptr, *v_conv_w = nullptr;
+        ggml_tensor *f_proj0_w = nullptr, *f_proj1_w = nullptr;
+        ggml_tensor* b_proj_w = nullptr;
+        ggml_tensor* a_log = nullptr;
+        ggml_tensor* dt_bias = nullptr;
+        ggml_tensor *g_proj0_w = nullptr, *g_proj1_w = nullptr, *g_proj1_b = nullptr;
+        ggml_tensor* o_norm_w = nullptr;
+        ggml_tensor* o_proj_w = nullptr;
+    };
+    std::vector<kda_layer_tensors> kda_layers;
+    ggml_tensor *kda_final_norm_w = nullptr, *kda_final_norm_b = nullptr;
 };
 
 struct parakeet_joint {
@@ -208,11 +263,17 @@ struct parakeet_model {
     // CTC head (hybrid TDT+CTC models). nullptr when not present.
     ggml_tensor* ctc_w = nullptr; // Conv1d(d_model, ctc_vocab, 1) → (ctc_vocab, d_model, 1)
     ggml_tensor* ctc_b = nullptr; // (ctc_vocab,)
+    bool phonon2 = false;
+    bool english_only = false; // model identity, independent of its filename
     bool has_ctc = false;
+    bool is_kda = false;
     uint32_t ctc_vocab_size = 0;
 
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t buf_default_partition = nullptr; // optional FFN repack loader partition
+    ggml_context* ctx_ffn_f32 = nullptr;
+    ggml_backend_buffer_t buf_ffn_f32 = nullptr; // optional once-per-load BLAS weights
 
     // F32 conv_dw_w copies (created during BN fold, avoids per-forward F16→F32 cast)
     ggml_context* ctx_f32 = nullptr;
@@ -239,6 +300,9 @@ struct parakeet_context {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_blas = nullptr;
+    int blas_threads = 0;
+    bool ffn_blas = false; // pin only cached FFN matmuls to BLAS
     ggml_backend_sched_t sched = nullptr;
 
     std::vector<uint8_t> compute_meta; // metadata buffer for graph allocation
@@ -308,6 +372,23 @@ static ggml_tensor* require(parakeet_model& m, const char* name) {
 // Model loading
 // ===========================================================================
 
+// These weights are consumed only by the four FFN MUL_MATs per encoder layer.
+// Exclude pointwise/attention/decoder weights: they have other consumers and
+// some are copied or converted at load, incompatible with repacked bytes.
+static bool parakeet_is_ffn_weight(const char* name, void*) {
+    if (!name || std::strncmp(name, "encoder.layers.", 15) != 0)
+        return false;
+    const char* suffix = std::strchr(name + 15, '.');
+    return suffix &&
+           (std::strcmp(suffix, ".ff1.linear1.weight") == 0 || std::strcmp(suffix, ".ff1.linear2.weight") == 0 ||
+            std::strcmp(suffix, ".ff2.linear1.weight") == 0 || std::strcmp(suffix, ".ff2.linear2.weight") == 0);
+}
+
+static bool parakeet_ffn_mode(const char* mode) {
+    const char* e = crispasr_env::get("CRISPASR_PARAKEET_FFN");
+    return e && std::strcmp(e, mode) == 0;
+}
+
 static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, const char* path,
                                 ggml_backend_t backend) {
     // ---- pass 1: read hparams + vocab via metadata-only context ----
@@ -316,7 +397,32 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         if (!gctx)
             return false;
 
+        // Inspect schema before allocating/loading weights. A foreign RNN-T
+        // predictor spelling must never be reported as proof of a CTC model.
+        if (core_parakeet_gguf::reject_external(gctx, path)) {
+            core_gguf::free_metadata(gctx);
+            return false;
+        }
+        if (!core_parakeet_gguf::has_predictor(gctx)) {
+            if (core_parakeet_gguf::compatible_ctc(gctx))
+                fprintf(stderr,
+                        "parakeet: '%s' uses the compatible pure-CTC layout; "
+                        "use --backend fastconformer-ctc.\n",
+                        path);
+            else
+                fprintf(stderr,
+                        "parakeet: unsupported GGUF architecture/layout for '%s': "
+                        "no supported transducer predictor or compatible CTC head found.\n",
+                        path);
+            core_gguf::free_metadata(gctx);
+            return false;
+        }
+
         auto& hp = model.hparams;
+        model.phonon2 =
+            core_gguf::kv_str(gctx, "general.name", "") == "Phonon-2" ||
+            core_gguf::kv_str(gctx, "general.source.huggingface.repository", "") == "FermionResearch/Phonon-2";
+        model.english_only = model.phonon2 || core_gguf::kv_str(gctx, "parakeet.language", "") == "en";
         hp.sample_rate = core_gguf::kv_u32(gctx, "parakeet.sample_rate", hp.sample_rate);
         hp.n_mels = core_gguf::kv_u32(gctx, "parakeet.n_mels", hp.n_mels);
         hp.n_fft = core_gguf::kv_u32(gctx, "parakeet.n_fft", hp.n_fft);
@@ -330,7 +436,20 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.subsampling_factor = core_gguf::kv_u32(gctx, "parakeet.subsampling_factor", hp.subsampling_factor);
         hp.subsampling_channels = core_gguf::kv_u32(gctx, "parakeet.subsampling_channels", hp.subsampling_channels);
         hp.conv_kernel = core_gguf::kv_u32(gctx, "parakeet.conv_kernel", hp.conv_kernel);
-        hp.xscaling = core_gguf::kv_bool(gctx, "parakeet.xscaling", hp.xscaling);
+        // parakeet.xscaling ABSENT means false. The only published GGUFs without
+        // the key (parakeet-tdt-0.6b-v3, parakeet_de_med = v3's frozen encoder)
+        // were converted before it was written, and NeMo runs that encoder with
+        // xscaling: false. The old fallback (true) scaled their encoder input
+        // by sqrt(d_model) = 32: crispasr-diff vs NeMo, v3 F16, jfk: encoder
+        // cos 0.594 with the fallback, 0.99995 without (Kaggle 2026-09-28).
+        // Every other published parakeet GGUF records the key explicitly.
+        if (gguf_find_key(gctx, "parakeet.xscaling") >= 0) {
+            hp.xscaling = core_gguf::kv_bool(gctx, "parakeet.xscaling", hp.xscaling);
+        } else {
+            hp.xscaling = false;
+            fprintf(stderr, "parakeet: GGUF has no parakeet.xscaling key - assuming false (pre-key conversions are "
+                            "parakeet-tdt-0.6b-v3 lineage); CRISPASR_PARAKEET_XSCALING=1 overrides\n");
+        }
         hp.pred_hidden = core_gguf::kv_u32(gctx, "parakeet.pred_hidden", hp.pred_hidden);
         hp.pred_layers = core_gguf::kv_u32(gctx, "parakeet.pred_layers", hp.pred_layers);
         hp.joint_hidden = core_gguf::kv_u32(gctx, "parakeet.joint_hidden", hp.joint_hidden);
@@ -338,6 +457,11 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.blank_id = core_gguf::kv_u32(gctx, "parakeet.blank_id", hp.blank_id);
         hp.n_tdt_durations = core_gguf::kv_u32(gctx, "parakeet.n_tdt_durations", hp.n_tdt_durations);
         hp.frame_dur_cs = core_gguf::kv_u32(gctx, "parakeet.frame_dur_cs", hp.frame_dur_cs);
+
+        model.predictor.kda_num_heads = core_gguf::kv_u32(gctx, "haas.kda_num_heads", 5);
+        model.predictor.kda_head_dim = core_gguf::kv_u32(gctx, "haas.kda_head_dim", 64);
+        model.predictor.kda_conv_size = core_gguf::kv_u32(gctx, "haas.kda_conv_size", 4);
+        model.predictor.kda_final_norm = core_gguf::kv_bool(gctx, "haas.kda_final_norm", true);
 
         // Local attention context (rel_pos_local_attn models).
         hp.att_context_left = core_gguf::kv_i32(gctx, "parakeet.att_context_left", hp.att_context_left);
@@ -356,6 +480,15 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
                 hp.att_context_right = r;
             }
         }
+
+        // Overrides for GGUFs converted before these keys were written: an
+        // absent parakeet.xscaling falls back to true, which is wrong for
+        // e.g. parakeet-tdt-0.6b-v3 (NeMo encoder.xscaling: false).
+        // CRISPASR_PARAKEET_XSCALING=0|1, CRISPASR_PARAKEET_GLOBAL_TOKENS=N.
+        if (const char* e = getenv("CRISPASR_PARAKEET_XSCALING"))
+            hp.xscaling = atoi(e) != 0;
+        if (const char* e = getenv("CRISPASR_PARAKEET_GLOBAL_TOKENS"))
+            hp.global_tokens = (uint32_t)atoi(e);
 
         // CTC head metadata (hybrid TDT+CTC models).
         model.has_ctc = core_gguf::kv_bool(gctx, "parakeet.has_ctc", false);
@@ -376,31 +509,16 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
 
     // ---- pass 2: load tensor data via the shared helper ----
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, backend, "parakeet", wl)) {
+    const bool repack = parakeet_ffn_mode("repack") && core_cpu_backend::is_cpu(backend);
+    const bool loaded =
+        repack ? core_gguf::load_weights_repack(path, backend, parakeet_is_ffn_weight, nullptr, "parakeet.ffn", wl)
+               : core_gguf::load_weights(path, backend, "parakeet", wl);
+    if (!loaded)
         return false;
-    }
     model.ctx = wl.ctx;
     model.buf = wl.buf;
+    model.buf_default_partition = wl.buf_cpu;
     model.tensors = std::move(wl.tensors);
-
-    // Pure-CTC guard. A NeMo EncDecCTCModelBPE (parakeet-ctc-*,
-    // stt_*_fastconformer_ctc_*) has only an encoder + a CTC classification
-    // head — no RNN-T prediction network and no joint. The parakeet backend is
-    // the transducer (TDT/RNN-T) runtime and cannot run such a model. Detect it
-    // up front and point the user at the CTC backend, rather than emitting a wall
-    // of "required tensor not found" errors and then dereferencing null weights.
-    // Such a GGUF carries arch "canary-ctc" and runs on --backend fastconformer-ctc.
-    if (model.tensors.find("decoder.embed.weight") == model.tensors.end() &&
-        model.tensors.find("decoder.lstm.0.w_ih") == model.tensors.end()) {
-        fprintf(stderr,
-                "parakeet: this GGUF has no RNN-T decoder/joint tensors — it is a pure CTC\n"
-                "parakeet: model (EncDecCTCModelBPE), not a transducer, so it cannot run on the\n"
-                "parakeet: parakeet (transducer) backend. Run it with the CTC backend instead:\n"
-                "parakeet: drop '--backend parakeet' to auto-detect, or pass '--backend fastconformer-ctc'.\n"
-                "parakeet: (If you converted it yourself, use\n"
-                "parakeet:  models/convert-stt-fastconformer-ctc-to-gguf.py, not convert-parakeet-to-gguf.py.)\n");
-        return false;
-    }
 
     // ---- bind named tensors into the per-layer structs ----
 
@@ -483,19 +601,72 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
 
     // Predictor
     auto& p = model.predictor;
+    p.is_kda = (model.tensors.find("decoder.kda.0.q_proj.weight") != model.tensors.end());
+    model.is_kda = p.is_kda;
     p.embed_w = require(model, "decoder.embed.weight");
-    p.lstm0_w_ih = require(model, "decoder.lstm.0.w_ih");
-    p.lstm0_w_hh = require(model, "decoder.lstm.0.w_hh");
-    p.lstm0_b_ih = require(model, "decoder.lstm.0.b_ih");
-    p.lstm0_b_hh = require(model, "decoder.lstm.0.b_hh");
-    // lstm.1 only exists when pred_layers >= 2 (v2/v3/0.6b-ja). Single-LSTM
-    // hybrids (e.g. parakeet-tdt_ctc-110m has pred_layers=1) keep them null
-    // and must use the CTC head — TDT decode requires a 2-LSTM predictor.
-    const bool has_lstm1 = model.hparams.pred_layers >= 2;
-    p.lstm1_w_ih = has_lstm1 ? require(model, "decoder.lstm.1.w_ih") : nullptr;
-    p.lstm1_w_hh = has_lstm1 ? require(model, "decoder.lstm.1.w_hh") : nullptr;
-    p.lstm1_b_ih = has_lstm1 ? require(model, "decoder.lstm.1.b_ih") : nullptr;
-    p.lstm1_b_hh = has_lstm1 ? require(model, "decoder.lstm.1.b_hh") : nullptr;
+    if (!p.is_kda) {
+        p.lstm0_w_ih = require(model, "decoder.lstm.0.w_ih");
+        p.lstm0_w_hh = require(model, "decoder.lstm.0.w_hh");
+        p.lstm0_b_ih = require(model, "decoder.lstm.0.b_ih");
+        p.lstm0_b_hh = require(model, "decoder.lstm.0.b_hh");
+        // lstm.1 only exists when pred_layers >= 2 (v2/v3/0.6b-ja). Single-LSTM
+        // hybrids (e.g. parakeet-tdt_ctc-110m has pred_layers=1) keep them null
+        // and must use the CTC head — TDT decode requires a 2-LSTM predictor.
+        const bool has_lstm1 = model.hparams.pred_layers >= 2;
+        p.lstm1_w_ih = has_lstm1 ? require(model, "decoder.lstm.1.w_ih") : nullptr;
+        p.lstm1_w_hh = has_lstm1 ? require(model, "decoder.lstm.1.w_hh") : nullptr;
+        p.lstm1_b_ih = has_lstm1 ? require(model, "decoder.lstm.1.b_ih") : nullptr;
+        p.lstm1_b_hh = has_lstm1 ? require(model, "decoder.lstm.1.b_hh") : nullptr;
+    } else {
+        const uint32_t n_layers = model.hparams.pred_layers;
+        p.kda_layers.resize(n_layers);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            auto& kl = p.kda_layers[l];
+            char buf[128];
+            snprintf(buf, sizeof(buf), "decoder.kda.norm.%u.weight", l);
+            kl.norm_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.norm.%u.bias", l);
+            kl.norm_b = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.q_proj.weight", l);
+            kl.q_proj_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.k_proj.weight", l);
+            kl.k_proj_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.v_proj.weight", l);
+            kl.v_proj_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.q_conv.weight", l);
+            kl.q_conv_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.k_conv.weight", l);
+            kl.k_conv_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.v_conv.weight", l);
+            kl.v_conv_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.f_proj.0.weight", l);
+            kl.f_proj0_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.f_proj.1.weight", l);
+            kl.f_proj1_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.b_proj.weight", l);
+            kl.b_proj_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.a_log", l);
+            kl.a_log = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.dt_bias", l);
+            kl.dt_bias = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.g_proj.0.weight", l);
+            kl.g_proj0_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.g_proj.1.weight", l);
+            kl.g_proj1_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.g_proj.1.bias", l);
+            kl.g_proj1_b = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.o_norm.weight", l);
+            kl.o_norm_w = require(model, buf);
+            snprintf(buf, sizeof(buf), "decoder.kda.%u.o_proj.weight", l);
+            kl.o_proj_w = require(model, buf);
+        }
+        auto try_kda = [&](const char* name) -> ggml_tensor* {
+            auto it = model.tensors.find(name);
+            return it != model.tensors.end() ? it->second : nullptr;
+        };
+        p.kda_final_norm_w = try_kda("decoder.kda.final_norm.weight");
+        p.kda_final_norm_b = try_kda("decoder.kda.final_norm.bias");
+    }
 
     // Joint
     auto& j = model.joint;
@@ -607,7 +778,8 @@ static void parakeet_fft_r2c(const float* in, int N, float* out) {
 
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
-#include "core/rnnt_ggml.h"        // §232 GPU transducer decode (shared)
+#include "core/sched_prof.h"
+#include "core/rnnt_ggml.h" // §232 GPU transducer decode (shared)
 #include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
@@ -834,7 +1006,8 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 
     // ----- xscaling: NeMo's RelPositionalEncoding multiplies the encoder
     // input by sqrt(d_model) before the conformer layers when the model's
-    // `encoder.xscaling: true` (default for parakeet-tdt-0.6b-v3 and -ja).
+    // `encoder.xscaling: true` (e.g. parakeet-rnnt-0.6b; NOT
+    // parakeet-tdt-0.6b-v3 or the 1.1b family, whose configs say false).
     // Without it, every layer's input is 32× too small, the rel-pos
     // sinusoid is the same scale, and the model produces near-random
     // activations downstream.
@@ -877,7 +1050,7 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
         (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
         kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
-    bp.manual_attn = core_conformer::fc_gpu_manual_attn(ctx->backend);
+    bp.manual_attn = !ctx->params.use_flash || core_conformer::fc_gpu_manual_attn(ctx->backend);
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask, nullptr, window_band_mask);
     }
@@ -890,6 +1063,43 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 
 // make_pos_enc moved to core_conformer::make_pos_enc in src/core/fastconformer.h.
 
+static void parakeet_pin_ffn_blas(parakeet_context* ctx, ggml_cgraph* gf) {
+    if (!ctx->ffn_blas || !ctx->model.buf_ffn_f32)
+        return;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        // ggml requires CPU last in the scheduler roster. Explicit placement
+        // prevents BLAS priority from capturing non-FFN encoder matmuls.
+        ggml_backend_t backend = ctx->backend;
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->buffer == ctx->model.buf_ffn_f32 &&
+            ggml_backend_supports_op(ctx->backend_blas, node))
+            backend = ctx->backend_blas;
+        ggml_backend_sched_set_tensor_backend(ctx->sched, node, backend);
+    }
+}
+
+static void parakeet_trace_ffn(parakeet_context* ctx, ggml_cgraph* gf) {
+    const char* e = crispasr_env::get("CRISPASR_PARAKEET_FFN_TRACE");
+    if (!e || e[0] != '1')
+        return;
+    std::map<std::string, int> counts;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node->op != GGML_OP_MUL_MAT || !node->src[0] ||
+            !parakeet_is_ffn_weight(ggml_get_name(node->src[0]), nullptr))
+            continue;
+        ggml_tensor* w = node->src[0];
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(ctx->sched, node);
+        char key[256];
+        snprintf(key, sizeof(key), "%s [%lldx%lld] buffer=%s extra=%s backend=%s", ggml_type_name(w->type),
+                 (long long)w->ne[0], (long long)w->ne[1], w->buffer ? ggml_backend_buffer_name(w->buffer) : "none",
+                 w->extra ? "yes" : "no", be ? ggml_backend_name(be) : "none");
+        counts[key]++;
+    }
+    for (const auto& row : counts)
+        fprintf(stderr, "parakeet_ffn: %s count=%d\n", row.first.c_str(), row.second);
+}
+
 // Run the encoder once. Returns enc_out as a flat row-major [T_enc, d_model].
 // Caller computes T_enc as ceil(T_mel / subsampling_factor) (approximately —
 // the actual value depends on the conv arithmetic and is reported back).
@@ -900,9 +1110,37 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         return {};
     }
 
+    // #441: enforce the physical-memory invariant at the allocation boundary,
+    // independently of every CLI/session routing decision. If an explicit
+    // chunk flag is ever lost again, or a direct library caller invokes the
+    // single-pass API on a multi-hour buffer, the full-attention graph is
+    // refused before ggml asks the OS for it. Normal orchestration selects
+    // streamed windows before reaching this last line of defence.
+    const int sub = std::max(1, (int)ctx->model.hparams.subsampling_factor);
+    const int T_est = std::max(1, T_mel / sub);
+    const int H = std::max(1, (int)ctx->model.hparams.n_heads);
+    double coeff = 8.0;
+    if (const char* e = getenv("CRISPASR_PARAKEET_MEM_COEFF"))
+        coeff = atof(e);
+    double available = core_sys_mem::available_mb();
+    if (const char* e = getenv("CRISPASR_PARAKEET_AVAILABLE_MB"))
+        available = atof(e); // deterministic CI/live-test override
+    if (!parakeet_encoder_fits_available_memory(T_est, H, available, coeff)) {
+        fprintf(stderr,
+                "crispasr[parakeet]: refusing encoder graph: est %.0f MiB exceeds safe share of %.0f MiB "
+                "available (T=%d, H=%d); use streamed/chunked orchestration\n",
+                parakeet_est_singlepass_peak_mb(T_est, H, coeff), available, T_est, H);
+        return {};
+    }
+
     if (!ctx->sched) {
-        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ggml_backend_t backends[3];
+        int n_be = 0;
+        if (ctx->backend_blas)
+            backends[n_be++] = ctx->backend_blas;
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend != ctx->backend_cpu)
+            backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
         crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
@@ -960,12 +1198,14 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
 
     int64_t t_alloc0 = probe_time ? ggml_time_us() : 0;
     ggml_backend_sched_reset(ctx->sched);
+    parakeet_pin_ffn_blas(ctx, gf);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "parakeet: failed to alloc encoder graph\n");
         return {};
     }
     int64_t t_alloc_us = probe_time ? ggml_time_us() - t_alloc0 : 0;
 
+    parakeet_trace_ffn(ctx, gf);
     // Set inputs
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
     ggml_backend_tensor_set(mel_in, mel, 0, (size_t)n_mels * T_mel * sizeof(float));
@@ -997,7 +1237,7 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
 
     // Compute
     int64_t t_comp0 = probe_time ? ggml_time_us() : 0;
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "parakeet.encoder", "CRISPASR_FC_PROFILE") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "parakeet: encoder graph compute failed\n");
         return {};
     }
@@ -1058,9 +1298,32 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
 //   h' = o * tanh(c')
 // ===========================================================================
 
+struct parakeet_kda_layer_state {
+    std::vector<float> q_conv; // [total_dim * conv_k]
+    std::vector<float> k_conv; // [total_dim * conv_k]
+    std::vector<float> v_conv; // [total_dim * conv_k]
+    std::vector<float> S;      // [num_heads * head_dim * head_dim]
+};
+
+struct parakeet_kda_scratch {
+    std::vector<float> cur_x;
+    std::vector<float> x_norm;
+    std::vector<float> q_raw, k_raw, v_raw;
+    std::vector<float> q_conv, k_conv, v_conv;
+    std::vector<float> q, k;
+    std::vector<float> f_mid, g, beta;
+    std::vector<float> o, g_mid, g_out, o_flat;
+};
+
+struct parakeet_kda_state {
+    std::vector<parakeet_kda_layer_state> layers;
+    parakeet_kda_scratch scratch;
+};
+
 struct parakeet_lstm_state {
     std::vector<float> h0, c0; // layer 0
     std::vector<float> h1, c1; // layer 1
+    parakeet_kda_state kda;
 };
 
 static void lstm_init_state(parakeet_lstm_state& s, int H) {
@@ -1068,6 +1331,7 @@ static void lstm_init_state(parakeet_lstm_state& s, int H) {
     s.c0.assign(H, 0.0f);
     s.h1.assign(H, 0.0f);
     s.c1.assign(H, 0.0f);
+    s.kda.layers.clear();
 }
 
 // Read an F16/F32 ggml tensor into a flat F32 std::vector for CPU stepping.
@@ -1093,6 +1357,39 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
     return out;
 }
 
+static bool parakeet_cache_ffn_f32(parakeet_model& model, ggml_backend_t backend) {
+    std::vector<std::pair<ggml_tensor**, ggml_tensor*>> jobs;
+    const size_t count = model.enc.size() * 4;
+    model.ctx_ffn_f32 = ggml_init({count * ggml_tensor_overhead(), nullptr, true});
+    if (!model.ctx_ffn_f32)
+        return false;
+    size_t bytes = 0;
+    for (auto& layer : model.enc) {
+        for (ggml_tensor** slot : {&layer.ff1_l1_w, &layer.ff1_l2_w, &layer.ff2_l1_w, &layer.ff2_l2_w}) {
+            ggml_tensor* src = *slot;
+            if (!src || ggml_n_dims(src) != 2 || !ggml_is_contiguous(src))
+                return false;
+            ggml_tensor* dst = ggml_new_tensor_2d(model.ctx_ffn_f32, GGML_TYPE_F32, src->ne[0], src->ne[1]);
+            ggml_set_name(dst, ggml_get_name(src));
+            jobs.emplace_back(slot, dst);
+            bytes += ggml_nbytes(dst);
+        }
+    }
+    model.buf_ffn_f32 = ggml_backend_alloc_ctx_tensors(model.ctx_ffn_f32, backend);
+    if (!model.buf_ffn_f32)
+        return false;
+    // Convert one matrix at a time; do not hold another model-sized F32 vector.
+    // Original slots remain intact until every copy has been populated.
+    for (const auto& job : jobs) {
+        auto values = tensor_to_f32(*job.first);
+        ggml_backend_tensor_set(job.second, values.data(), 0, values.size() * sizeof(float));
+    }
+    for (const auto& job : jobs)
+        *job.first = job.second;
+    fprintf(stderr, "parakeet.ffn: cached %zu F32 matmul weights, %zu MiB\n", jobs.size(), bytes / 1048576);
+    return true;
+}
+
 static void lstm_step_layer(const float* x, // [in_dim]
                             const float* w_ih, const float* b_ih, const float* w_hh, const float* b_hh, float* h,
                             float* c,     // [H]   in/out
@@ -1105,8 +1402,8 @@ static void lstm_step_layer(const float* x, // [in_dim]
     for (int i = 0; i < H4; i++)
         gates[i] = b_ih[i] + b_hh[i];
 
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
+#if defined(HAVE_PARAKEET_BLAS)
+    if (parakeet_use_blas()) {
         // w_ih[4H, in_dim] @ x[in_dim] and w_hh[4H, H] @ h[H], adding into gates
         cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, in_dim, 1.0f, w_ih, in_dim, x, 1, 1.0f, gates.data(), 1);
         cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, H, 1.0f, w_hh, H, h, 1, 1.0f, gates.data(), 1);
@@ -1126,7 +1423,7 @@ static void lstm_step_layer(const float* x, // [in_dim]
                 s += row[k] * h[k];
             gates[i] += s;
         }
-#if defined(HAVE_ACCELERATE)
+#if defined(HAVE_PARAKEET_BLAS)
     }
 #endif
 
@@ -1142,9 +1439,365 @@ static void lstm_step_layer(const float* x, // [in_dim]
     }
 }
 
+// Run one Kimi Delta Attention (KDA) predictor step
+static void kda_predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_kda_state& state,
+                               std::vector<float>& pred_out) {
+    const int H_dim = W.H;
+    pred_out.assign(H_dim, 0.0f);
+
+    const int num_heads = (int)W.kda_num_heads;
+    const int head_dim = (int)W.kda_head_dim;
+    const int total_dim = num_heads * head_dim;
+    const int conv_k = (int)W.kda_conv_size;
+    const float eps_l2 = 1e-6f;
+    const float eps_rms = 1e-5f;
+    const float inv_sqrt_d = 1.0f / std::sqrt((float)head_dim);
+
+    if (state.layers.size() != W.kda_layers.size()) {
+        state.layers.resize(W.kda_layers.size());
+        for (auto& l : state.layers) {
+            l.q_conv.assign((size_t)total_dim * conv_k, 0.0f);
+            l.k_conv.assign((size_t)total_dim * conv_k, 0.0f);
+            l.v_conv.assign((size_t)total_dim * conv_k, 0.0f);
+            l.S.assign((size_t)num_heads * head_dim * head_dim, 0.0f);
+        }
+    }
+
+    auto& sc = state.scratch;
+    const int max_f_mid = W.kda_layers.empty() ? 64 : (int)(W.kda_layers[0].f_proj0_w.size() / H_dim);
+    const int max_g_mid = W.kda_layers.empty() ? 64 : (int)(W.kda_layers[0].g_proj0_w.size() / H_dim);
+    if ((int)sc.cur_x.size() != H_dim || (int)sc.q_raw.size() != total_dim || (int)sc.f_mid.size() != max_f_mid ||
+        (int)sc.g_mid.size() != max_g_mid) {
+        sc.cur_x.assign(H_dim, 0.0f);
+        sc.x_norm.assign(H_dim, 0.0f);
+        sc.q_raw.assign(total_dim, 0.0f);
+        sc.k_raw.assign(total_dim, 0.0f);
+        sc.v_raw.assign(total_dim, 0.0f);
+        sc.q_conv.assign(total_dim, 0.0f);
+        sc.k_conv.assign(total_dim, 0.0f);
+        sc.v_conv.assign(total_dim, 0.0f);
+        sc.q.assign(total_dim, 0.0f);
+        sc.k.assign(total_dim, 0.0f);
+        sc.f_mid.assign(max_f_mid, 0.0f);
+        sc.g.assign(total_dim, 0.0f);
+        sc.beta.assign(num_heads, 0.0f);
+        sc.o.assign(total_dim, 0.0f);
+        sc.g_mid.assign(max_g_mid, 0.0f);
+        sc.g_out.assign(total_dim, 0.0f);
+        sc.o_flat.assign(total_dim, 0.0f);
+    }
+
+    float* cur_x = sc.cur_x.data();
+    float* x_norm = sc.x_norm.data();
+    float* q_raw = sc.q_raw.data();
+    float* k_raw = sc.k_raw.data();
+    float* v_raw = sc.v_raw.data();
+    float* q_conv = sc.q_conv.data();
+    float* k_conv = sc.k_conv.data();
+    float* v_conv = sc.v_conv.data();
+    float* q = sc.q.data();
+    float* k = sc.k.data();
+    float* f_mid = sc.f_mid.data();
+    float* g = sc.g.data();
+    float* beta = sc.beta.data();
+    float* o = sc.o.data();
+    float* g_mid = sc.g_mid.data();
+    float* g_out = sc.g_out.data();
+    float* o_flat = sc.o_flat.data();
+
+    // Embed token
+    std::fill(cur_x, cur_x + H_dim, 0.0f);
+    if ((size_t)(token_id + 1) * H_dim <= W.embed.size()) {
+        std::copy(W.embed.data() + (size_t)token_id * H_dim, W.embed.data() + (size_t)(token_id + 1) * H_dim, cur_x);
+    }
+
+    auto silu = [](float x) { return x / (1.0f + std::exp(-x)); };
+    auto sigmoid = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+    auto softplus = [](float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); };
+
+    for (size_t l_idx = 0; l_idx < W.kda_layers.size(); ++l_idx) {
+        const auto& L = W.kda_layers[l_idx];
+        auto& st = state.layers[l_idx];
+
+        // 1. LayerNorm on cur_x
+        float mean = 0.0f;
+        for (int i = 0; i < H_dim; ++i)
+            mean += cur_x[i];
+        mean /= (float)H_dim;
+        float var = 0.0f;
+        for (int i = 0; i < H_dim; ++i) {
+            float d = cur_x[i] - mean;
+            var += d * d;
+        }
+        var /= (float)H_dim;
+        float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        for (int i = 0; i < H_dim; ++i) {
+            x_norm[i] = (cur_x[i] - mean) * inv_std * L.norm_w[i] + L.norm_b[i];
+        }
+
+        // 2. Linear projections: q, k, v [320, 640]
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, total_dim, H_dim, 1.0f, L.q_proj_w.data(), H_dim, x_norm, 1, 0.0f,
+                        q_raw, 1);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, total_dim, H_dim, 1.0f, L.k_proj_w.data(), H_dim, x_norm, 1, 0.0f,
+                        k_raw, 1);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, total_dim, H_dim, 1.0f, L.v_proj_w.data(), H_dim, x_norm, 1, 0.0f,
+                        v_raw, 1);
+        } else
+#endif
+        {
+            for (int i = 0; i < total_dim; ++i) {
+                const float* qw = L.q_proj_w.data() + (size_t)i * H_dim;
+                const float* kw = L.k_proj_w.data() + (size_t)i * H_dim;
+                const float* vw = L.v_proj_w.data() + (size_t)i * H_dim;
+                float sq = 0.0f, sk = 0.0f, sv = 0.0f;
+                for (int j = 0; j < H_dim; ++j) {
+                    sq += qw[j] * x_norm[j];
+                    sk += kw[j] * x_norm[j];
+                    sv += vw[j] * x_norm[j];
+                }
+                q_raw[i] = sq;
+                k_raw[i] = sk;
+                v_raw[i] = sv;
+            }
+        }
+
+        // 3. Conv1D causal step: shift left and append new value at index conv_k - 1 (3)
+        for (int c = 0; c < total_dim; ++c) {
+            float* qc = st.q_conv.data() + (size_t)c * conv_k;
+            float* kc = st.k_conv.data() + (size_t)c * conv_k;
+            float* vc = st.v_conv.data() + (size_t)c * conv_k;
+
+            qc[0] = qc[1];
+            qc[1] = qc[2];
+            qc[2] = qc[3];
+            qc[3] = q_raw[c];
+            kc[0] = kc[1];
+            kc[1] = kc[2];
+            kc[2] = kc[3];
+            kc[3] = k_raw[c];
+            vc[0] = vc[1];
+            vc[1] = vc[2];
+            vc[2] = vc[3];
+            vc[3] = v_raw[c];
+
+            const float* qcw = L.q_conv_w.data() + (size_t)c * conv_k;
+            const float* kcw = L.k_conv_w.data() + (size_t)c * conv_k;
+            const float* vcw = L.v_conv_w.data() + (size_t)c * conv_k;
+
+            float dot_q = qc[0] * qcw[0] + qc[1] * qcw[1] + qc[2] * qcw[2] + qc[3] * qcw[3];
+            float dot_k = kc[0] * kcw[0] + kc[1] * kcw[1] + kc[2] * kcw[2] + kc[3] * kcw[3];
+            float dot_v = vc[0] * vcw[0] + vc[1] * vcw[1] + vc[2] * vcw[2] + vc[3] * vcw[3];
+
+            q_conv[c] = silu(dot_q);
+            k_conv[c] = silu(dot_k);
+            v_conv[c] = silu(dot_v);
+        }
+
+        // 4. L2 norm & scaling over head dimension
+        const float* v = v_conv;
+
+        for (int h = 0; h < num_heads; ++h) {
+            float sum_sq_q = 0.0f, sum_sq_k = 0.0f;
+            const int offset = h * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                sum_sq_q += q_conv[offset + d] * q_conv[offset + d];
+                sum_sq_k += k_conv[offset + d] * k_conv[offset + d];
+            }
+            float norm_q = std::sqrt(sum_sq_q + eps_l2);
+            float norm_k = std::sqrt(sum_sq_k + eps_l2);
+            float scale_q = inv_sqrt_d / norm_q;
+            float scale_k = 1.0f / norm_k;
+            for (int d = 0; d < head_dim; ++d) {
+                q[offset + d] = q_conv[offset + d] * scale_q;
+                k[offset + d] = k_conv[offset + d] * scale_k;
+            }
+        }
+
+        // 5. Gate g: f_proj0 [64, 640] -> f_proj1 [320, 64] + dt_bias [320] -> -exp(a_log) * softplus(...)
+        const int f_mid_dim = (int)(L.f_proj0_w.size() / H_dim);
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, f_mid_dim, H_dim, 1.0f, L.f_proj0_w.data(), H_dim, x_norm, 1, 0.0f,
+                        f_mid, 1);
+            std::copy(L.dt_bias.data(), L.dt_bias.data() + total_dim, g);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, total_dim, f_mid_dim, 1.0f, L.f_proj1_w.data(), f_mid_dim, f_mid,
+                        1, 1.0f, g, 1);
+            for (int h = 0; h < num_heads; ++h) {
+                float exp_a = std::exp(L.a_log[h]);
+                for (int d = 0; d < head_dim; ++d) {
+                    int idx = h * head_dim + d;
+                    g[idx] = -exp_a * softplus(g[idx]);
+                }
+            }
+        } else
+#endif
+        {
+            for (int i = 0; i < f_mid_dim; ++i) {
+                const float* row = L.f_proj0_w.data() + (size_t)i * H_dim;
+                float s = 0.0f;
+                for (int j = 0; j < H_dim; ++j)
+                    s += row[j] * x_norm[j];
+                f_mid[i] = s;
+            }
+            for (int h = 0; h < num_heads; ++h) {
+                float exp_a = std::exp(L.a_log[h]);
+                for (int d = 0; d < head_dim; ++d) {
+                    int idx = h * head_dim + d;
+                    const float* row = L.f_proj1_w.data() + (size_t)idx * f_mid_dim;
+                    float s = 0.0f;
+                    for (int j = 0; j < f_mid_dim; ++j)
+                        s += row[j] * f_mid[j];
+                    s += L.dt_bias[idx];
+                    g[idx] = -exp_a * softplus(s);
+                }
+            }
+        }
+
+        // 6. Beta: b_proj [5, 640] -> sigmoid
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, num_heads, H_dim, 1.0f, L.b_proj_w.data(), H_dim, x_norm, 1, 0.0f,
+                        beta, 1);
+            for (int h = 0; h < num_heads; ++h) {
+                beta[h] = sigmoid(beta[h]);
+            }
+        } else
+#endif
+        {
+            for (int h = 0; h < num_heads; ++h) {
+                const float* row = L.b_proj_w.data() + (size_t)h * H_dim;
+                float s = 0.0f;
+                for (int j = 0; j < H_dim; ++j)
+                    s += row[j] * x_norm[j];
+                beta[h] = sigmoid(s);
+            }
+        }
+
+        // 7. Recurrent state S [5, 64, 64] update (state_v_first: S[h, v, k])
+        std::fill(o, o + total_dim, 0.0f);
+        for (int h = 0; h < num_heads; ++h) {
+            float* Sh = st.S.data() + (size_t)h * head_dim * head_dim;
+            const float* gh = g + h * head_dim;
+            const float* kh = k + h * head_dim;
+            const float* qh = q + h * head_dim;
+            const float* vh = v + h * head_dim;
+            const float b = beta[h];
+
+            float exp_g[64];
+            for (int k_idx = 0; k_idx < head_dim; ++k_idx) {
+                exp_g[k_idx] = std::exp(gh[k_idx]);
+            }
+
+            for (int v_idx = 0; v_idx < head_dim; ++v_idx) {
+                float* S_row = Sh + v_idx * head_dim;
+                float p_v = 0.0f;
+                for (int k_idx = 0; k_idx < head_dim; ++k_idx) {
+                    S_row[k_idx] *= exp_g[k_idx];
+                    p_v += S_row[k_idx] * kh[k_idx];
+                }
+                float diff_v = vh[v_idx] - p_v;
+                float u_v = b * diff_v;
+                float o_v = 0.0f;
+                for (int k_idx = 0; k_idx < head_dim; ++k_idx) {
+                    S_row[k_idx] += u_v * kh[k_idx];
+                    o_v += S_row[k_idx] * qh[k_idx];
+                }
+                o[h * head_dim + v_idx] = o_v;
+            }
+        }
+
+        // 8. Output norm & gate:
+        //    g_proj0 [64, 640] -> g_proj1 [320, 64] + g_proj1_b [320]
+        const int g_mid_dim = (int)(L.g_proj0_w.size() / H_dim);
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, g_mid_dim, H_dim, 1.0f, L.g_proj0_w.data(), H_dim, x_norm, 1, 0.0f,
+                        g_mid, 1);
+            std::copy(L.g_proj1_b.data(), L.g_proj1_b.data() + total_dim, g_out);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, total_dim, g_mid_dim, 1.0f, L.g_proj1_w.data(), g_mid_dim, g_mid,
+                        1, 1.0f, g_out, 1);
+        } else
+#endif
+        {
+            for (int i = 0; i < g_mid_dim; ++i) {
+                const float* row = L.g_proj0_w.data() + (size_t)i * H_dim;
+                float s = 0.0f;
+                for (int j = 0; j < H_dim; ++j)
+                    s += row[j] * x_norm[j];
+                g_mid[i] = s;
+            }
+            for (int i = 0; i < total_dim; ++i) {
+                const float* row = L.g_proj1_w.data() + (size_t)i * g_mid_dim;
+                float s = L.g_proj1_b[i];
+                for (int j = 0; j < g_mid_dim; ++j)
+                    s += row[j] * g_mid[j];
+                g_out[i] = s;
+            }
+        }
+
+        for (int h = 0; h < num_heads; ++h) {
+            const int offset = h * head_dim;
+            float sum_sq = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                float val = o[offset + d];
+                sum_sq += val * val;
+            }
+            float rms = std::sqrt(sum_sq / (float)head_dim + eps_rms);
+            float inv_rms = 1.0f / rms;
+            for (int d = 0; d < head_dim; ++d) {
+                int idx = offset + d;
+                o_flat[idx] = (o[idx] * inv_rms) * L.o_norm_w[d] * sigmoid(g_out[idx]);
+            }
+        }
+
+        // 9. Output projection [640, 320] + residual
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, H_dim, total_dim, 1.0f, L.o_proj_w.data(), total_dim, o_flat, 1,
+                        1.0f, cur_x, 1);
+        } else
+#endif
+        {
+            for (int i = 0; i < H_dim; ++i) {
+                const float* row = L.o_proj_w.data() + (size_t)i * total_dim;
+                float s = 0.0f;
+                for (int j = 0; j < total_dim; ++j)
+                    s += row[j] * o_flat[j];
+                cur_x[i] += s;
+            }
+        }
+    }
+
+    // 10. Final norm
+    if (W.is_kda && !W.kda_final_norm_w.empty()) {
+        float mean = 0.0f;
+        for (int i = 0; i < H_dim; ++i)
+            mean += cur_x[i];
+        mean /= (float)H_dim;
+        float var = 0.0f;
+        for (int i = 0; i < H_dim; ++i) {
+            float d = cur_x[i] - mean;
+            var += d * d;
+        }
+        var /= (float)H_dim;
+        float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        for (int i = 0; i < H_dim; ++i) {
+            pred_out[i] = (cur_x[i] - mean) * inv_std * W.kda_final_norm_w[i] + W.kda_final_norm_b[i];
+        }
+    } else {
+        std::copy(cur_x, cur_x + H_dim, pred_out.data());
+    }
+}
+
 // Run one predictor step:  input token id  →  pred_out [H]
 static void predictor_step(const parakeet_predictor_weights& W, int token_id, parakeet_lstm_state& state,
                            std::vector<float>& pred_out) {
+    if (W.is_kda) {
+        kda_predictor_step(W, token_id, state.kda, pred_out);
+        return;
+    }
     const int H = W.H;
     pred_out.assign(H, 0.0f);
 
@@ -1184,8 +1837,8 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 // inner predictor loop.
 static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, std::vector<float>& out) {
     out.assign(J.enc_b.begin(), J.enc_b.end());
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
+#if defined(HAVE_PARAKEET_BLAS)
+    if (parakeet_use_blas()) {
         // enc_w[joint_hidden, d_model] @ enc_t[d_model], adding into out (which holds enc_b)
         cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.d_model, 1.0f, J.enc_w.data(), J.d_model, enc_t, 1,
                     1.0f, out.data(), 1);
@@ -1201,13 +1854,44 @@ static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, 
     }
 }
 
+static void joint_project_encoder_cpu(const parakeet_joint_weights& J, const float* enc, int T_enc,
+                                      std::vector<float>& all_proj_e) {
+    all_proj_e.resize((size_t)T_enc * J.joint_hidden);
+    for (int t = 0; t < T_enc; t++) {
+        float* dst = all_proj_e.data() + (size_t)t * J.joint_hidden;
+        std::copy(J.enc_b.begin(), J.enc_b.end(), dst);
+    }
+#if defined(HAVE_PARAKEET_BLAS)
+    if (parakeet_use_blas()) {
+        // Batched sgemm: all_proj_e[T_enc, Jh] += enc[T_enc, d] @ enc_w^T[d, Jh]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T_enc, J.joint_hidden, J.d_model, 1.0f, enc, J.d_model,
+                    J.enc_w.data(), J.d_model, 1.0f, all_proj_e.data(), J.joint_hidden);
+    } else
+#endif
+    {
+        // Per-frame fallback (still better than computing inside the loop
+        // where cache misses on enc[] are random due to dur_skip advances)
+        for (int t = 0; t < T_enc; t++) {
+            float* dst = all_proj_e.data() + (size_t)t * J.joint_hidden;
+            const float* enc_t = enc + (size_t)t * J.d_model;
+            for (int i = 0; i < J.joint_hidden; i++) {
+                float s = dst[i]; // already has enc_b[i]
+                const float* row = J.enc_w.data() + (size_t)i * J.d_model;
+                for (int k = 0; k < J.d_model; k++)
+                    s += row[k] * enc_t[k];
+                dst[i] = s;
+            }
+        }
+    }
+}
+
 static void joint_step(const parakeet_joint_weights& J,
                        const float* proj_enc, // [joint_hidden]
                        const float* pred_u,   // [pred_hidden]
                        std::vector<float>& logits) {
     std::vector<float> mid(J.joint_hidden);
-#if defined(HAVE_ACCELERATE)
-    if (!parakeet_use_scalar()) {
+#if defined(HAVE_PARAKEET_BLAS)
+    if (parakeet_use_blas()) {
         // pred_w[joint_hidden, pred_hidden] @ pred_u + pred_b → mid, then relu(proj_enc + mid)
         mid.assign(J.pred_b.begin(), J.pred_b.end());
         cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
@@ -1241,7 +1925,7 @@ static void joint_step(const parakeet_joint_weights& J,
                 s += row[k] * mid[k];
             logits[v] = s;
         }
-#if defined(HAVE_ACCELERATE)
+#if defined(HAVE_PARAKEET_BLAS)
     }
 #endif
 }
@@ -1257,6 +1941,44 @@ static void parakeet_init_pred_weights(parakeet_context* ctx) {
     auto& W = ctx->pred_w;
     const int H = (int)ctx->model.hparams.pred_hidden;
     const int blank_id = (int)ctx->model.hparams.blank_id;
+
+    if (p.is_kda) {
+        W.is_kda = true;
+        W.kda_num_heads = p.kda_num_heads;
+        W.kda_head_dim = p.kda_head_dim;
+        W.kda_conv_size = p.kda_conv_size;
+        W.embed = tensor_to_f32(p.embed_w);
+        W.kda_layers.resize(p.kda_layers.size());
+        for (size_t l = 0; l < p.kda_layers.size(); ++l) {
+            const auto& kl = p.kda_layers[l];
+            auto& kw = W.kda_layers[l];
+            kw.norm_w = tensor_to_f32(kl.norm_w);
+            kw.norm_b = tensor_to_f32(kl.norm_b);
+            kw.q_proj_w = tensor_to_f32(kl.q_proj_w);
+            kw.k_proj_w = tensor_to_f32(kl.k_proj_w);
+            kw.v_proj_w = tensor_to_f32(kl.v_proj_w);
+            kw.q_conv_w = tensor_to_f32(kl.q_conv_w);
+            kw.k_conv_w = tensor_to_f32(kl.k_conv_w);
+            kw.v_conv_w = tensor_to_f32(kl.v_conv_w);
+            kw.f_proj0_w = tensor_to_f32(kl.f_proj0_w);
+            kw.f_proj1_w = tensor_to_f32(kl.f_proj1_w);
+            kw.b_proj_w = tensor_to_f32(kl.b_proj_w);
+            kw.a_log = tensor_to_f32(kl.a_log);
+            kw.dt_bias = tensor_to_f32(kl.dt_bias);
+            kw.g_proj0_w = tensor_to_f32(kl.g_proj0_w);
+            kw.g_proj1_w = tensor_to_f32(kl.g_proj1_w);
+            kw.g_proj1_b = tensor_to_f32(kl.g_proj1_b);
+            kw.o_norm_w = tensor_to_f32(kl.o_norm_w);
+            kw.o_proj_w = tensor_to_f32(kl.o_proj_w);
+        }
+        if (p.kda_final_norm_w)
+            W.kda_final_norm_w = tensor_to_f32(p.kda_final_norm_w);
+        if (p.kda_final_norm_b)
+            W.kda_final_norm_b = tensor_to_f32(p.kda_final_norm_b);
+        W.H = H;
+        W.initialised = true;
+        return;
+    }
 
     W.embed = tensor_to_f32(p.embed_w);
     W.w_ih_0 = tensor_to_f32(p.lstm0_w_ih);
@@ -1367,10 +2089,11 @@ struct parakeet_emitted_token {
     float p;     // softmax probability of the emitted token [0, 1]
 };
 
-// §232 — GPU decode via the shared core_rnnt_ggml helpers (predictor LSTM +
-// joint as ggml graphs on ctx->backend). Default ON when the decode backend is a
-// GPU (P100 A/B: 5-12x faster, transcript-identical — LEARNINGS 33); cblas on
-// CPU. Override PARAKEET_GGML_DECODE=1/0; RNNT_GGML_PERSTEP = per-step path.
+// Predictor LSTM and joint decoding share persistent core_rnnt_ggml graphs.
+// Default on CUDA/Vulkan and native AVX2/F16C Phonon-2 CPU builds; Apple keeps
+// Accelerate and other CPU models keep their existing scalar/BLAS defaults.
+// CRISPASR_PARAKEET_GGML_DECODE=1/0 overrides selection; RNNT_GGML_PERSTEP
+// selects the legacy per-step graph path.
 //
 // Returns whether to use ggml decode, and builds the persistent `gdec` when so.
 // Shared by every parakeet decode variant (greedy, beam, maes, rnnt).
@@ -1379,8 +2102,24 @@ struct parakeet_emitted_token {
 // can ask the question WITHOUT building the decoder — the long-form pipeline
 // needs it to decide whether encode and decode may overlap on two threads
 // (they may not when both drive ctx->backend). Keep the two in lockstep.
+// The Phonon-2 CPU sweep and 21-clip corpus cover the native x86 kernels.
+// Leave other models/ISAs and Apple Accelerate on their existing defaults.
+static bool parakeet_native_cpu_decode_default(const parakeet_context* ctx) {
+    if (crispasr_env::get("CRISPASR_PARAKEET_FORCE_SCALAR"))
+        return false;
+#if defined(HAVE_ACCELERATE)
+    (void)ctx;
+    return false;
+#else
+    return ctx->model.phonon2 && core_cpu_backend::is_cpu(ctx->backend) && core_cpu_backend::has_feature("AVX2") &&
+           core_cpu_backend::has_feature("F16C");
+#endif
+}
+
 static bool parakeet_ggml_decode_active(const parakeet_context* ctx) {
-    bool ggml_dec = !core_cpu_backend::is_cpu(ctx->backend);
+    if (!ctx || ctx->model.is_kda)
+        return false;
+    bool ggml_dec = !core_cpu_backend::is_cpu(ctx->backend) || parakeet_native_cpu_decode_default(ctx);
     // ggml decode wins on CUDA/Vulkan (slow CPU BLAS: P100 5-12x) but LOSES on
     // Metal, where Apple Accelerate cblas beats the small-matmul GPU decode (M1
     // parakeet total ~16x cblas vs ~11x ggml). Default OFF on Metal (LEARNINGS 34).
@@ -1397,14 +2136,22 @@ static bool parakeet_ggml_decode_active(const parakeet_context* ctx) {
 // first operation was still the T*640*1024 encoder projection in a scalar CPU
 // loop on non-Apple builds. The Q4 P100 A/B cut varied-audio TDT wall time from
 // 2.56 s to 1.15 s with an identical 301-word transcript, so use the backend
-// projection by default on the measured CUDA path. Other GPU backends remain
-// opt-in until they have the same transcript and timing evidence; `=0` retains
-// the measured scalar fallback everywhere.
+// projection by default on the measured CUDA path and native Phonon-2 CPU
+// path. Other GPU backends remain opt-in until transcript and timing evidence
+// supports them; `=0` retains the CPU scalar/BLAS projection fallback.
 static bool parakeet_gpu_encoder_projection(const parakeet_context* ctx) {
     if (const char* e = crispasr_env::get("CRISPASR_RNNT_GPU_ENC_PROJ"))
         return *e == '1';
+    if (parakeet_native_cpu_decode_default(ctx) && parakeet_ggml_decode_active(ctx))
+        return true;
 #if defined(GGML_USE_CUDA)
-    return ggml_backend_is_cuda(ctx->backend);
+    // ggml_backend_is_cuda() is a CUDA-MODULE symbol: linking it into
+    // libcrispasr.so fails with "undefined reference" in the release CUDA
+    // build. Test the backend NAME instead, which is core ggml and is what
+    // granite_speech, dots_tts and omnivoice already do. ROCm is included
+    // for the same reason granite_speech includes it.
+    const char* be_name = ctx->backend ? ggml_backend_name(ctx->backend) : nullptr;
+    return be_name && (std::strstr(be_name, "CUDA") || std::strstr(be_name, "ROCm"));
 #else
     (void)ctx;
     return false;
@@ -1522,30 +2269,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
         core_rnnt_ggml::decoder_project_encoder(gdec, ctx->model.joint.enc_w, ctx->model.joint.enc_b, enc, T_enc,
                                                 d_model, all_proj_e);
     if (!gpu_enc_proj) {
-        all_proj_e.resize((size_t)T_enc * J.joint_hidden);
-        for (int t = 0; t < T_enc; t++) {
-            float* dst = all_proj_e.data() + (size_t)t * J.joint_hidden;
-            std::copy(J.enc_b.begin(), J.enc_b.end(), dst);
-        }
-#if defined(HAVE_ACCELERATE)
-        // Batched sgemm: all_proj_e[T_enc, Jh] += enc[T_enc, d] @ enc_w^T[d, Jh]
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T_enc, J.joint_hidden, J.d_model, 1.0f, enc, J.d_model,
-                    J.enc_w.data(), J.d_model, 1.0f, all_proj_e.data(), J.joint_hidden);
-#else
-        // Per-frame fallback (still better than computing inside the loop
-        // where cache misses on enc[] are random due to dur_skip advances)
-        for (int t = 0; t < T_enc; t++) {
-            float* dst = all_proj_e.data() + (size_t)t * J.joint_hidden;
-            const float* enc_t = enc + (size_t)t * J.d_model;
-            for (int i = 0; i < J.joint_hidden; i++) {
-                float s = dst[i]; // already has enc_b[i]
-                const float* row = J.enc_w.data() + (size_t)i * J.d_model;
-                for (int k = 0; k < J.d_model; k++)
-                    s += row[k] * enc_t[k];
-                dst[i] = s;
-            }
-        }
-#endif
+        joint_project_encoder_cpu(J, enc, T_enc, all_proj_e);
     }
     const auto _proj_t1 = std::chrono::steady_clock::now();
 
@@ -1732,8 +2456,15 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     if (time_dec) {
         auto _dt1 = std::chrono::steady_clock::now();
         fprintf(stderr, "parakeet: tdt_decode %.1f ms (%s, T_enc=%d, %zu tokens, enc_proj=%.1f ms %s)\n",
-                std::chrono::duration<double, std::milli>(_dt1 - _dt0).count(), ggml_dec ? "ggml" : "cblas", T_enc,
-                emitted.size(), std::chrono::duration<double, std::milli>(_proj_t1 - _proj_t0).count(),
+                std::chrono::duration<double, std::milli>(_dt1 - _dt0).count(),
+                ggml_dec ? "ggml" :
+#if defined(HAVE_PARAKEET_BLAS)
+                parakeet_use_blas() ? "blas"
+                                    : "scalar",
+#else
+                         "scalar",
+#endif
+                T_enc, emitted.size(), std::chrono::duration<double, std::milli>(_proj_t1 - _proj_t0).count(),
                 gpu_enc_proj ? "backend" : "cpu");
     }
     return emitted;
@@ -1767,26 +2498,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_batched(parakeet_
     std::vector<float> pred_out;
     predictor_step(W, blank_id, state, pred_out);
 
-    // Pre-compute ALL encoder projections
-    std::vector<float> all_proj_e((size_t)T_enc * Jh);
-    for (int f = 0; f < T_enc; f++)
-        std::copy(J.enc_b.begin(), J.enc_b.end(), all_proj_e.data() + (size_t)f * Jh);
-#if defined(HAVE_ACCELERATE)
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T_enc, Jh, J.d_model, 1.0f, enc, J.d_model, J.enc_w.data(),
-                J.d_model, 1.0f, all_proj_e.data(), Jh);
-#else
-    for (int f = 0; f < T_enc; f++) {
-        float* dst = all_proj_e.data() + (size_t)f * Jh;
-        const float* enc_f = enc + (size_t)f * d_model;
-        for (int i = 0; i < Jh; i++) {
-            const float* row = J.enc_w.data() + (size_t)i * J.d_model;
-            float s = dst[i];
-            for (int k = 0; k < J.d_model; k++)
-                s += row[k] * enc_f[k];
-            dst[i] = s;
-        }
-    }
-#endif
+    std::vector<float> all_proj_e;
+    joint_project_encoder_cpu(J, enc, T_enc, all_proj_e);
 
     std::vector<float> pred_proj(Jh);
     std::vector<float> mid_batch;
@@ -1796,18 +2509,21 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_batched(parakeet_
     while (t < T_enc) {
         // Compute pred_proj = pred_w @ pred_out + pred_b (constant until next emission)
         std::copy(J.pred_b.begin(), J.pred_b.end(), pred_proj.data());
-#if defined(HAVE_ACCELERATE)
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, Jh, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
-                    pred_out.data(), 1, 1.0f, pred_proj.data(), 1);
-#else
-        for (int i = 0; i < Jh; i++) {
-            const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
-            float s = pred_proj[i];
-            for (int k = 0; k < J.pred_hidden; k++)
-                s += row[k] * pred_out[k];
-            pred_proj[i] = s;
-        }
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, Jh, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
+                        pred_out.data(), 1, 1.0f, pred_proj.data(), 1);
+        } else
 #endif
+        {
+            for (int i = 0; i < Jh; i++) {
+                const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
+                float s = pred_proj[i];
+                for (int k = 0; k < J.pred_hidden; k++)
+                    s += row[k] * pred_out[k];
+                pred_proj[i] = s;
+            }
+        }
 
         // Batch: compute mid + logits for a window of upcoming frames.
         // Cap at 32 — between token emissions, blanks advance 1-4 frames
@@ -1828,22 +2544,25 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_batched(parakeet_
         logits_batch.resize((size_t)batch * Vt);
         for (int f = 0; f < batch; f++)
             std::copy(J.out_b.begin(), J.out_b.end(), logits_batch.data() + (size_t)f * Vt);
-#if defined(HAVE_ACCELERATE)
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, batch, Vt, Jh, 1.0f, mid_batch.data(), Jh, J.out_w.data(),
-                    Jh, 1.0f, logits_batch.data(), Vt);
-#else
-        for (int f = 0; f < batch; f++) {
-            float* lg = logits_batch.data() + (size_t)f * Vt;
-            const float* m = mid_batch.data() + (size_t)f * Jh;
-            for (int v = 0; v < Vt; v++) {
-                const float* row = J.out_w.data() + (size_t)v * Jh;
-                float s = lg[v];
-                for (int k = 0; k < Jh; k++)
-                    s += row[k] * m[k];
-                lg[v] = s;
+#if defined(HAVE_PARAKEET_BLAS)
+        if (parakeet_use_blas()) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, batch, Vt, Jh, 1.0f, mid_batch.data(), Jh,
+                        J.out_w.data(), Jh, 1.0f, logits_batch.data(), Vt);
+        } else
+#endif
+        {
+            for (int f = 0; f < batch; f++) {
+                float* lg = logits_batch.data() + (size_t)f * Vt;
+                const float* m = mid_batch.data() + (size_t)f * Jh;
+                for (int v = 0; v < Vt; v++) {
+                    const float* row = J.out_w.data() + (size_t)v * Jh;
+                    float s = lg[v];
+                    for (int k = 0; k < Jh; k++)
+                        s += row[k] * m[k];
+                    lg[v] = s;
+                }
             }
         }
-#endif
 
         // Scan batch: walk through frames using pre-computed logits.
         // For blank frames, advance by dur_skip (or 1 for dur=0 — deterministic
@@ -2912,7 +3631,7 @@ static ggml_backend_t pick_backend(bool use_gpu) {
 extern "C" struct parakeet_context_params parakeet_context_default_params(void) {
     parakeet_context_params p = {};
     p.n_threads = std::min(4, (int)std::thread::hardware_concurrency());
-    p.use_flash = false;
+    p.use_flash = true; // preserve the previously always-enabled default graph
     p.verbosity = 1;
     p.use_gpu = true;
     return p;
@@ -2929,13 +3648,59 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
+    // Apply the public thread parameter to both CPU instances, including the
+    // scheduler fallback when the selected backend is a GPU.
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
+
+    // CPU-only experiment: let the scheduler route supported encoder matmuls
+    // through a registered BLAS backend; all other operations retain CPU kernels.
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        const char* e = crispasr_env::get("CRISPASR_PARAKEET_ENCODER_BLAS");
+        ctx->ffn_blas = parakeet_ffn_mode("blas");
+        if ((e && e[0] == '1') || ctx->ffn_blas) {
+            ctx->backend_blas = ggml_backend_init_by_name("BLAS", nullptr);
+            if (ctx->backend_blas) {
+                auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx->backend_blas));
+                auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+                ctx->blas_threads = ctx->n_threads;
+                if (const char* threads = crispasr_env::get("CRISPASR_PARAKEET_ENCODER_BLAS_THREADS"))
+                    ctx->blas_threads = std::clamp(atoi(threads), 1, ctx->n_threads);
+                if (ctx->ffn_blas) {
+                    ctx->blas_threads = 1;
+                    if (const char* threads = crispasr_env::get("CRISPASR_PARAKEET_FFN_BLAS_THREADS"))
+                        ctx->blas_threads = std::clamp(atoi(threads), 1, ctx->n_threads);
+                }
+                if (set_threads)
+                    set_threads(ctx->backend_blas, ctx->blas_threads);
+            }
+        }
+    }
+
     if (!parakeet_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
         fprintf(stderr, "parakeet: failed to load '%s'\n", path_model);
         parakeet_free(ctx);
         return nullptr;
     }
 
+    if (ctx->ffn_blas) {
+        if (!ctx->backend_blas) {
+            fprintf(stderr, "parakeet.ffn: BLAS backend unavailable; retaining ordinary CPU weights\n");
+            ctx->ffn_blas = false;
+        } else if (!parakeet_cache_ffn_f32(ctx->model, ctx->backend)) {
+            fprintf(stderr, "parakeet.ffn: failed to cache F32 weights\n");
+            parakeet_free(ctx);
+            return nullptr;
+        }
+    }
     parakeet_fold_batchnorm(ctx->model, ctx->backend);
+
+    if (parakeet_bench_enabled())
+        fprintf(stderr, "parakeet_bench: backend=%s threads=%d encoder_blas=%s blas_threads=%d\n",
+                ggml_backend_name(ctx->backend), ctx->n_threads,
+                ctx->backend_blas ? ggml_backend_name(ctx->backend_blas) : "off", ctx->blas_threads);
 
     // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
     // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
@@ -2968,6 +3733,12 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
+    if (ctx->model.buf_ffn_f32)
+        ggml_backend_buffer_free(ctx->model.buf_ffn_f32);
+    if (ctx->model.ctx_ffn_f32)
+        ggml_free(ctx->model.ctx_ffn_f32);
+    if (ctx->model.buf_default_partition)
+        core_gguf::release_weight_buffer(ctx->model.buf_default_partition);
     if (ctx->model.buf_f32)
         ggml_backend_buffer_free(ctx->model.buf_f32);
     if (ctx->model.ctx_f32)
@@ -2976,6 +3747,8 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
+    if (ctx->backend_blas)
+        ggml_backend_free(ctx->backend_blas);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
     if (ctx->backend_cpu)
@@ -3184,6 +3957,7 @@ static ggml_cgraph* parakeet_build_graph_encoder_dump(parakeet_context* ctx, int
         (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
         kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
+    bp.manual_attn = !ctx->params.use_flash || core_conformer::fc_gpu_manual_attn(ctx->backend);
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask_dump);
         char nm[64];
@@ -3195,7 +3969,10 @@ static ggml_cgraph* parakeet_build_graph_encoder_dump(parakeet_context* ctx, int
         cur = tag; // chain next layer off the tagged tensor (numerics fix)
     }
 
-    ggml_set_name(cur, "enc_out");
+    // Do NOT rename cur here: after the loop it IS the dump_layer_{n-1} tag.
+    // Naming it "enc_out" deleted that tag from the graph, so the last layer's
+    // dump was never read and crispasr-diff compared the reference against an
+    // untouched zero buffer, which scored PASS (#445).
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx0);
     return gf;
@@ -3211,8 +3988,13 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
     }
 
     if (!ctx->sched) {
-        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ggml_backend_t backends[3];
+        int n_be = 0;
+        if (ctx->backend_blas)
+            backends[n_be++] = ctx->backend_blas;
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend != ctx->backend_cpu)
+            backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
         crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
@@ -3223,10 +4005,12 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
     ggml_cgraph* gf = parakeet_build_graph_encoder_dump(ctx, T_mel);
 
     ggml_backend_sched_reset(ctx->sched);
+    parakeet_pin_ffn_blas(ctx, gf);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "parakeet: dump: failed to alloc encoder graph\n");
         return 3;
     }
+    parakeet_trace_ffn(ctx, gf);
 
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
     ggml_backend_tensor_set(mel_in, mel, 0, (size_t)n_mels * T_mel * sizeof(float));
@@ -3245,7 +4029,7 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
         ggml_backend_tensor_set(local_mask_in2, lm.data(), 0, lm.size() * sizeof(float));
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "parakeet.encoder", "CRISPASR_FC_PROFILE") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "parakeet: dump: encoder graph compute failed\n");
         return 4;
     }
@@ -3343,32 +4127,37 @@ extern "C" float* parakeet_joint_project_encoder(struct parakeet_context* ctx, c
     if (!out)
         return nullptr;
 
-    for (int t = 0; t < T_enc; t++) {
-        std::vector<float> proj(JH);
-        joint_proj_enc(J, enc_frames + (size_t)t * d_model, proj);
-        memcpy(out + (size_t)t * JH, proj.data(), JH * sizeof(float));
-    }
+    std::vector<float> projected;
+    core_rnnt_ggml::Decoder gdec;
+    const bool backend_proj =
+        parakeet_init_ggml_decoder(ctx, gdec) && parakeet_gpu_encoder_projection(ctx) &&
+        core_rnnt_ggml::decoder_project_encoder(gdec, ctx->model.joint.enc_w, ctx->model.joint.enc_b, enc_frames, T_enc,
+                                                d_model, projected);
+    if (!backend_proj)
+        joint_project_encoder_cpu(J, enc_frames, T_enc, projected);
+    memcpy(out, projected.data(), projected.size() * sizeof(float));
     if (out_joint_hidden)
         *out_joint_hidden = JH;
     return out;
 }
 
-extern "C" float* parakeet_predictor_initial(struct parakeet_context* ctx, int* out_pred_hidden) {
+static float* parakeet_predictor_start(struct parakeet_context* ctx, int steps, int* out_pred_hidden) {
     parakeet_init_pred_weights(ctx);
     const auto& W = ctx->pred_w;
     const int H = W.H;
     const int blank_id = (int)ctx->model.hparams.blank_id;
 
-    // NeMo's decoder.predict(y=None, state=None, add_sos=True) feeds TWO
-    // zero inputs to the LSTM: a zero "SOS" vector prepended, plus the
-    // pad-token (also zero since y=None). This means the LSTM runs for 2
-    // timesteps on zero input. The blank embedding is all-zeros (NeMo uses
-    // padding_idx=blank_id), so feeding blank_id twice is equivalent.
     parakeet_lstm_state state;
     lstm_init_state(state, H);
     std::vector<float> pred_out;
-    predictor_step(W, blank_id, state, pred_out); // SOS (zero)
-    predictor_step(W, blank_id, state, pred_out); // pad  (zero)
+    core_rnnt_ggml::Decoder gdec;
+    const bool ggml_dec = parakeet_init_ggml_decoder(ctx, gdec);
+    for (int i = 0; i < steps; ++i) {
+        if (ggml_dec)
+            parakeet_predictor_step_ggml(ctx, gdec, blank_id, state, pred_out);
+        else
+            predictor_step(W, blank_id, state, pred_out);
+    }
 
     float* out = (float*)malloc(sizeof(float) * H);
     if (!out)
@@ -3379,13 +4168,27 @@ extern "C" float* parakeet_predictor_initial(struct parakeet_context* ctx, int* 
     return out;
 }
 
+extern "C" float* parakeet_predictor_initial(struct parakeet_context* ctx, int* out_pred_hidden) {
+    // Legacy NeMo component capture: SOS followed by the zero pad token.
+    return parakeet_predictor_start(ctx, 2, out_pred_hidden);
+}
+
+extern "C" float* parakeet_predictor_sos(struct parakeet_context* ctx, int* out_pred_hidden) {
+    // The production greedy decoder and Transformers start with ONE blank.
+    return parakeet_predictor_start(ctx, 1, out_pred_hidden);
+}
+
 extern "C" float* parakeet_joint_step(struct parakeet_context* ctx, const float* proj_enc, const float* pred_out,
                                       int* out_vocab_total) {
     parakeet_init_joint_weights(ctx);
     const auto& J = ctx->joint_w;
 
     std::vector<float> logits;
-    joint_step(J, proj_enc, pred_out, logits);
+    core_rnnt_ggml::Decoder gdec;
+    if (parakeet_init_ggml_decoder(ctx, gdec))
+        parakeet_joint_step_ggml(ctx, gdec, proj_enc, pred_out, logits);
+    else
+        joint_step(J, proj_enc, pred_out, logits);
 
     float* out = (float*)malloc(sizeof(float) * logits.size());
     if (!out)
@@ -3512,6 +4315,10 @@ extern "C" float* parakeet_encode(struct parakeet_context* ctx, const float* sam
         fprintf(stderr, "parakeet: encoder OK (%d frames)\n", T_enc);
     const int d = (int)ctx->model.hparams.d_model;
     float* out = (float*)malloc(enc.size() * sizeof(float));
+    if (!out) {
+        fprintf(stderr, "parakeet: failed to allocate %zu-byte encoder output\n", enc.size() * sizeof(float));
+        return nullptr;
+    }
     memcpy(out, enc.data(), enc.size() * sizeof(float));
     if (out_T_enc)
         *out_T_enc = T_enc;
@@ -3524,7 +4331,7 @@ extern "C" float* parakeet_encode(struct parakeet_context* ctx, const float* sam
 // (single-pass) and parakeet_decode_frames (streamed / chunked) so every path
 // emits a word list — previously decode_frames left r->words null and the CLI
 // adapter only *copies* r->words, so streamed/chunked output had no words.
-static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
+static bool parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
     // ----- Group sub-word tokens into words -----
     //
     // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
@@ -3537,40 +4344,8 @@ static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
     std::vector<parakeet_word_data> words;
     words.reserve(r->n_tokens);
 
-    // Detect tokenizer style: count tokens that look like real
-    // word-starts (leading space + at least one more char). A
-    // standalone " " token (BOS-ish) doesn't count.
-    int n_space_word_starts = 0;
-    for (int i = 0; i < r->n_tokens; i++) {
-        const char* t = r->tokens[i].text;
-        if (t[0] == ' ' && t[1] != '\0')
-            n_space_word_starts++;
-    }
-    const bool space_prefix_style = (n_space_word_starts >= 2);
-
-    auto is_punct_only = [](const char* s) {
-        if (!s || !*s)
-            return false;
-        const unsigned char* p = (const unsigned char*)s;
-        while (*p) {
-            unsigned char c = *p;
-            if (c < 0x80) {
-                if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' || c == '"' ||
-                      c == '(' || c == ')' || c == '-'))
-                    return false;
-                p++;
-            } else if (c == 0xE3 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xBF) {
-                p += 3; // U+3000–U+303F CJK Symbols and Punctuation
-            } else if (c == 0xE3 && p[1] == 0x83 && p[2] == 0xBB) {
-                p += 3; // U+30FB ・
-            } else if (c == 0xEF && p[1] == 0xBC && ((p[2] >= 0x81 && p[2] <= 0x8F) || p[2] == 0x9F)) {
-                p += 3; // U+FF01–U+FF0F, U+FF1F
-            } else {
-                return false;
-            }
-        }
-        return true;
-    };
+    const auto ranges = core_parakeet_words::token_ranges(r->n_tokens, [&](int i) { return r->tokens[i].text; });
+    size_t group = 0;
 
     auto ends_with_sentence_punct = [](const char* s) {
         size_t len = s ? strlen(s) : 0;
@@ -3608,10 +4383,10 @@ static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
             continue; // standalone space / BOS marker
 
         const bool has_leading_space = (td.text[0] == ' ');
-        const bool is_punct = is_punct_only(td.text);
-        const bool is_new_word = !is_punct && (has_leading_space || !space_prefix_style);
+        const bool is_new_word = group + 1 < ranges.size() && i == ranges[group].second;
 
         if (is_new_word && have_cur) {
+            ++group;
             flush_cur();
             cur = {};
             cur_p_sum = 0.0f;
@@ -3652,8 +4427,14 @@ static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
 
     r->n_words = (int)words.size();
     r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
+    if (!r->words) {
+        fprintf(stderr, "parakeet: failed to allocate word results\n");
+        r->n_words = 0;
+        return false;
+    }
     for (int i = 0; i < r->n_words; i++)
         r->words[i] = words[i];
+    return true;
 }
 
 extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames,
@@ -3690,8 +4471,14 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
 
     // Build result (same as the tail of parakeet_transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    if (!r)
+        return nullptr;
     r->n_tokens = (int)emitted.size();
     r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    if (!r->tokens) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
     std::string text;
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
     for (int i = 0; i < r->n_tokens; i++) {
@@ -3712,10 +4499,17 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
     if (!text.empty() && text[0] == ' ')
         text = text.substr(1);
     r->text = strdup(text.c_str());
+    if (!r->text) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     // Word grouping (issue #257): the streamed / chunked paths funnel through
     // here, so build words too — otherwise those paths emit none.
-    parakeet_group_words(r, frame_dur_cs);
+    if (!parakeet_group_words(r, frame_dur_cs)) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     return r;
 }
@@ -3852,8 +4646,14 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
 
     // 3. Build result (reuse the same result-building code as transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    if (!r)
+        return nullptr;
     r->n_tokens = (int)emitted.size();
     r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    if (!r->tokens) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
     std::string text;
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
     for (int i = 0; i < r->n_tokens; i++) {
@@ -4117,8 +4917,15 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     if (!text.empty() && text[0] == ' ')
         text = text.substr(1);
     r->text = strdup(text.c_str());
+    if (!r->text) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
-    parakeet_group_words(r, frame_dur_cs);
+    if (!parakeet_group_words(r, frame_dur_cs)) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     return r;
 }
@@ -4130,4 +4937,8 @@ extern "C" char* parakeet_transcribe(struct parakeet_context* ctx, const float* 
     char* out = strdup(r->text ? r->text : "");
     parakeet_result_free(r);
     return out;
+}
+
+extern "C" bool parakeet_is_english_only(const struct parakeet_context* ctx) {
+    return ctx && ctx->model.english_only;
 }

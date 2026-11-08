@@ -53,8 +53,23 @@ namespace CrispASR
         public int MidiNote { get; }
         /// <summary>MIDI velocity 0-127.</summary>
         public int Velocity { get; }
-        public PianoNote(double onsetSeconds, double offsetSeconds, int midiNote, int velocity)
-        { OnsetSeconds = onsetSeconds; OffsetSeconds = offsetSeconds; MidiNote = midiNote; Velocity = velocity; }
+        /// <summary>
+        /// General MIDI program 0-127 — which instrument played the note;
+        /// 128 for percussion (GM channel 10, which carries no meaningful
+        /// program); -1 when the model does not identify an instrument.
+        /// </summary>
+        /// <remarks>
+        /// Only MT3 fills this in. piano-transcription and basic-pitch report
+        /// -1 throughout — deliberately -1 and not 0, because 0 is "Acoustic
+        /// Grand Piano" and would be indistinguishable from a real answer. It
+        /// is also -1 against a native library that predates
+        /// crispasr_session_piano_note_programs, so callers can read the
+        /// sentinel rather than probing for the export.
+        /// </remarks>
+        public int Program { get; }
+        public PianoNote(double onsetSeconds, double offsetSeconds, int midiNote, int velocity,
+            int program = -1)
+        { OnsetSeconds = onsetSeconds; OffsetSeconds = offsetSeconds; MidiNote = midiNote; Velocity = velocity; Program = program; }
     }
 
     /// <summary>One pitch frame, from <see cref="Session.Pitch"/>.</summary>
@@ -187,10 +202,22 @@ namespace CrispASR
             if (n < 0) throw new InvalidOperationException($"piano failed (rc={n})");
             IntPtr p = NativeMethods.crispasr_session_piano_notes(Handle, out int nn);
             var raw = CopyView(p, nn * 4);          // {onset_ms, offset_ms, midi_note, velocity}
+
+            // Programs travel in a PARALLEL int array rather than as a fifth
+            // float, because widening the note record would break every
+            // existing reader of that layout. Absent (older native library,
+            // or a model that identifies no instrument) leaves -1, so this
+            // reads the sentinel instead of probing for the export.
+            var programs = new int[nn];
+            for (int i = 0; i < nn; i++) programs[i] = -1;
+            IntPtr gp = NativeMethods.crispasr_session_piano_note_programs(Handle, out int gn);
+            if (gp != IntPtr.Zero && gn >= nn)
+                Marshal.Copy(gp, programs, 0, nn);
+
             var notes = new PianoNote[nn];
             for (int i = 0; i < nn; i++)
                 notes[i] = new PianoNote(raw[i * 4] / 1000.0, raw[i * 4 + 1] / 1000.0,
-                    (int)raw[i * 4 + 2], (int)raw[i * 4 + 3]);
+                    (int)raw[i * 4 + 2], (int)raw[i * 4 + 3], programs[i]);
             return notes;
         }
 
@@ -242,6 +269,25 @@ namespace CrispASR
         public int ConvertSpeakerCount => NativeMethods.crispasr_session_convert_n_speakers(Handle);
         /// <summary>Native output rate of the RVC model (32k/40k/48k — not a constant).</summary>
         public int ConvertSampleRate => NativeMethods.crispasr_session_convert_sample_rate(Handle);
+        /// <summary>Latent channels used by replay noise [channels, frames].</summary>
+        public int ConvertInterChannels => NativeMethods.crispasr_session_convert_inter_channels(Handle);
+        /// <summary>Samples per frame used by replay sine noise [frames, samples].</summary>
+        public int ConvertUpsampleProduct => NativeMethods.crispasr_session_convert_upsample_product(Handle);
+
+        private static void ValidateReplayNoise(float[]? noise, int frames, Func<int> dimension, string name)
+        {
+            if (noise == null) return; // retain compatibility with older libraries for random draws
+            int width;
+            try { width = dimension(); }
+            catch (EntryPointNotFoundException e)
+            {
+                throw new NotSupportedException("Replay noise validation requires a newer native library", e);
+            }
+            if (width <= 0) throw new InvalidOperationException("native replay-noise dimension is unavailable");
+            int required = checked(frames * width);
+            if (noise.Length != required)
+                throw new ArgumentException($"{name} length {noise.Length} must equal {required}", name);
+        }
 
         /// <summary>
         /// RVC voice conversion. <paramref name="content"/> is a frame-major content
@@ -256,6 +302,8 @@ namespace CrispASR
         public float[] Convert(float[] content, float[] f0Hz, int speakerId = 0,
                                float[]? noiseZp = null, float[]? noiseSine = null)
         {
+            ArgumentNullException.ThrowIfNull(content);
+            ArgumentNullException.ThrowIfNull(f0Hz);
             int dim = ConvertContentDim;
             if (dim <= 0) throw new InvalidOperationException("loaded model has no voice-conversion arm");
             int nFrames = content.Length / dim;
@@ -263,6 +311,10 @@ namespace CrispASR
                 throw new ArgumentException($"content length {content.Length} is not a multiple of content_dim {dim}", nameof(content));
             if (f0Hz.Length != nFrames)
                 throw new ArgumentException($"f0Hz length {f0Hz.Length} must equal frame count {nFrames}", nameof(f0Hz));
+            if (speakerId < 0 || speakerId >= ConvertSpeakerCount)
+                throw new ArgumentOutOfRangeException(nameof(speakerId));
+            ValidateReplayNoise(noiseZp, nFrames, () => ConvertInterChannels, nameof(noiseZp));
+            ValidateReplayNoise(noiseSine, nFrames, () => ConvertUpsampleProduct, nameof(noiseSine));
             int n = NativeMethods.crispasr_session_convert(Handle, content, nFrames, f0Hz, speakerId, noiseZp, noiseSine);
             if (n < 0) throw new InvalidOperationException($"convert failed (rc={n})");
             IntPtr p = NativeMethods.crispasr_session_convert_audio(Handle, out int nSamples);

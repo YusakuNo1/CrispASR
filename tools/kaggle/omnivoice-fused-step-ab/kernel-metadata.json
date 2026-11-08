@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-omnivoice-fused-step-ab",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-omnivoice-fused-step-ab",
   "title": "crispasr-omnivoice-fused-step-ab",
   "code_file": "crispasr-omnivoice-fused-step-ab.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token",
-    "chr1str/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

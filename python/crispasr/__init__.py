@@ -1,7 +1,22 @@
 """CrispASR — lightweight speech recognition via ggml."""
 
 from ._binding import (
+    PuncModel,
+    TitaNet,
+    VadSpan,
+    Parakeet,
+    vad_segments,
+    vad_slices,
+    text_detect_language,
+    enhance_audio_rnnoise,
+    detect_backend_from_gguf,
+    detect_backends_from_gguf,
+    lcs_dedup_prefix_count,
+    kokoro_lang_is_german,
+    kokoro_lang_has_native_voice,
+
     AlignedWord,
+    AlignedCharacter,
     ChatAborted,
     ChatMessage,
     ChatSession,
@@ -21,10 +36,14 @@ from ._binding import (
     Session,
     SessionSegment,
     SessionWord,
+    SessionToken,
+    TokenAlternative,
     SpeakerDB,
     SpeakerEmbedder,
     agglomerative_cluster,
     align_words,
+    align_words_ultra,
+    free_aligner_cache,
     cache_dir,
     cache_ensure_file,
     detect_language_pcm,
@@ -41,8 +60,37 @@ from ._binding import (
     watermark_load_model,
 )
 
+from ._session_extra import PianoResult, ChordResult, BeatResult, TabResult
+from ._utilities import TruecaseModel, PCSModel, set_gpu_backend, backend_capabilities, c_api_version, dart_helpers_version, AudioData, load_audio, load_audio_stereo, pcm_to_wav, c2pa_sign
+
 __all__ = [
+    "AudioData", "load_audio", "load_audio_stereo", "pcm_to_wav", "c2pa_sign",
+    'PuncModel',
+    'TitaNet',
+    'VadSpan',
+    'Parakeet',
+    'vad_segments',
+    'vad_slices',
+    'text_detect_language',
+    'enhance_audio_rnnoise',
+    'detect_backend_from_gguf',
+    'detect_backends_from_gguf',
+    'lcs_dedup_prefix_count',
+    'kokoro_lang_is_german',
+    'kokoro_lang_has_native_voice',
+    'PianoResult',
+    'ChordResult',
+    'BeatResult',
+    'TabResult',
+    'TruecaseModel',
+    'PCSModel',
+    'set_gpu_backend',
+    'backend_capabilities',
+    'c_api_version',
+    'dart_helpers_version',
+
     "AlignedWord",
+    "AlignedCharacter",
     "ChatAborted",
     "ChatMessage",
     "ChatSession",
@@ -62,10 +110,14 @@ __all__ = [
     "Session",
     "SessionSegment",
     "SessionWord",
+    "SessionToken",
+    "TokenAlternative",
     "SpeakerDB",
     "SpeakerEmbedder",
     "agglomerative_cluster",
     "align_words",
+    "align_words_ultra",
+    "free_aligner_cache",
     "cache_dir",
     "cache_ensure_file",
     "detect_language_pcm",
@@ -81,4 +133,4 @@ __all__ = [
     "watermark_embed",
     "watermark_load_model",
 ]
-__version__ = "0.8.32"
+__version__ = "0.8.52"

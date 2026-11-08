@@ -14,6 +14,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 paraformer GPU path)
 #include "core/crispasr_env.h"
+#include "core/parallel_for.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h" // core_cpu_backend::is_metal(§232 CUDA/Vulkan-default gate)
 #endif
@@ -31,6 +32,7 @@
 #include <string>
 #include <vector>
 #include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 // ===========================================================================
 // Bench instrumentation — `PARAFORMER_BENCH=1` for per-stage timings.
@@ -104,6 +106,12 @@ struct paraformer_model {
 
     // CMVN
     ggml_tensor *cmvn_shift = nullptr, *cmvn_scale = nullptr;
+    std::vector<float> cmvn_shift_v, cmvn_scale_v;
+
+    // CIF cached weights
+    std::vector<float> cif_conv_w_f32, cif_conv_b_f32, cif_out_w_f32;
+    float cif_out_b_f32 = 0.0f;
+    bool cif_weights_cached = false;
 
     // Encoder: entry block(s)
     std::vector<core_sanm::BlockWeights> enc0;
@@ -192,6 +200,13 @@ static bool paraformer_load_model(paraformer_context* ctx) {
     // CMVN
     m.cmvn_shift = get("paraformer.cmvn_shift");
     m.cmvn_scale = get("paraformer.cmvn_scale");
+    if (m.cmvn_shift && m.cmvn_scale) {
+        int D_lfr = (int)m.hp.n_mels * (int)m.hp.lfr_m;
+        m.cmvn_shift_v.resize((size_t)D_lfr);
+        m.cmvn_scale_v.resize((size_t)D_lfr);
+        ggml_backend_tensor_get(m.cmvn_shift, m.cmvn_shift_v.data(), 0, D_lfr * sizeof(float));
+        ggml_backend_tensor_get(m.cmvn_scale, m.cmvn_scale_v.data(), 0, D_lfr * sizeof(float));
+    }
 
     // Encoder: entry block(s)
     m.enc0.resize(hp.n_enc_blocks0);
@@ -331,11 +346,24 @@ static std::vector<float> paraformer_compute_features(paraformer_context* ctx, c
     D_lfr = (int)hp.n_mels * (int)hp.lfr_m; // 80*7 = 560
 
     // CMVN: x = (x + shift) * scale (AddShift + Rescale)
-    if (ctx->model.cmvn_shift && ctx->model.cmvn_scale) {
-        const size_t cmvn_sz = ggml_nbytes(ctx->model.cmvn_shift);
-        if (ctx->verbosity >= 2)
-            fprintf(stderr, "paraformer: CMVN shift nbytes=%zu, D_lfr=%d, expect=%zu\n", cmvn_sz, D_lfr,
-                    (size_t)D_lfr * sizeof(float));
+    if (!ctx->model.cmvn_shift_v.empty() && !ctx->model.cmvn_scale_v.empty()) {
+        const float* shift_ptr = ctx->model.cmvn_shift_v.data();
+        const float* scale_ptr = ctx->model.cmvn_scale_v.data();
+        float* lfr_ptr = lfr.data();
+        auto apply_cmvn = [&](int t0, int t1) {
+            for (int t = t0; t < t1; t++) {
+                float* row = lfr_ptr + (size_t)t * D_lfr;
+                for (int d = 0; d < D_lfr; d++) {
+                    row[d] = (row[d] + shift_ptr[d]) * scale_ptr[d];
+                }
+            }
+        };
+        if (T_lfr >= 16) {
+            core_parallel::for_each_chunk_work(T_lfr, ctx->n_threads, (uint64_t)D_lfr * 2, 65536, apply_cmvn);
+        } else {
+            apply_cmvn(0, T_lfr);
+        }
+    } else if (ctx->model.cmvn_shift && ctx->model.cmvn_scale) {
         std::vector<float> shift_v((size_t)D_lfr);
         std::vector<float> scale_v((size_t)D_lfr);
         ggml_backend_tensor_get(ctx->model.cmvn_shift, shift_v.data(), 0, D_lfr * sizeof(float));
@@ -367,6 +395,8 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     // quantized path is defensive — but without it a quantized tensor would leave
     // dst as uninitialized garbage, silently. Mirrors pcs.cpp's read helper.
     auto read_f32 = [](ggml_tensor* t, float* dst, size_t n_elem) {
+        if (!t)
+            return;
         if (t->type == GGML_TYPE_F32) {
             ggml_backend_tensor_get(t, dst, 0, n_elem * sizeof(float));
             return;
@@ -381,48 +411,69 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
             tr->to_float(raw.data() + (size_t)r * row_size, dst + (size_t)r * ne0, ne0);
     };
 
-    std::vector<float> conv_w((size_t)D * D * 3);
-    std::vector<float> conv_b((size_t)D);
-    std::vector<float> out_w((size_t)D);
-    float out_b = 0.0f;
+    if (!ctx->model.cif_weights_cached) {
+        ctx->model.cif_conv_w_f32.resize((size_t)D * D * 3);
+        ctx->model.cif_conv_b_f32.resize((size_t)D);
+        ctx->model.cif_out_w_f32.resize((size_t)D);
+        read_f32(ctx->model.cif_conv_w, ctx->model.cif_conv_w_f32.data(), ctx->model.cif_conv_w_f32.size());
+        read_f32(ctx->model.cif_conv_b, ctx->model.cif_conv_b_f32.data(), ctx->model.cif_conv_b_f32.size());
+        read_f32(ctx->model.cif_out_w, ctx->model.cif_out_w_f32.data(), ctx->model.cif_out_w_f32.size());
+        read_f32(ctx->model.cif_out_b, &ctx->model.cif_out_b_f32, 1);
+        ctx->model.cif_weights_cached = true;
+    }
 
-    read_f32(ctx->model.cif_conv_w, conv_w.data(), conv_w.size());
-    read_f32(ctx->model.cif_conv_b, conv_b.data(), conv_b.size());
-    read_f32(ctx->model.cif_out_w, out_w.data(), out_w.size());
-    read_f32(ctx->model.cif_out_b, &out_b, 1);
-
-    // Conv1d: for each time step, sum over 3 kernel positions
-    // conv_w shape: (out_ch=D, in_ch=D, K=3) → for each output channel o:
-    //   y[t, o] = bias[o] + sum_{k=0}^{2} sum_{d=0}^{D-1} w[o, d, k] * x[t-1+k, d]
-    // But since this is depthwise-like (in_ch == out_ch == D), we can optimize.
-    // Actually it's a full Conv1d(D, D, 3) — not depthwise. Let me do it properly.
+    const float* conv_w = ctx->model.cif_conv_w_f32.data();
+    const float* conv_b = ctx->model.cif_conv_b_f32.data();
+    const float* out_w = ctx->model.cif_out_w_f32.data();
+    const float out_b = ctx->model.cif_out_b_f32;
 
     // Apply conv1d with padding=1
     std::vector<float> conv_out((size_t)T * D, 0.0f);
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < D; o++) {
-            float val = conv_b[o];
-            for (int k = 0; k < 3; k++) {
-                int ti = t - 1 + k; // padding=1: shift by 1
-                if (ti < 0 || ti >= T)
-                    continue;
-                for (int d = 0; d < D; d++) {
-                    // conv_w layout: (out_ch, in_ch, K) → w[o * D * 3 + d * 3 + k]
-                    val += conv_w[(size_t)o * D * 3 + (size_t)d * 3 + k] * enc_out[(size_t)ti * D + d];
+    float* conv_out_ptr = conv_out.data();
+    auto run_conv_chunk = [&](int t0, int t1) {
+        for (int t = t0; t < t1; t++) {
+            float* out_row = conv_out_ptr + (size_t)t * D;
+            for (int o = 0; o < D; o++) {
+                float val = conv_b[o];
+                const float* w_o = conv_w + (size_t)o * D * 3;
+                for (int k = 0; k < 3; k++) {
+                    int ti = t - 1 + k; // padding=1: shift by 1
+                    if (ti < 0 || ti >= T)
+                        continue;
+                    const float* x_ti = enc_out + (size_t)ti * D;
+                    const float* w_k = w_o + k;
+                    for (int d = 0; d < D; d++) {
+                        // conv_w layout: (out_ch, in_ch, K) → w[o * D * 3 + d * 3 + k]
+                        val += w_k[(size_t)d * 3] * x_ti[d];
+                    }
                 }
+                out_row[o] = val > 0.0f ? val : 0.0f; // ReLU
             }
-            conv_out[(size_t)t * D + o] = val > 0.0f ? val : 0.0f; // ReLU
         }
+    };
+    if (T >= 8) {
+        core_parallel::for_each_chunk_work(T, ctx->n_threads, (uint64_t)D * D * 3, 65536, run_conv_chunk);
+    } else {
+        run_conv_chunk(0, T);
     }
 
     // Linear(D, 1) → sigmoid → alphas
     std::vector<float> alphas((size_t)T);
-    for (int t = 0; t < T; t++) {
-        float val = out_b;
-        for (int d = 0; d < D; d++) {
-            val += out_w[d] * conv_out[(size_t)t * D + d];
+    float* alphas_ptr = alphas.data();
+    auto run_linear_chunk = [&](int t0, int t1) {
+        for (int t = t0; t < t1; t++) {
+            float val = out_b;
+            const float* in_row = conv_out_ptr + (size_t)t * D;
+            for (int d = 0; d < D; d++) {
+                val += out_w[d] * in_row[d];
+            }
+            alphas_ptr[t] = 1.0f / (1.0f + std::exp(-val)); // sigmoid
         }
-        alphas[t] = 1.0f / (1.0f + std::exp(-val)); // sigmoid
+    };
+    if (T >= 16) {
+        core_parallel::for_each_chunk_work(T, ctx->n_threads, D, 65536, run_linear_chunk);
+    } else {
+        run_linear_chunk(0, T);
     }
 
     // CIF accumulation: integrate alphas, fire when ≥ 1.0
@@ -624,8 +675,15 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr);
         ggml_set_name(inp, "features");
         ggml_set_input(inp);
+        // SANMEncoder with input_layer "pe": xs *= sqrt(output_size), then
+        // SinusoidalPositionEncoder adds sin|cos of positions 1..T over the input
+        // width. Missing before 2026-09: encoder_layer_0 sat at cos ~0.95 against
+        // upstream while the text still came out right.
+        ggml_tensor* pe_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr);
+        ggml_set_name(pe_in, "enc_pe");
+        ggml_set_input(pe_in);
 
-        ggml_tensor* cur = inp;
+        ggml_tensor* cur = ggml_add(ctx0, ggml_scale(ctx0, inp, std::sqrt((float)D)), pe_in);
 
         // Encoder: entry block(s)
         int enc_layer_idx = 0;
@@ -708,12 +766,41 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             fprintf(stderr, "paraformer: encoder input OK: T_lfr=%d, D_lfr=%d, bytes=%zu\n", T_lfr, D_lfr_actual,
                     lfr_bytes);
         ggml_backend_tensor_set(inp, lfr.data(), 0, lfr_bytes);
+        // sinusoidal PE (FunASR SinusoidalPositionEncoder): positions 1..T,
+        // depth = input width; first half sin, second half cos
+        const int Dp = D_lfr_actual, half = Dp / 2;
+        const float log_inc = std::log(10000.0f) / (float)(half - 1);
+        std::vector<float> inv_freq((size_t)half);
+        for (int i = 0; i < half; i++) {
+            inv_freq[i] = std::exp(-log_inc * (float)i);
+        }
+        std::vector<float> pe((size_t)Dp * (size_t)T_lfr);
+        float* pe_ptr = pe.data();
+        const float* inv_freq_ptr = inv_freq.data();
+        auto compute_pe = [&](int t0, int t1) {
+            for (int t = t0; t < t1; t++) {
+                float* row_sin = pe_ptr + (size_t)t * Dp;
+                float* row_cos = row_sin + half;
+                const float t_plus_1 = (float)(t + 1);
+                for (int i = 0; i < half; i++) {
+                    const float a = t_plus_1 * inv_freq_ptr[i];
+                    row_sin[i] = std::sin(a);
+                    row_cos[i] = std::cos(a);
+                }
+            }
+        };
+        if (T_lfr >= 16) {
+            core_parallel::for_each_chunk_work(T_lfr, ctx->n_threads, (uint64_t)Dp * 4, 65536, compute_pe);
+        } else {
+            compute_pe(0, T_lfr);
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_pe"), pe.data(), 0, pe.size() * sizeof(float));
     }
     if (ctx->verbosity >= 2)
         fprintf(stderr, "paraformer: running encoder graph...\n");
     {
         paraformer_bench_stage _b("encoder");
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(ctx->sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: encoder graph compute failed\n");
             ggml_free(ctx0);
             return "";
@@ -855,7 +942,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_backend_tensor_set(enc_tensor, enc_out.data(), 0, enc_out.size() * sizeof(float));
     {
         paraformer_bench_stage _b("decoder");
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(ctx->sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: decoder graph compute failed\n");
             ggml_free(ctx0);
             return "";
@@ -938,6 +1025,8 @@ paraformer_context_params paraformer_context_default_params() {
 }
 
 paraformer_context* paraformer_init_from_file(const char* path, paraformer_context_params params) {
+    if (!path || !path[0])
+        return nullptr;
     auto* ctx = new paraformer_context();
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
     ctx->flash_attn = params.flash_attn;
@@ -949,6 +1038,7 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
         delete ctx;
         return nullptr;
     }
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // Backend selection (§232). Weights already load onto ctx->backend via
     // core_gguf::load_weights, so pointing that at a GPU backend is the whole fix.
     //   * CRISPASR_PARAFORMER_GPU=1 forces GPU on ANY backend; =0 forces CPU.
@@ -983,12 +1073,12 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
     ctx->model_path = path;
     if (!core_gguf::load_weights(path, ctx->backend, "paraformer", ctx->wl)) {
         fprintf(stderr, "paraformer: failed to load '%s'\n", path);
-        delete ctx;
+        paraformer_free(ctx);
         return nullptr;
     }
 
     if (!paraformer_load_model(ctx)) {
-        delete ctx;
+        paraformer_free(ctx);
         return nullptr;
     }
 

@@ -8,10 +8,10 @@ throughput win — the honest null was documented; this settles it on a GPU.
 ## Run
 ```bash
 # 1. Merge the code to main (or push the branch) so the kernel can clone it.
-# 2. Ensure the private dataset chr1str/crispasr-hf-token exists (HF_TOKEN secret).
+# 2. Ensure the private dataset ${KAGGLE_ACCOUNT}/crispasr-hf-token exists (HF_TOKEN secret).
 bash push.sh
-kaggle kernels status  chr1str/crispasr-server-workers-cuda
-kaggle kernels output  chr1str/crispasr-server-workers-cuda -p ./out
+kaggle kernels status  ${KAGGLE_ACCOUNT}/crispasr-server-workers-cuda
+kaggle kernels output  ${KAGGLE_ACCOUNT}/crispasr-server-workers-cuda -p ./out
 ```
 
 ## Knobs (env)

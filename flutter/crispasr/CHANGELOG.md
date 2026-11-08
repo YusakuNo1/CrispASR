@@ -1,5 +1,256 @@
 # Changelog
 
+## Unreleased
+
+## 0.8.52
+
+* **Alignment:** Qwen3-ForcedAligner-Ultra F16 GGUF in the model registry; experimental Ultra local-head alignment (#579).
+* **Speech synthesis:** Qwen3-TTS can keep only the codec on Vulkan with the talker on CPU (#585); `--voice-dir` bare names resolve into clone references (#584).
+* **Packaging:** the Linux HIP tarball falls back to CPU when ROCm/hipBLAS is missing (#586).
+
+## 0.8.51
+
+* **Bindings:** session auto-chunking and duration-proportional token budgets (#574).
+* **Speech synthesis:** optional Qwen3-TTS codec capture and VoxCPM2 long-sentence VAE improvements (#576, #164).
+* **Fixes:** environment flags now recognize false, off, and no as disabled (#572).
+
+## 0.8.50
+* **Separation:** native Mini-BS-RoFormer V2.5 (#562) and SCNet / SCNet-large
+  (#566) source separation through CLI, server and Session.
+* **Recognition:** MOSS-Transcribe-Diarize beam size and seeded sampling (#564);
+  moss-audio encodes only real audio (#569); Haas-ja-v1.0 (#561).
+* **LID:** no silent LID model downloads without consent (#570).
+* **Voice conversion:** MeanVC2 streaming zero-shot conversion.
+
+## 0.8.49
+
+* **Native speech:** integrate Audio8-TTS (ArkTTS 0.6B) dual-autoregressive TTS
+  and causal neural vocoder; chunked causal decoding bounds memory (<2.5 GB) for
+  arbitrary audio lengths, with FASTCONV k=1 bypass and dual-transformer KV caching.
+* **Recognition:** support free-form transcription context in Qwen3-ASR (#559);
+  standalone LID mode exits before model load, and dominant language detection
+  spans full recordings (#560).
+* **Streaming & Context:** adaptive strided audio context gating for Hikari and
+  Parakeet; Moonshine attention mask caching.
+* **Bindings:** synchronize audio context and strided refresh parameters across
+  Dart, Go, Rust, Python, JavaScript, and C ABI.
+
+## 0.8.48
+
+* **Native speech:** restore original Melo/OpenVoice conditioning, duration and
+  decoder behavior; preserve output rates and reject invalid speaker choices.
+* **Models:** managed Melo V2 downloads select the qualified F16 BERT companion
+  with immutable source pins and separate Apache-2.0 attribution.
+* **Recognition and CLI:** preserve standalone Parakeet word boundaries and
+  make standalone language detection exit before loading an ASR model.
+* Public Dart interfaces are unchanged. CPU/T4 speech acceptance is bounded to
+  the documented English profile; additional GPU families remain unverified.
+
+## 0.8.47
+
+* **Packaging:** Linux GPU Python wheels and native bundles (#557). Dart
+  interfaces and native inference are unchanged.
+
+## 0.8.46
+
+* **Models:** the managed Nemotron download now selects the original-qualified
+  F16 model with its OpenMDW-1.1 notices; the former plain Q4 default failed
+  fixed original-model controls. Public Dart interfaces are unchanged.
+
+## 0.8.45
+
+* **Native speech:** restore original CSM rotary scaling for both transformer
+  stacks and shared CLI/C ABI initialization.
+* **Models:** add the qualified Granite Speech5 F16/Q4_K profiles and model-matched
+  Qwen3-TTS designed voice packs with retained source/license provenance.
+* **Bindings:** decode incomplete UTF-8 safely in Dart results and preserve
+  native synthesis errors in the Rust wrapper. Public Dart interfaces are unchanged.
+
+## 0.8.44
+
+* **Native results and alignment:** preserve owned Session token metadata and
+  structured diarization results; bound long CTC encoder windows and expose
+  aligner cache release through Python/native APIs.
+* **Native runtime:** fix Dolphin decoding, Breeze instructions/reference audio
+  and server voice handling, Whisper callback/parallel timelines, and TTS
+  reference ownership and sample rates.
+* **Bindings:** harden speaker-result validation, native lifetimes and callback
+  ownership across the supported wrappers. Raw low-level handles still require
+  caller serialization.
+* **Distribution:** ship both public native headers consistently and verify
+  clean installed-wheel loading. Optional CANN NZ caching stays off by default;
+  experimental quantizations and unmerged OmniVoice/Conv1D changes are excluded.
+* **Model downloads:** retain explicit ordinary-NC opt-ins and require separate
+  acknowledgment for OmniVoice companion terms and OpenRAIL restrictions.
+
+## 0.8.43
+
+* **Transcript correctness:** preserve UTF-8 continuation bytes during cleanup
+  and sanitize malformed result bytes before native callbacks/getters publish
+  them, retaining strict binding decoding.
+* **Session audio/control fixes:** VoxCPM2 synthesis reports its native 48 kHz
+  rate; Breeze sessions forward temperature, 64-bit seed and token limits,
+  including restoration of the model limit when cleared.
+* **Native discovery:** canonical capabilities include Hikari and German
+  Dattazigzag Moonshine; ggml plugins are found beside the loaded native library.
+* **Native inference:** Nemotron frontend padding/length masks match reference
+  behavior; HTDemucs Q8 attention avoids unsupported Metal contiguous copies.
+* **Distribution:** packages use immutable source pins and checked CUDA runtime
+  pairing. Experimental quantizations and pending Breeze instruction/voice-cache
+  features are excluded. The Dart API is unchanged.
+
+## 0.8.42
+
+* **Persistent streaming:** `streamKind` exposes unavailable, rolling-window,
+  persistent-cache and text-prefix implementations. Nemotron, Qwen3-ASR and
+  Voxtral use their native streaming paths through the session API.
+* **German Moonshine:** native and ONNX deployments, model detection and
+  streaming/session support.
+* **Live translation:** Marian translation models and direction selection;
+  Hikari simultaneous English ASR and speech translation to German, Japanese
+  and Russian.
+* **Native fixes:** Arabic word/character alignment, Qwen3 hotword prompt
+  forwarding, MiMo device/verbosity settings, and MioTTS output/voice handling.
+* **Distribution:** ggml Metal fixes, synchronized bindings/capabilities and
+  improved Windows CUDA diagnostics. Experimental PR #492 precision changes
+  remain excluded; production model/precision defaults are unchanged.
+
+## 0.8.41
+
+* **Native Index-Echo:** validated 9B F16 translation with a matching decoder,
+  metadata detection through the existing session API, and protected 2B Q8
+  regression checks. The accepted 9B pair requires approximately 17.9 GiB of
+  model storage; experimental 9B quantizations remain unpublished.
+* **Native inference:** CPU thread requests are honored by Nemotron, Paraformer
+  and Dia; Dia fixes enable complete dialogue synthesis without the hidden
+  CPU generation cap. Nemotron realtime CPU inference uses aligned windows.
+* **Windows distribution:** matching CUDA 12.6 CLI, library and runtime assets
+  alongside CUDA 12.8/13, with runtime hash checks and an explicit AVX2 library
+  CPU floor. Native A100/H100 target coverage is restored.
+* The Dart API is unchanged.
+
+## 0.8.40
+
+* **Native ASR:** Phonon-2 English recognition through the shared Parakeet
+  engine, with model metadata detection and registry selection. Q8_0 is the
+  recommended export; native CPU decoder optimizations retain fallback gates.
+* **AudioSeal:** graph and scheduler capacity scale with audio length, fixing
+  embedding/detection aborts on clips longer than approximately two seconds.
+* **VoxCPM2:** batched RALM prefill defaults on for native AVX2/F16C CPU F16/Q8
+  models. Q4 remains opt-in after failing strict state/speech parity checks.
+* **Native distribution:** the standard Intel macOS CLI restores AVX2/FMA/F16C
+  kernels with Accelerate; a separate CPU-legacy archive keeps the SSE2 floor.
+  Both Intel archive variants require and bundle the matching C2PA sidecar.
+
+## 0.8.39
+
+* **VoxCPM2 synthesis:** the bundled native library processes the TSLM prompt
+  once in a batched graph, honors the requested thread count in eager matmuls,
+  reduces VAE weight setup, and enables faster depthwise VAE convolutions on
+  Vulkan. Serial and legacy prefill fallbacks remain available.
+* **Native distribution:** separate Intel and Apple Silicon macOS CLI archives;
+  the Intel archive uses CPU/Accelerate. The existing macOS filename remains
+  an arm64 alias. Fixed the macOS quantizer's bundled C2PA search path.
+* **Quantizer:** tensor-type overrides preserve scalar/one-dimensional tensor
+  precision, avoiding F16 bias/norm crashes during CPU synthesis.
+* **Maintenance:** credential scanning, branch-scoped heavy verification, and
+  CPU reference/roundtrip workflows. The Dart API is unchanged.
+
+## 0.8.38
+
+* **`DiarizeMethod.sortformer`** (C ABI method 5, #466) with a
+  `sortformerModelPath` argument to `diarizeSegments`, which also returns
+  Sortformer's audio-derived turns through `outTurns`. 0.8.37 shipped the
+  method in the native library, but the Dart enum stopped at `foxNose`, so
+  Dart callers could not select it.
+
+## 0.8.37
+
+* **Phrase scoring:** `CrispasrSession.scoreTexts(pcm, texts, language:,
+  prompt:)` returns log P(text | audio) and a token count for each candidate
+  (whisper sessions), for picking the likeliest of a known set of phrases.
+  All candidates are decoded in one batch.
+* **Strict grammars:** `setGrammarStrict(true)` forbids end-of-text until the
+  grammar can be complete, so a constrained decode no longer stops
+  mid-phrase. Off by default.
+* **New in the bundled native library:** Raon-Speech-9B speech-to-text,
+  parakeet-ultra / parakeet-redux, and Nemotron-3-Diarization
+  (`sortformer`) with streaming presets.
+* **TTS:** letters followed by digits ("d4", "B52") keep their number in
+  every language; German reads a lone letter by its name.
+
+## 0.8.36
+
+* **New ASR backends in the bundled native library:** Dolphin CN-Dialect
+  (`dolphin`; Mandarin plus Chinese dialects, a two-level
+  `sourceLanguage` such as `zh-SICHUAN`), X-ASR zh-en (`xasr`; streaming
+  Zipformer2 transducer), Hojo-ASR-Multi-V1 (`hojo-asr`), and registry
+  entries for Orukeet and Confucius4-R2T2.
+* **Piano transcription** gains Onsets & Frames and hFT-Transformer
+  (`onsets-and-frames`, `hft-transformer`), both auto-downloading and
+  reachable through the existing piano-notes accessors.
+* **Front-end fixes** in the native library change transcripts for Kaldi-fbank
+  models (FireRedASR, SenseVoice, Paraformer and relatives), whose mel
+  triangles are now built in mel space as the reference does.
+* **Session TTS:** three defects fixed that only the session ABI (and so this
+  package) could hit; see the v0.8.36 release notes for details.
+
+## 0.8.35
+
+* **`pianoNotesWithPrograms()`** reports the General MIDI program of each
+  transcribed note — which instrument played it. `0`-`127` is a GM program,
+  `128` is percussion, and `-1` means the model does not identify an
+  instrument. Only MT3 fills it in; `piano-transcription` and `basic-pitch`
+  report `-1` throughout, and so does any native library predating the
+  export, so callers read the sentinel rather than probing for the symbol.
+  MT3's multi-instrument transcription was previously flattened to a single
+  part before any caller could see it.
+* **Basic Pitch convolutions gain SIMD and threading** in the native library:
+  3.59x on x86-64 and 2.67x on Apple Silicon at four threads, byte-identical
+  output, on by default with `CRISPASR_BASIC_PITCH_FASTCONV=0` as the way
+  back.
+* Fixes two build-guard defects around the piano accessors: note storage
+  accidentally required CREPE to be compiled in, and
+  `crispasr_session_piano_notes` was guarded more narrowly than
+  `crispasr_session_piano_n_notes`, so a build with MT3 or basic-pitch but
+  without piano-transcription reported a note count and returned `nullptr`.
+
+## 0.8.34
+
+* **Breeze-TTS-2 (`bt2-tts`)** adds plain synthesis, voice cloning, and voice
+  design. Its GGUFs retain the upstream non-commercial licence.
+* **Linux CUDA 12 and CUDA 13 CLI packages return** after v0.8.33's release
+  jobs failed to link their dynamically loaded ggml backends (#442).
+* **Parakeet long audio is bounded at the encoder allocation itself** and uses
+  cgroup-aware available memory, preventing the intermittent 123.6 GB request
+  and NULL dereference reported on a 47.5-minute input (#441).
+* **Sidon splits oversized recordings by default** instead of asking users to
+  do it manually, while inputs that fit keep the same single-pass path (#431).
+* M2M100/WMT21 translation now uses each checkpoint's beam-5, 200-token decode
+  defaults in both CLI and library sessions, avoiding repetition collapse
+  (#439). Zonos rejects unsupported voice cloning and switches per-request
+  languages reliably (#435).
+
+## 0.8.33
+
+* **Two new TTS backends**: Supertonic-3 (`--backend supertonic`, 44.1 kHz
+  non-autoregressive flow matching, 10 voices, OpenRAIL-M) and FireRedTTS3
+  (`--backend fireredtts3`, zero-shot voice cloning, Apache-2.0) — closing the
+  last model in #377.
+* **Sidon accepts long audio** (#431). The input cap now derives from a memory
+  budget instead of a hardcoded frame count, and `CRISPASR_SIDON_SPLIT=1`
+  restores very long files as N exact passes cut at energy minima.
+* **Zonos no longer emits noise for non-Latin scripts** (#435). A missing
+  phonemizer now refuses loudly instead of synthesising a near-empty prompt,
+  and the per-request language is honoured.
+* **New API**: `set_voice_samples()` (#432), `backend_caps()` /
+  `list_backends_with_caps()` and `detect_backends()` (#433) — the last names
+  every backend that can open a given file, not just one.
+* **Built-in G2P replaces espeak-ng for en/de/fr** in zonos, removing that
+  GPL-3.0 dependency for those languages.
+* Fixes: supertonic q4_k was unloadable; a shared CAM++ pooling defect affecting
+  five backends; `voxcpm2-vae` reachable by `-m auto`.
+
 ## 0.8.32
 
 * **Four new backends**: Raon-OpenTTS speech synthesis, Quds Persian

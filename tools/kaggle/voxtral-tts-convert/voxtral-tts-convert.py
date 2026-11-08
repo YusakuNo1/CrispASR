@@ -8,8 +8,8 @@ The model is ~8 GB in BF16 (consolidated.safetensors). The converter handles:
   - 20 preset voice embeddings
   - Tekken tokenizer (131K vocab)
 
-Push (under chr1s4):
-  export KAGGLE_API_TOKEN=<chr1s4 token>
+Push (under $KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/voxtral-tts-convert
 """
 

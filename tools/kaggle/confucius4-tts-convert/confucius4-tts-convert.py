@@ -14,11 +14,11 @@ The T2S model is a GPT-2 backbone (24L, d=1280, 20h) with:
   - Semantic head: Linear(1280, 8194)
 
 REQUIREMENTS:
-  - chr1str/crispasr-hf-token dataset mounted (HF token for upload)
+  - ${KAGGLE_ACCOUNT}/crispasr-hf-token dataset mounted (HF token for upload)
   - No GPU needed (CPU conversion only)
 
-Push (under chr1str):
-  export KAGGLE_API_TOKEN=KGAT_cb3f25c81b9e65d706ebcf655f1daa42
+Push (under $KAGGLE_ACCOUNT):
+  # Kaggle CLI auth: ~/.kaggle/access_token (never commit a token; see tests/test_no_secrets.py)
   python -m kaggle kernels push -p tools/kaggle/confucius4-tts-convert
 """
 

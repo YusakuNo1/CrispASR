@@ -87,11 +87,24 @@ const float* qwen3_tts_get_runtime_spk_emb(struct qwen3_tts_context* ctx, int* o
 float* qwen3_tts_cenc_extract_stage(struct qwen3_tts_context* ctx, const float* audio, int n_samples,
                                     const char* stage_name, int* out_n);
 
+// Encode 24 kHz mono float32 PCM straight to codec codes, without going
+// through a WAV file on disk. qwen3_tts_set_voice_prompt() has always been
+// able to do this, but only from a path and only as a side effect of setting
+// a voice prompt — so a caller that already holds PCM and wants nothing but
+// the codes (Breeze TTS 2's Voice Clone reference segment, #412) had to write
+// a temp file and then adopt speaker state it did not ask for.
+// Writes a malloc'd [T_frames, 16] row-major array to *out_codes (free with
+// qwen3_tts_codes_free) and T_frames to *out_n_frames. Returns 0 on success.
+// Requires a context whose codec encoder is loaded.
+int qwen3_tts_encode_pcm_to_codes(struct qwen3_tts_context* ctx, const float* pcm, int n_samples, int32_t** out_codes,
+                                  int* out_n_frames);
+
 // Load a voice pack GGUF (produced by `models/bake-qwen3-tts-voice-pack.py`)
 // containing one or more `(spk_embedding, ref_code)` pairs extracted via
 // the official qwen-tts package. Required for voice-clone synthesis
-// until the runtime ECAPA speaker_encoder + codec encoder forwards
-// land.  Returns 0 on success.
+// or supply a runtime WAV prompt instead. Packs must match the model
+// dimension (0.6B: 1024, 1.7B: 2048). Returns 0 on success, -1 on
+// invalid/incompatible packs; failed loads preserve the current pack.
 int qwen3_tts_load_voice_pack(struct qwen3_tts_context* ctx, const char* path);
 
 // Select an active voice from the loaded voice pack by name.
@@ -310,6 +323,9 @@ void qwen3_tts_set_n_threads(struct qwen3_tts_context* ctx, int n_threads);
 // non-zero value to override).
 void qwen3_tts_set_temperature(struct qwen3_tts_context* ctx, float temperature);
 void qwen3_tts_set_seed(struct qwen3_tts_context* ctx, uint64_t seed);
+// Attach per-request metadata for opt-in local codec capture. This does not affect synthesis.
+void qwen3_tts_set_capture_metadata(struct qwen3_tts_context* ctx, const char* request_id, const char* source_text,
+                                    const char* voice, const char* instruction, float speed, int suppress_capture);
 
 // Compute the 128-mel log-mel spectrogram used by the speaker encoder
 // from 24 kHz mono audio. Returns malloc'd (T_mel × 128) row-major float32.

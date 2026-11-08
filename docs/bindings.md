@@ -1,9 +1,10 @@
 # Language bindings
 
-All wrappers are thin shells over the same C-ABI surface in
-`src/crispasr_c_api.cpp`. Anything the CLI can do — transcribe, VAD,
-diarize, LID, align, download — is one function call in every
-language.
+The wrappers expose parts of the shared C ABI in `src/crispasr_c_api.cpp`.
+Coverage differs by language; adding a native function does not expose it
+through every wrapper. The [2026-10-18 source audit](historical/binding-gaps-2026-10-18.md)
+records confirmed gaps and PLAN.md tracks their repair. Python's separate
+[API inventory](python-api-coverage.md) does not establish other-language parity.
 
 ## Session audio-format getters (#332)
 
@@ -22,18 +23,50 @@ All return `0` on a NULL/invalid session. Exposed as `output_sample_rate` /
 `inputChannels()` / `outputChannels()` (Java, C# `OutputSampleRate()` etc.),
 and `sessionOutputSampleRate()` etc. in the WASM/JS binding.
 
+For MioTTS, the output getter reads the loaded codec metadata: public MioCodec-v2
+models return 44100 Hz; missing legacy metadata defaults to 24000 Hz. Use the
+returned rate when saving or playing synthesized PCM. Load a preset embedding
+GGUF with `set_voice` / `SetVoice` / `setVoice`; sampling temperature and seed
+are forwarded to the native runtime. The Python getter is
+`session.output_sample_rate()`, Go uses `OutputSampleRate()`, and Dart exposes
+`outputSampleRate`.
+
+## Streaming implementation query
+
+`crispasr_session_stream_kind(session)` returns 0 for unavailable streaming,
+1 for rolling windows, 2 for persistent model caches and 3 for text-prefix
+streaming (accumulated audio is re-encoded). It describes the loaded model;
+legacy Moonshine ONNX is batch-only even when the backend name is shared.
+
+| Wrapper | Query |
+|---|---|
+| Python / Rust | `session.stream_kind()` |
+| Go / C# | `session.StreamKind()` |
+| Java | `session.streamKind()` |
+| Dart | `session.streamingKind` |
+| Ruby | `CrispASR::Session.stream_kind(handle)` |
+| WASM/JS | `sessionStreamKind()` for the session opened with `ttsOpenExplicit` |
+
+The WebSocket streaming server includes `stream_kind` in its ready event.
+Python and Dart return 0 when an older library lacks the query. Other compiled
+wrappers require the matching native library. The model session must outlive
+its stream; allow only one active stream or inference call per model session.
+
 ## Session setter reference
 
-All generation-control setters are available in every binding. Each
-call is a thin proxy over the C-ABI function of the same name.
-Setters that return an error code `-2` are soft no-ops — the active
-backend doesn't expose that knob, but the call is safe to make.
+The table below maps intended generation controls to binding names; it is not
+a complete verified availability matrix. Check the actual public method and
+native call in each wrapper. Error-code meanings are function-specific:
+`-2` can mean an unsupported backend knob, but for `set_sensitivity` it means an
+invalid preset and must raise. Do not universally swallow this code.
 
 | C-ABI setter | Bindings name (Python/Rust/Go/Java) | Notes |
 |---|---|---|
 | `set_temperature(temp, seed)` | `set_temperature` / `set_temperature` / `SetTemperature` / `setTemperature` | ASR + TTS backends that sample; rc=-2 = no backend supports it |
 | `set_tts_seed(seed)` | `set_tts_seed` / `set_tts_seed` / `SetTTSSeed` / `setTtsSeed` | Chatterbox, vibevoice, qwen3-tts, orpheus; rc=-2 for others |
 | `set_max_new_tokens(n)` | `set_max_new_tokens` / `set_max_new_tokens` / `SetMaxNewTokens` / `setMaxNewTokens` | AR backends; ≤ 0 clears override |
+| `set_autochunk(enabled, chunk_seconds)` | `set_autochunk` / `set_autochunk` / `SetAutochunk` / `setAutochunk` | Auto-chunking controls for long audio (> 30s); enabled=false disables slicing |
+| `set_max_new_tokens_per_second(rate, minimum)` | `set_max_new_tokens_per_second` / `set_max_new_tokens_per_second` / `SetMaxNewTokensPerSecond` / `setMaxNewTokensPerSecond` | Dynamic token budget per piece: max(minimum, round(rate * piece_duration_seconds)) |
 | `set_frequency_penalty(f)` | `set_frequency_penalty` / `set_frequency_penalty` / `SetFrequencyPenalty` / `setFrequencyPenalty` | AR backends; ≤ 0 disables |
 | `set_tts_steps(n)` | `set_tts_steps` / `set_tts_steps` / `SetTTSSteps` / `setTtsSteps` | Chatterbox S3Gen CFM steps; vibevoice DPM-Solver++ steps; kugelaudio; tada FM steps; irodori flow-matching ODE steps |
 | `set_tts_num_candidates(n)` | `set_tts_num_candidates` / `set_tts_num_candidates` / `SetTTSNumCandidates` / `setTtsNumCandidates` | TADA flow-matching timing candidates ranked per token (default 4); rc=-2 for others |
@@ -55,18 +88,22 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_sensitivity(preset)` | `set_sensitivity` / `set_sensitivity` / `SetSensitivity` / `setSensitivity` | The four thresholds above as one named bundle: `conservative` / `balanced` / `aggressive` (aliases `strict` / `default` / `loose`). `balanced` is the shipped defaults, so it is always a no-op. **rc=-2 means an unknown preset and every wrapper raises** — a typo must never decode silently at the defaults. A later `set_fallback_thresholds` overrides it. HTTP: the `sensitivity` form field, applied before the individual threshold fields so those still win. |
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
 | `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
-| `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b, mimo-asr, higgs-stt, ark-asr, moss-audio, moss-diarize, mini-omni2, lfm2-audio). Empty string clears. |
+| `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, raon-speech, glm-asr, gemma4-e2b, mimo-asr, higgs-stt, ark-asr, moss-audio, moss-diarize, mini-omni2, lfm2-audio). Empty string clears. |
 | `set_punc_model(alias\|path)` | `set_punc_model` / `set_punc_model` / `SetPuncModel` / `setPuncModel` | Load FireRedPunc/PCS punctuation restoration on the session (`auto`/`firered`/`fullstop`/`punctuate-all`/`pcs`/path; auto-downloads). Restores punctuation on backends that emit none (parakeet RNNT/CTC, …). `"none"`/`""` unloads. (Also Java/Ruby.) |
-| `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection). Empty string clears. (All six wrappers.) |
+| `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection; Qwen3 uses the system turn and preserves the language prefill). Empty string clears. (All six wrappers.) |
 | `set_tts_phonemes(ipa)` | `set_tts_phonemes` / `set_tts_phonemes` / `SetTTSPhonemes` / `setTtsPhonemes` | #316: synthesize the given phonemes verbatim, skipping the G2P — the seam between text processing and the acoustic model. Use it to reproduce another implementation's pronunciation, or to tell a G2P bug from a model bug. Empty clears; rc=-2 on a backend with no phonemes-in call (kokoro and piper have one). Server: `"phonemes"` on `/v1/audio/speech`. CLI: `--tts-phonemes`. (All wrappers.) |
+| `set_audio_ctx(audio_ctx)` | `set_audio_ctx` / `set_audio_ctx` / `SetAudioCtx` / `setAudioCtx` | Whisper encoder audio context size in 20 ms frames (default: `0` = full 1500 pad; `1024` for 33% streaming speedup). (All wrappers.) |
+| `set_hikari_refresh_stride(stride)` | `set_hikari_refresh_stride` / `set_hikari_refresh_stride` / `SetHikariRefreshStride` / `setHikariRefreshStride` | Hikari strided encoder refresh interval (default: `16` strided, `0` = exact sliding baseline). (All wrappers.) |
+| `set_parakeet_att_context(left, right)` | `set_parakeet_att_context` / `set_parakeet_att_context` / `SetParakeetAttContext` / `setParakeetAttContext` | Parakeet local attention window in encoder frames (~80 ms each). Bounds encoder memory to O(T·window). (All wrappers.) |
 | `set_g2p_dict(source)` | `set_g2p_dict` / `set_g2p_dict` / `SetG2PDict` / `setG2pDict` | Select the G2P pronunciation dictionary for TTS phonemization (`olaph`/`open-dict`/path). (All six wrappers.) |
 
 ## Result field reference
 
 Everything a transcription result carries is read back through per-index
 accessors on the opaque `crispasr_session_result`, so adding a field is a new
-symbol rather than a layout change — old callers keep working. Every wrapper
-exposes them as struct/class members on its segment type.
+symbol rather than a layout change — old callers keep working. Wrappers must
+explicitly copy each field into their result types. Several still omit shared
+session tokens or other metadata; see the source audit linked above.
 
 | C-ABI accessor | Member (Python/Rust/Go/Dart/Java/C#/Ruby) | Notes |
 |---|---|---|
@@ -110,26 +147,24 @@ exposes them as struct/class members on its segment type.
 > `ctc_vocab` / `CtcVocab` returns raw token pieces where the backend exposes a
 > CTC vocabulary.
 
-| Language | Status | Surface |
-|---|---|---|
-| C / C++ | ✓ | Full (the C-ABI is the source of truth) |
-| Python | ✓ | Full — transcribe, VAD, diarize, LID, align, registry |
-| Rust | ✓ | Full — same surface as Python |
-| Dart / Flutter | ✓ | Full — used by [CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver) |
-| Go | ✓ | Full (all 11 capabilities) |
-| Java | ✓ | Transcribe + align + LID; full session-setter parity (JNA) |
-| Ruby | ✓ | Transcribe; full session-setter parity (C ext) |
-| C# / .NET | ✓ | Transcribe + align + LID + VAD + the music task surface; full session-setter parity (P/Invoke). CI-tested on ubuntu + windows (`bindings-csharp.yml`) |
-| JavaScript / WASM | ✓ | `asrOpen`/`asrTranscribe` + session setters (backend-agnostic); plus the whisper-only `init`/`full_default` and the TTS surface. Built with emcc. |
+| Language | Current scope / verification |
+|---|---|
+| C / C++ | Public C ABI is the wrapper reference; CLI/native task surfaces still differ. |
+| Python | Session-header source census with documented equivalents/retired cases; the eight additional audio/container/channel functions in `crispasr.h` are now implemented and covered by the expanded guard. Local behavior probes pass; native/model acceptance pending. |
+| Dart / Flutter | Broad ASR/auxiliary APIs, piano/programs and beats; shared tokens, additional task/TTS operations and missing-time fixes pending. |
+| Go | ASR/auxiliary APIs and session controls; metadata and task/TTS gaps pending. |
+| Rust | ASR/auxiliary APIs, safe PCM voice references; safe result fields and task/TTS gaps pending. |
+| Java | ASR/auxiliary APIs and session controls; result and task/TTS gaps pending. |
+| Ruby | ASR/auxiliary APIs and session controls; result and task/TTS gaps pending. |
+| C# / .NET | Broad music/conversion API; shared tokens, replay-noise validation and initial TTS additions now have model-free .NET/ABI proof; auxiliary API/hosted acceptance remains pending. Dedicated workflow: `bindings-csharp.yml`. |
+| JavaScript / WASM | Session ASR/setters, piano/programs and chords; result and additional task/TTS gaps pending, subject to WASM backend availability. |
 
-> **Setter parity.** Python, Rust (`crispasr-sys` + `crispasr` at the repo root),
-> Go, Dart, Java, Ruby, and C# all expose the complete `crispasr_session_set_*`
-> surface declared in `include/crispasr_session.h` and `include/crispasr.h`
-> (a handful — `set_sensitivity`, `set_pcm_sample_rate` — live in the latter).
-> The native Node addon
-> (`examples/addon.node`) reaches it via `transcribeSession`; the WASM/JS binding
-> (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
-> (`asrOpen`/`asrTranscribe`/`asrSet…`).
+> **Setter coverage.** The wrappers share many session controls, but the claim
+> that all expose the complete `crispasr_session_set_*` surface is not supported
+> by the current code. For example, the distinct `set_tts_cfg_scale` and PCM
+> `set_voice_samples` APIs are not wired universally. Curated setter tests cover
+> a subset. Require an explicit per-language API/result mapping and behavior
+> tests before claiming full parity.
 >
 > **Long audio auto-chunks.** `transcribe` slices audio longer than
 > ~30 s at energy minima and transcribes each piece (like the CLI/server),
@@ -168,6 +203,24 @@ exposes them as struct/class members on its segment type.
 >    callbacks are idiomatic and safe: C/C++, Rust
 >    (`Session::transcribe_chunked_with_progress`), and Python
 >    (`transcribe_chunked(..., progress=fn)`). The other bindings use the poll.
+
+## Character alignment
+
+With a wav2vec2-family character vocabulary, `align_words` / `alignWords`
+returns measured CTC spans in each word's `characters` (`Characters` in Go/C#).
+Each character retains its original UTF-8 text; repeated letters have separate
+spans. Python, Rust, Dart and C# use seconds; Go, Java and Ruby use
+centiseconds. The alignment offset applies to both word and character times.
+Unsupported codepoints are omitted, and romanized words and other aligner
+families return an empty list. Frame boundaries are model-derived, not
+human-annotated phonetic boundaries. See [CLI semantics](cli.md#character-timestamps-with-wav2vec2-ctc-490).
+
+The C ABI exposes `crispasr_align_result_n_characters`, `character_text`,
+`character_t0` and `character_t1` on the existing opaque alignment result
+(the latter three also have the `crispasr_align_result_` prefix).
+Text pointers remain borrowed until `crispasr_align_result_free`; invalid
+indices return empty text or zero. Python also returns an empty list when
+loaded against an older native library without these symbols.
 
 ## Python
 
@@ -605,3 +658,49 @@ result, _ := s.SpeechToSpeech(inputPCM)
 fmt.Println("Transcript:", result.Transcript)
 // result.PCM is []float32 at 24 kHz
 ```
+
+### Current wrapper repair validation
+
+The model-free ABI suites run through actual .NET, JNA, Ruby-extension and
+Embind calls: `python3 tools/run-wrapper-contract.py csharp|java|ruby|dart|wasm|go-rust`
+(select one language). SDK requirements and the difference between optional
+CTest skips and strict CI are documented in [contributing](contributing.md).
+These suites exercise transport, ownership and lifecycle; they do not establish
+real model accuracy or complete API parity. Current remaining work is in
+[PLAN.md](../PLAN.md), with completed checkpoints in [HISTORY.md](../HISTORY.md).
+
+Shared token results retain raw UTF-8 bytes because individual tokens may split
+a Unicode character. Decode concatenated raw pieces to reconstruct text; each
+token's display text may contain replacement characters. Existing language
+time units remain stable, and unavailable timing is exposed as `-1` plus an
+availability predicate. Java session results and Ruby's ordinary transcription
+results use centiseconds; WASM `session*`, C# and Dart expose seconds. Ruby's
+existing `transcribe_vad_lang` route uses seconds.
+
+WASM `sessionSynthesizeStreaming(text, callback)` delivers synchronous sentence
+chunks as copied `Float32Array`s. It returns `{status, failed, error}` after
+native synthesis returns. Check both the native status and callback error.
+Callback exceptions stay on the JS side until native unwinds; re-entry is
+rejected. Browser worker scheduling and backend availability still require the
+full WASM build/model gates.
+
+C# text chat is available through `ChatSession.Open`, `Generate`,
+`GenerateStreaming`, `CountTokens`, `Reset`, and the context/template/memory
+queries. Pass the whole conversation to preserve native KV-prefix reuse.
+Streaming delivers owned raw UTF-8 byte chunks; concatenate before decoding.
+`CancellationToken` and registered abort predicates map native abort code 40
+to `OperationCanceledException`. Abort/token callbacks must be fast and cannot
+re-enter or dispose their session; callback exceptions propagate after native
+returns. The chat disclosure string is exposed through `AiDisclosureText`.
+
+### Legacy Parakeet offset contract
+
+The direct legacy C entry point accepts a 64-bit **centisecond offset**, not a
+language string. Current wrappers pass that offset explicitly. Python exposes
+`t_offset_cs`, Go/Rust expose `TranscribeAt`/`transcribe_at`, Java's
+`CrispasrAuxiliary.Parakeet` and WASM's `ParakeetContext` accept centiseconds,
+Dart exposes `offsetCs`, and Ruby's direct method accepts an integer fourth
+argument. C# `ParakeetContext.Transcribe` uses seconds like the rest of its API.
+Existing empty/English hints in applicable wrappers map to zero offset; use a
+unified session for actual per-call language selection. Token pieces can split
+UTF-8: concatenate the owned raw bytes before decoding.

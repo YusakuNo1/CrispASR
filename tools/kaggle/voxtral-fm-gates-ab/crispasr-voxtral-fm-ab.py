@@ -18,8 +18,8 @@
 # than FM-on-GPU, and does reducing ODE steps perturb the frame trajectory?
 #
 # Requirements: Kaggle GPU (T4x1 or P100), Internet ON, ~8 GB disk.
-# Secrets/datasets: chr1str/crispasr-hf-token (public GGUF, token optional),
-# chr1str/crispasr-ccache (build cache).
+# Secrets/datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token (public GGUF, token optional),
+# ${KAGGLE_ACCOUNT}/crispasr-ccache (build cache).
 
 # ─────────────────────────── cell 1 (code) — config ──────────────────────
 import json

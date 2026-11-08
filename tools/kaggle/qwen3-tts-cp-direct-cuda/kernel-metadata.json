@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-qwen3-cp-direct-cuda",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-qwen3-cp-direct-cuda",
   "title": "crispasr-qwen3-cp-direct-cuda",
   "code_file": "crispasr-qwen3-tts-cp-direct-cuda.py",
   "language": "python",
@@ -7,7 +7,9 @@
   "is_private": "true",
   "enable_gpu": "true",
   "enable_internet": "true",
-  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"],
+  "dataset_sources": [
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

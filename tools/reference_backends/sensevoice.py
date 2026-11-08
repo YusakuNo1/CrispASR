@@ -62,12 +62,15 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     tokenizer = m.kwargs.get("tokenizer")
     sv.eval()
 
-    fe = WavFrontend(
-        cmvn_file=None, fs=16000, window="hamming", n_mels=80,
-        frame_length=25, frame_shift=10, lfr_m=7, lfr_n=6, dither=0.0,
-        upsacle_samples=True, snip_edges=True,
-    )
+    # The front-end AutoModel really uses: FunASR wires the snapshot's am.mvn
+    # into it (CMVN) although config.yaml says cmvn_file: null. A hand-built
+    # WavFrontend(cmvn_file=None) captured un-normalised features that the model
+    # never sees. Only the dither is changed, to 0, for a reproducible reference.
+    fe = m.kwargs["frontend"]
+    fe.dither = 0.0
     fe.eval()
+    assert getattr(fe, "cmvn", None) is not None, "expected AutoModel to load am.mvn into the frontend"
+    _ = WavFrontend  # imported for the type only
 
     sig = torch.from_numpy(audio.astype(np.float32))[None, :]
     sig_len = torch.tensor([audio.shape[0]])
@@ -101,7 +104,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         feats, feats_lens = fe(sig, sig_len)
         T_lfr = int(feats_lens.item())
         if "mel_features" in stages:
-            out["mel_features"] = feats[0, :T_lfr].cpu().float().numpy()
+            out["mel_features"] = feats[0, :T_lfr].cpu().float().numpy().copy()  # a view: the encoder later scales feats in place
 
         # 2. Prepend the 4 query embeds (textnorm + language + event + emotion).
         # Replicate SenseVoiceSmall.inference's prepend order: first textnorm

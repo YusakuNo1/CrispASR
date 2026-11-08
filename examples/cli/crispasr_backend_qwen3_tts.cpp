@@ -12,7 +12,10 @@
 #include "crispasr_model_registry.h"
 #include "whisper_params.h"
 
+#include "core/tts_voice_policy.h"
+#include "core/gguf_loader.h"
 #include "qwen3_tts.h"
+#include "qwen3_tts_voice_pack.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +72,20 @@ static std::string discover_codec(const std::string& model_path) {
 // as an extra companion when the user runs --model auto --backend qwen3-tts).
 static std::string discover_default_voice(const std::string& model_path) {
     const std::string dir = dir_of(model_path);
+    // Read the model contract, including for renamed files. The native loader
+    // uses 1024 when this key is absent; a present unknown width has no default.
+    auto* metadata = core_gguf::open_metadata(model_path.c_str());
+    if (!metadata)
+        return "";
+    const auto dimension = core_gguf::kv_u32(metadata, "qwen3tts.talker.d_model", 1024);
+    core_gguf::free_metadata(metadata);
+    if (const char* filename = qwen3_tts_voice_pack::default_filename(dimension)) {
+        const std::string path = dir + "/" + filename;
+        if (file_exists(path))
+            return path;
+    }
+    // Preserve existing locally installed packs; the runtime validates their
+    // actual speaker width before any tensor read.
     static const char* candidates[] = {
         "qwen3-tts-voice-default.gguf",
         "qwen3-tts-voice-default-q8_0.gguf",
@@ -88,6 +105,9 @@ public:
     ~Qwen3TtsBackend() override { Qwen3TtsBackend::shutdown(); }
 
     const char* name() const override { return "qwen3-tts"; }
+
+    // Own --voice-dir resolution (prefers <name>.wav over <name>.gguf, and only in Base mode); skip the shared #584 step.
+    bool resolves_voice_dir_itself() const override { return true; }
 
     uint32_t capabilities() const override {
         // #329: CAP_SRC_TGT_LANGUAGE — the talker's prefill carries an explicit
@@ -246,7 +266,7 @@ public:
             // Include instruct in key so a style change triggers a re-load.
             voice_key = "cv:" + params.tts_voice + "\x01" + params.tts_instruct;
         } else {
-            voice_key = "base:" + resolved_voice + "\x01" + resolved_ref_text;
+            voice_key = "base:" + core_tts_voice::reference_key(resolved_voice, resolved_ref_text);
         }
         if (voice_key != last_voice_key_) {
             if (qwen3_tts_is_voice_design(ctx_)) {
@@ -348,6 +368,10 @@ public:
             }
             last_voice_key_ = voice_key;
         }
+        qwen3_tts_set_capture_metadata(ctx_, params.tts_capture_request_id.c_str(),
+                                       params.tts_capture_source_text.c_str(), params.tts_voice.c_str(),
+                                       params.tts_instruct.c_str(), params.tts_speed,
+                                       params.tts_capture_suppress ? 1 : 0);
         return true;
     }
 

@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-nemotron-quantize",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-nemotron-quantize",
   "title": "crispasr-nemotron-quantize",
   "code_file": "nemotron_quantize.py",
   "language": "python",
@@ -7,7 +7,7 @@
   "is_private": "true",
   "enable_gpu": "true",
   "enable_internet": "true",
-  "dataset_sources": ["chr1s4/crispasr-hf-token"],
+  "dataset_sources": ["${KAGGLE_ACCOUNT}/crispasr-hf-token"],
   "competition_sources": [],
   "kernel_sources": []
 }

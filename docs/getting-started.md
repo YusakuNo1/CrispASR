@@ -4,7 +4,7 @@ A first walkthrough for someone who has never run CrispASR. Download one file,
 make it speak, transcribe the result back, then run it as a server. No repo
 clone, no Python, no model hunting.
 
-The rest of the documentation is a reference catalogue — 117 backends. Ignore it
+The rest of the documentation is a reference catalogue — 145 backends. Ignore it
 until this page works.
 
 - [1. Download the binary](#1-download-the-binary)
@@ -31,13 +31,14 @@ Unpack it and work from the folder you unpacked into — the binary is
 | **Windows, no NVIDIA GPU** | `crispasr-windows-x86_64-cpu.zip` |
 | **Windows, CPU older than 2013** | `crispasr-windows-x86_64-cpu-legacy.zip` |
 | **Windows + NVIDIA GPU** | `crispasr-windows-x86_64-cuda.zip` (or `-cuda13.zip` on Turing/GTX 16xx or newer) |
-| **macOS** | `crispasr-macos.tar.gz` — Metal GPU support is built in |
+| **macOS, Apple Silicon** | `crispasr-macos-arm64.tar.gz` — Metal GPU + Accelerate (`crispasr-macos.tar.gz` is the arm64 alias) |
+| **macOS, Intel** | `crispasr-macos-x86_64.tar.gz` — CPU + Accelerate; no Metal |
 | **Linux, no GPU** | `crispasr-linux-x86_64.tar.gz` |
 | **Linux + NVIDIA GPU** | `crispasr-linux-x86_64-cuda.tar.gz` |
 
 Three things that trip people up here:
 
-- **The default CPU builds require AVX2 + FMA** (Intel 2013+ / AMD 2015+). On an
+- **The default Windows and Linux CPU builds require AVX2 + FMA** (Intel 2013+ / AMD 2015+). On an
   older CPU the AVX2 build dies on an illegal instruction. Take the
   `-cpu-legacy` asset instead — same features, slower per core.
 - **The CUDA packages are self-contained.** You do *not* need to install the
@@ -45,8 +46,9 @@ Three things that trip people up here:
   **driver** matters.
 - **No GPU is not a problem.** The plain CPU builds are the normal case, and the
   CUDA builds fall back to CPU when no NVIDIA driver is present (since v0.8.30).
-  The `-hip` and `-vulkan` builds are the exception: they *require* their driver
-  and do not fall back.
+  The `-vulkan` build is the exception: it *requires* the Vulkan driver and does
+  not fall back. The `-hip` build falls back to CPU since #586; its GPU path needs
+  ROCm 6.x with hipBLAS.
 
 Full asset matrix, including the split CUDA-DLL downloads:
 [install.md](install.md#windows-cpu-which-zip-380).

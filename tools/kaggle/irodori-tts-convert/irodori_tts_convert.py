@@ -11,7 +11,7 @@ Outputs:
   - irodori-tts-500m-v3-q4_k.gguf    (~250 MB)
   - irodori-tts-ref.gguf              (reference activations for diff)
 
-Run under chr1s4 account with GPU enabled.
+Run under $KAGGLE_ACCOUNT account with GPU enabled.
 """
 
 import os
@@ -65,8 +65,8 @@ except Exception as e:
         def resolve_hf_token(self):
             import os
             for p in ["/kaggle/input/crispasr-hf-token/hf_token.txt",
-                      "/kaggle/input/datasets/chr1str/crispasr-hf-token/hf_token.txt",
-                      "/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"]:
+                      "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt",
+                      "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt"]:
                 if os.path.exists(p):
                     return open(p).read().strip()
             return os.environ.get("HF_TOKEN")

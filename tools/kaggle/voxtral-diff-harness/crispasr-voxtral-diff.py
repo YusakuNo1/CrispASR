@@ -15,7 +15,7 @@
 #   3. Codec — runtime codec vs reference codec on the SAME ref codes → PCM max|Δ|
 # Plus a step-count perf sweep (8/7/6/5) on the GPU.
 #
-# Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache,
+# Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache,
 #           (reference C source is vendored in the repo under refsrc/).
 # Needs GPU + Internet + ~30 GB disk (ref model 8 GB + F16 8 GB + Q4_K 2.3 GB).
 # HF token MUST have accepted mistralai/Voxtral-4B-TTS-2603 (gated CC-BY-NC).

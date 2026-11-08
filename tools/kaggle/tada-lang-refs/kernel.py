@@ -6,7 +6,7 @@
 #
 # NO HF upload from here — fetch locally + upload:
 #
-#   kaggle kernels output chr1str/tada-language-voice-reference-ggufs \
+#   kaggle kernels output ${KAGGLE_ACCOUNT}/tada-language-voice-reference-ggufs \
 #       -p /Volumes/backups/code/tada-lang-refs-stash/kaggle-out/
 #   python tools/upload_tada_lang_refs.py \
 #       --dir /Volumes/backups/code/tada-lang-refs-stash/kaggle-out/lang-refs/
@@ -86,7 +86,7 @@ for p in files:
     print(f"  {p.name}  ({p.stat().st_size // 1024} KB)")
 
 print("\n=== fetch + upload locally (NOT on Kaggle) ===")
-print("  kaggle kernels output chr1str/tada-language-voice-reference-ggufs \\")
+print("  kaggle kernels output ${KAGGLE_ACCOUNT}/tada-language-voice-reference-ggufs \\")
 print("      -p /Volumes/backups/code/tada-lang-refs-stash/kaggle-out/")
 print("  python tools/upload_tada_lang_refs.py \\")
 print("      --dir /Volumes/backups/code/tada-lang-refs-stash/kaggle-out/lang-refs/")

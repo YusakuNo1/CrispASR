@@ -92,6 +92,13 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    "openvoice2": "reference_backends.openvoice2",
+    "dia": "reference_backends.dia_tts_reference",
+    "index-echo": "reference_backends.index_echo",
+    # Dolphin (DataoceanAI) E-Branchformer + Transformer decoder + CTC (#436).
+    # model_dir holds <name>.pt + train.yaml + units.txt + global_cmvn;
+    # DOLPHIN_MODEL_NAME picks the registry name (default small.cn.streaming).
+    "dolphin":    "reference_backends.dolphin",
     # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
     # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
     # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
@@ -108,8 +115,15 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # fp32 checkpoint ONE TENSOR AT A TIME, so it fits a ~13 GB box.
     "madlad":     "reference_backends.madlad",
     "miotts":     "reference_backends.miotts",
+    "breeze-tts-2": "reference_backends.breeze_tts_2",
+    "bt2-tts":    "reference_backends.breeze_tts_2",
     "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
+    "raon-speech": "reference_backends.raon_speech",  # #455 Raon-Speech-9B STT
+    "nemotron3-diar": "reference_backends.nemotron3_diar",  # #466 Nemotron-3-Diarization
+    # X-ASR (#436): icefall streaming Zipformer2 transducer, driven chunk by chunk
+    # like sherpa-onnx. Needs XASR_ICEFALL_DIR (icefall zipformer/ sources).
+    "xasr":       "reference_backends.xasr",
     "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
@@ -130,6 +144,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # audio arg is a real multi-speaker clip.
     "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # transformers-format ParakeetForTDT (#454: moondream parakeet-ultra / -redux);
+    # same stage names as the NeMo "parakeet" dumper.
+    "parakeet-hf": "reference_backends.parakeet_hf",
+    "phonon2":    "reference_backends.parakeet_hf",  # #481, independent upstream container reader
     # Supertonic-3 (#434): ONNX-only distribution — the reference IS the
     # onnxruntime pipeline (standalone script; run it directly, not via this
     # dispatcher). Kept here for discoverability.
@@ -235,12 +253,26 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Moonshine (UsefulSensors tiny/base). model_dir = usefulsensors/moonshine-tiny
     # or usefulsensors/moonshine-base (or a local snapshot). Audio arg is a 16 kHz
     # mono WAV. Captures encoder_output (T_enc, hidden_dim) matching moonshine_encode().
+    # transformers *ForCTC checkpoints (Wav2Vec2 / Hubert / Data2VecAudio, and the
+    # omniASR-CTC Wav2Vec2ForCTC conversions). Captures ctc_logits (T, V), the
+    # grid wav2vec2_compute_logits() / omniasr_transcribe_with_logits() return.
+    "wav2vec2":        "reference_backends.wav2vec2",
+    "hubert":          "reference_backends.wav2vec2",
+    "data2vec":        "reference_backends.wav2vec2",
+    "omniasr":         "reference_backends.hf_ctc",
+    # NeMo FastConformer CTC (stt_en_fastconformer_ctc_large): mel, pre-encode,
+    # per-layer, encoder_output and the CTC log-prob grid (canary_ctc runtime).
+    "fastconformer-ctc": "reference_backends.fastconformer_ctc",
     "moonshine":       "reference_backends.moonshine",
+    # Hikari (sbintuitions/hikari-medium) simultaneous S2TT: replays the
+    # upstream server's per-80ms policy; HIKARI_SRC = hikari repo src/.
+    "hikari":          "reference_backends.hikari",
     "moonshine-base":  "reference_backends.moonshine",
     # Moonshine-Streaming (ONNX variant from usefulsensors/moonshine).
     # model_dir = root of the cloned repo (onnx/tiny/{preprocess,encode}.onnx).
     # Captures encoder_output (T, 288) matching moonshine_encode() streaming path.
     "moonshine-streaming": "reference_backends.moonshine_streaming",
+    "moonshine-onnx": "reference_backends.moonshine_onnx",
     # GLM-ASR (GGUF-direct, no PyTorch). model_dir = path to an F32 GLM-ASR GGUF
     # (e.g. cstr/glm-asr-nano-GGUF / glm-asr-nano.gguf) or a directory containing
     # it. Captures mel_spectrogram (128, T_mel) and encoder_output (T_proj, 2048).
@@ -301,6 +333,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-1.7B LM. Ships modeling+processing code (no GitHub clone needed).
     # model_dir = OpenMOSS-Team/MOSS-Transcribe-preview-2B HF id or local dir.
     "moss-transcribe": "reference_backends.moss_transcribe",
+    # Hojo-ASR-Multi-V1: Qwen3-Omni audio tower + 2-block WeNet Conformer
+    # adapter + Qwen3-4B LM. Drives the upstream `hojo-asr` PyPI package
+    # (pip install hojo-asr) rather than re-implementing the forward pass.
+    # model_dir = HojoAI/Hojo-ASR-Multi-V1 HF id or local snapshot.
+    "hojo-asr": "reference_backends.hojo_asr",
     # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
@@ -360,6 +397,8 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # hop) is not recoverable from the weights alone. Audio arg = mixed music
     # WAV (any rate; resampled to the config's rate, stereo, internally).
     "mel-band-roformer": "reference_backends.mel_band_roformer",
+    # HiDolen V2.5 shared-decoder four-stem model; use its pinned original blueprint.
+    "mini-bs-roformer": "reference_backends.mini_bs_roformer",
     # MioCodec v2 (§249): neural audio codec. model_dir = HF repo ID
     # ("Aratako/MioCodec-25Hz-44.1kHz-v2") or local snapshot dir.
     # Audio arg = mono WAV at 44100 Hz. Captures decode path intermediates
@@ -538,8 +577,9 @@ def main() -> None:
             print(f"  {name:10s}  -> tools/{mod_path.replace('.', '/')}.py")
         return
 
-    if not (args.backend and args.model_dir and args.audio and args.output):
-        p.error("--backend, --model-dir, --audio, --output are all required "
+    if not (args.backend and args.model_dir and args.output) or (args.backend != "dia" and not args.audio):
+        p.error("--backend, --model-dir and --output are required; "
+                "--audio is also required except for text-only dia "
                 "(unless --list-backends is set)")
 
     mod = _resolve_backend(args.backend)
@@ -555,9 +595,13 @@ def main() -> None:
                          f"has empty DEFAULT_STAGES and --stages is empty)")
 
     # Load audio
-    print(f"Loading audio: {args.audio}")
-    audio = load_audio_16k_mono(args.audio)
-    print(f"  samples: {len(audio)}  ({len(audio)/16000:.2f} s)")
+    if args.backend == "dia":
+        audio = np.empty(0, dtype=np.float32)
+        print("Text-only Dia input; audio is unused.")
+    else:
+        print(f"Loading audio: {args.audio}")
+        audio = load_audio_16k_mono(args.audio)
+        print(f"  samples: {len(audio)}  ({len(audio)/16000:.2f} s)")
 
     # Run backend dump
     print(f"Running {args.backend} reference forward pass ...")
@@ -567,6 +611,14 @@ def main() -> None:
         stages=stages,
         max_new_tokens=args.max_new_tokens,
     )
+
+    # Captures are owned copies (reference_backends/_safe_capture.py); list any
+    # whose source tensor changed after capture — each would have been a
+    # corrupted reference under the old view-returning .numpy() — and record
+    # the verdict in the archive's metadata.
+    from reference_backends import _safe_capture
+    alias_hits = _safe_capture.report()
+    alias_note = "none" if not alias_hits else "; ".join(f"{w} x{n}" for w, (n, _) in alias_hits)
 
     # Always include raw audio so C++ tests can feed it in without
     # re-reading the WAV.
@@ -586,11 +638,12 @@ def main() -> None:
 
     # Serialize
     meta = {
+        "aliasing_after_capture": alias_note,
         "backend":  args.backend,
         "model_dir": str(args.model_dir.resolve()),
-        "audio":    str(args.audio.resolve()),
+        "audio":    str(args.audio.resolve()) if args.audio else "",
         "n_samples": int(len(audio)),
-        "sample_rate": 16000,
+        "sample_rate": 0 if args.backend == "dia" else 16000,
         "generated_text": str(captures.pop("generated_text", "")) if "generated_text" in captures else "",
     }
     # Any other str-typed captures get routed into metadata too so the

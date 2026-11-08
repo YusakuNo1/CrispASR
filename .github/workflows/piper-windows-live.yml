@@ -3,6 +3,18 @@ name: Piper Windows Live
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    paths:
+      - '.github/workflows/piper-windows-live.yml'
+      - 'examples/cli/crispasr_model_mgr_cli.cpp'
+      - 'src/crispasr_model_registry.cpp'
+      - 'src/crispasr_cache.cpp'
+      - 'src/crispasr_cache.h'
+      - 'src/CMakeLists.txt'
+      - 'src/piper_tts.cpp'
+      - 'src/piper_tts.h'
+      - 'tests/test-dry-run-resolve.sh'
+  pull_request:
     paths:
       - '.github/workflows/piper-windows-live.yml'
       - 'examples/cli/crispasr_model_mgr_cli.cpp'
@@ -14,8 +26,40 @@ on:
       - 'src/piper_tts.h'
       - 'tests/test-dry-run-resolve.sh'
 
+# PRs: a newer push to the same PR cancels the older run. main pushes and
+# manual runs get their own group (run_id), so they are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Cheap gate: on a branch push, run the heavy job only when the BRANCH ITSELF
+  # changes a watched path (vs its merge-base with main). A rebase onto a main
+  # that touched CMakeLists.txt no longer queues one heavy run per branch.
+  # main, pull requests and manual dispatch always run. See the script's header.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.scope.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "push" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            git fetch --no-tags origin main || true   # no base -> script answers true
+            python3 .github/scripts/branch_touches_paths.py "$GITHUB_WORKFLOW_REF_PATH" origin/main >> "$GITHUB_OUTPUT" \
+              || echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_WORKFLOW_REF_PATH: .github/workflows/piper-windows-live.yml
+
   cori-cli-and-server:
+    needs: scope
+    if: needs.scope.outputs.relevant == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -26,6 +70,8 @@ jobs:
       - name: Build portable CPU CLI (bounded)
         shell: pwsh
         run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize
+          Get-CimInstance Win32_Processor | Select-Object LoadPercentage
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
@@ -62,7 +108,7 @@ jobs:
           if ($preview -match 'lessac') { throw 'Cori was substituted with the Lessac registry default' }
 
           $ttsLog = (& build/bin/crispasr.exe --backend piper `
-            -m piper-en_GB-cori-medium-f16.gguf -l en -t 2 --no-gpu `
+            -m piper-en_GB-cori-medium-f16.gguf -l en -t 2 --no-gpu --seed 42 `
             --tts 'The quick brown fox jumps over the lazy dog.' `
             --tts-output proof/cori-cli.wav `
             --no-spoken-disclaimer --no-c2pa --accept-marking-responsibility 2>&1) -join "`n"
@@ -75,6 +121,27 @@ jobs:
               (Get-Item proof-models/espeak_en_us.tsv).Length -lt 1000000) {
             throw 'Piper IPA dictionary was not downloaded into the clean cache'
           }
+          # Seed 0 resamples VITS noise every run. Keep seed 42 explicit and
+          # prove reproducibility without relaxing the existing speech gate.
+          $repeat = (& build/bin/crispasr.exe --backend piper `
+            -m piper-en_GB-cori-medium-f16.gguf -l en -t 2 --no-gpu --seed 42 `
+            --tts 'The quick brown fox jumps over the lazy dog.' `
+            --tts-output proof/cori-cli-repeat.wav `
+            --no-spoken-disclaimer --no-c2pa --accept-marking-responsibility 2>&1) -join "`n"
+          Write-Host $repeat
+          if ($LASTEXITCODE -ne 0) { throw "Repeated Piper CLI exited $LASTEXITCODE" }
+          $firstHash = (Get-FileHash proof/cori-cli.wav -Algorithm SHA256).Hash
+          $repeatHash = (Get-FileHash proof/cori-cli-repeat.wav -Algorithm SHA256).Hash
+          if ($firstHash -ne $repeatHash) { throw 'Seeded Piper WAVs differ' }
+          @{
+            source = $env:GITHUB_SHA; seed = 42
+            wav_sha256 = $firstHash.ToLower(); repeated_wav_sha256 = $repeatHash.ToLower()
+            inputs = @(Get-FileHash proof-models/piper-en_GB-cori-medium-f16.gguf,
+              proof-models/ggml-base.en.bin, proof-models/espeak_en_us.tsv -Algorithm SHA256 |
+              Select-Object Path,Hash)
+          } | ConvertTo-Json -Depth 4 | Set-Content proof/seeded-cli-proof.json
+          Write-Host "PIPER_SEEDED_REPEAT_OK seed=42 sha256=$firstHash"
+
           $wav = [IO.File]::ReadAllBytes('proof/cori-cli.wav')
           if ($wav.Length -lt 10000 -or [Text.Encoding]::ASCII.GetString($wav, 0, 4) -ne 'RIFF') {
             throw 'CLI output is not a non-empty WAV'
@@ -93,7 +160,7 @@ jobs:
           $env:CRISPASR_MODELS_DIR = (Resolve-Path proof-models).Path
           $server = Start-Process -FilePath (Resolve-Path build/bin/crispasr.exe) `
             -ArgumentList @('--server', '-m', 'piper-en_GB-cori-medium-f16.gguf',
-              '--port', '18089', '-l', 'en', '-t', '2', '--no-gpu',
+              '--port', '18089', '-l', 'en', '-t', '2', '--no-gpu', '--seed', '42',
               '--no-spoken-disclaimer', '--no-c2pa', '--accept-marking-responsibility') `
             -RedirectStandardOutput proof/server.stdout.log `
             -RedirectStandardError proof/server.stderr.log -PassThru
@@ -135,8 +202,34 @@ jobs:
               -m proof-models/ggml-base.en.bin --no-gpu -l en -np `
               -f proof/cori-server.wav 2>&1) -join "`n"
             Write-Host $asr
-            if ($LASTEXITCODE -ne 0 -or $asr -notmatch '(?i)great job') {
-              throw 'Whisper did not recover the HTTP synthesis'
+            # Word overlap against the WHOLE prompt, not a single magic phrase.
+            #
+            # This used to be `-notmatch '(?i)great job'`, which is fragile in
+            # BOTH directions. It failed a run whose transcript was
+            # "Hello how are you today?  UT-Tay Quit Job Today." — sentence one
+            # recovered perfectly, sentence two garbled — and it would equally
+            # have PASSED if only those two words survived and the rest were
+            # noise. A whole-prompt overlap catches the multi-sentence case the
+            # single phrase was blind to, which is the case this arm exists for:
+            # the CLI arm above sends ONE sentence and passed in the same run.
+            $expected = 'hello how are you today you did a great job today'
+            $heard = ($asr -replace '[^\p{L}\p{N}\s]', ' ').ToLower()
+            # UNIQUE words on the expected side. Counting duplicates scores the
+            # known-bad transcript at 0.73 — ABOVE a 0.70 threshold — because
+            # "you" and "today" each appear twice and both survived. Deduped it
+            # scores 0.67 and fails, while a correct transcript scores 1.00 and
+            # pure noise 0.00. Verified against those exact strings before this
+            # gate was trusted.
+            $want  = $expected -split '\s+' | Where-Object { $_ } | Select-Object -Unique
+            $got   = $heard    -split '\s+' | Where-Object { $_ }
+            $hits  = ($want | Where-Object { $got -contains $_ }).Count
+            $overlap = if ($want.Count) { $hits / $want.Count } else { 0 }
+            Write-Host ("HTTP ASR word overlap: {0:N2} ({1}/{2})" -f $overlap, $hits, $want.Count)
+            if ($LASTEXITCODE -ne 0 -or $overlap -lt 0.7) {
+              # Keep the audio so the next failure is diagnosable instead of
+              # being re-run until it passes.
+              Copy-Item proof/cori-server.wav proof/FAILED-cori-server.wav -ErrorAction SilentlyContinue
+              throw ("Whisper did not recover the HTTP synthesis (overlap {0:N2} < 0.70). Heard: {1}" -f $overlap, $heard)
             }
             Write-Host 'PIPER_WINDOWS_LIVE_OK — exact Cori lookup + CLI WAV + HTTP WAV + streaming PCM'
           } finally {

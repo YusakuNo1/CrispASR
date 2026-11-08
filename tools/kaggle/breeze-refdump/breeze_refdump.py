@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Breeze TTS 2 reference-oracle dump on a Kaggle GPU (#412, PHASE 1).
+"""Breeze TTS 2 reference-oracle dump on a Kaggle worker (#412).
 
-WHY KAGGLE: the upstream needs Linux + CUDA and ~7.7 GiB VRAM in eager mode
-(README), and the checkpoint is 6.97 GB bf16 — it does not fit the 8 GB VPS.
+WHY KAGGLE: the checkpoint is 6.97 GB bf16 and does not fit the 8 GB VPS.
+The README asks for CUDA, but nothing here needs it: this dumps ~24 frames,
+not throughput. Since Kaggle is P100-pinned and its torch has no sm_60
+kernels (gotchas #21-#23), the GPU is the one resource we cannot count on —
+so a too-old draw falls back to the CPU rather than discarding the session.
 Everything here is the reference half of the diff harness; the C++ half lands
 in phase 2 and is compared with `tools/reference_backends/breeze_tts_2.py`.
 
@@ -58,6 +61,10 @@ STAGES DUMPED (all float32, row-major, batch dim dropped)
   codec_audio                (N_out,)        24 kHz PCM from the Qwen3-TTS
                                              tokenizer decode
   meta.json                  the constants + shapes + the exact prompt
+  guided/{CASE}/...          prompt ids, combined frame-0 logits and greedy
+                             codes for plain, clone, and instruction requests
+                             at cfg_scale 0 / 1 / 4 with and without the
+                             reference; see GUIDED_CASES
 
 ENV
   BREEZE_TEXT        target text (default: a short EN line)
@@ -66,6 +73,7 @@ ENV
   BREEZE_GREEDY      1 (default) / 0
   BREEZE_MAX_FRAMES  cap the AR loop (default 24; enough for 5 dumped frames)
   BREEZE_DUMP_TE_LAYERS  1 to also dump all 27 text-encoder layer states
+  BREEZE_FORCE_CPU   1 to run on the CPU even when a usable GPU was drawn
   CRISPASR_REF       CrispASR branch to clone (default main)
 
 DO NOT run/push this from an agent session — the maintainer pushes it.
@@ -146,8 +154,14 @@ import kaggle_harness as kh  # noqa: E402
 
 kh.init_progress()
 # Bump when the arms, capture or predicate change (see kh.provenance).
-SCRIPT_VERSION = "2026-09-03.1"
-kh.provenance(SCRIPT_VERSION, clone_dir=CLONE)
+SCRIPT_VERSION = "2026-10-10.1"
+# kh.provenance landed in the harness AFTER this kernel was first pushed, so the
+# 2026-09-02 run died in 10 s with AttributeError against its own fresh clone
+# (gotcha #24, the two-halves trap). Never let provenance logging be fatal.
+if hasattr(kh, "provenance"):
+    kh.provenance(SCRIPT_VERSION, clone_dir=CLONE)
+else:
+    step("provenance_unavailable", script_version=SCRIPT_VERSION)
 HF_TOKEN = kh.resolve_hf_token()
 step("cloned", crispasr_ref=CRISPASR_REF, hf_token_ok=bool(HF_TOKEN))
 
@@ -179,18 +193,44 @@ assert torch.cuda.is_available(), "this kernel needs enable_gpu=true"
 _cap = torch.cuda.get_device_capability(0)
 _name = torch.cuda.get_device_name(0)
 print(f"[gpu] {_name} sm_{_cap[0]}{_cap[1]}", flush=True)
-if _cap < (7, 0):
+
+# GPU LOTTERY, RESOLVED BY NOT PLAYING IT.
+# Kaggle's preinstalled torch has no kernels below sm_70 (gotcha #23) and the
+# accelerator is effectively P100-pinned with no working API selector (#21,
+# #22) — ~20 consecutive P100 draws across both accounts. The previous version
+# of this kernel exited on a P100 draw and told the operator to "re-push to
+# redraw", which is a coin-flip that has not come up once: the reference
+# oracle was simply unobtainable.
+#
+# It does not have to be. This dump needs ~24 frames, not throughput, and the
+# host has far more RAM than the checkpoint (6.97 GB bf16). So on a too-old
+# GPU we run the SAME model, SAME dtype, SAME eager attention on the CPU.
+# Nothing about the reference changes except where the matmuls happen.
+# Set BREEZE_FORCE_CPU=1 to take this path even on a good GPU (A/B control).
+_host_gb = None
+try:
+    _host_gb = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
+except Exception:
+    pass
+FORCE_CPU = os.environ.get("BREEZE_FORCE_CPU", "0") == "1"
+if FORCE_CPU or _cap < (7, 0):
+    DEVICE = "cpu"
+    why = "forced" if FORCE_CPU else f"gpu_too_old_sm_{_cap[0]}{_cap[1]}"
     print(
-        f"P100_LOTTERY_RETRY: drew {_name} (sm_{_cap[0]}{_cap[1]}); this torch "
-        f"build has no kernels below sm_70. Nothing was computed — re-push to redraw.",
+        f"CPU_FALLBACK: {why}; this torch build has no kernels below sm_70. "
+        f"Running the reference on the CPU instead of discarding the session "
+        f"(host RAM {_host_gb} GB vs a 6.97 GB bf16 checkpoint). Slower, "
+        f"numerically equivalent, and it actually produces the fixture.",
         flush=True,
     )
-    Path("/kaggle/working/lottery_retry.json").write_text(
-        json.dumps({"conclusive": False, "reason": "gpu_too_old", "gpu": _name,
-                    "capability": f"sm_{_cap[0]}{_cap[1]}"}, indent=1))
-    raise SystemExit(0)
-
-DEVICE = "cuda:0"
+else:
+    DEVICE = "cuda:0"
+# The arm that ran must be visible in the artifact, not only in the log — a
+# fixture that does not say where it came from cannot be argued with later.
+RUN_DEVICE = DEVICE
+RUN_GPU = _name
+step("device_selected", device=DEVICE, gpu=_name,
+     capability=f"sm_{_cap[0]}{_cap[1]}", host_ram_gb=_host_gb)
 
 # ── checkpoint ────────────────────────────────────────────────────────────
 from huggingface_hub import snapshot_download  # noqa: E402
@@ -205,7 +245,9 @@ sys.path.insert(0, str(BREEZE))
 from breeze_infer.runtime import (  # noqa: E402
     load_runtime, set_all_seeds, update_generation_config_for_breeze,
 )
-from breeze_infer.templates import get_template, prepare_inputs  # noqa: E402
+from breeze_infer.templates import (  # noqa: E402
+    get_template, prepare_inputs, select_template_name,
+)
 
 tokenizer, model, audio_tokenizer = load_runtime(
     CKPT, device=DEVICE, attn_implementation="eager",
@@ -219,6 +261,15 @@ if GREEDY:
         gc.temperature = 1.0
         gc.top_k = 0
         gc.top_p = 1.0
+        # STATE the penalty rather than inherit it. repetition_penalty is
+        # absent from generation_config.json — infer.py and api.py pass 1.1 at
+        # CALL time, so it belongs to the synthesis recipe, not the model. This
+        # dump does not pass it, so the codes here are penalty-free and the C++
+        # greedy path matches that deliberately (GenOptions::repetition_penalty).
+        # Pinning it means the two arms agree because both declare 1.0, not
+        # because both happen to inherit the same library default — which is
+        # the kind of agreement that quietly ends when a default changes.
+        gc.repetition_penalty = 1.0
 model.generation_config.max_new_tokens = MAX_FRAMES
 step("model_loaded", greedy=GREEDY, max_frames=MAX_FRAMES,
      dtype=str(next(model.parameters()).dtype))
@@ -238,24 +289,110 @@ def f32(t):
 REF_WAV = CLONE / "samples" / "jfk.wav"
 wav, sr = sf.read(str(REF_WAV), always_2d=True, dtype="float32")
 wav = np.mean(wav, axis=1)
+
+# RESAMPLE HERE, ONCE, AND DUMP WHAT THE CODEC ACTUALLY SAW.
+#
+# Upstream (breeze_infer/audio.py:14-16) reads the clip at its native rate and
+# hands `sr=sample_rate` to the tokenizer, which resamples internally. That is
+# faithful to production and it is also unmeasurable: the C++ runtime resamples
+# with core_audio::resample_polyphase, so two different resamplers see the same
+# file and the codes diverge before a single transformer weight is involved.
+# Measured on run 1: 138 frames on both sides, but only 61.8% of codes equal,
+# first divergence at index 7 — and every later stage inherits it.
+#
+# So the fixture now feeds the tokenizer 24 kHz directly (sr == 24000, nothing
+# to resample) and dumps exactly those samples. ref_codes then compares the
+# CODEC ENCODER against the codec encoder, which is a question the harness can
+# actually answer. `ref_audio_native` keeps the raw clip so the resampler
+# itself can still be diffed on its own, as its own stage, rather than as a
+# mystery inside ref_codes.
+import torchaudio  # noqa: E402
+
+if sr != 24000:
+    wav24 = torchaudio.functional.resample(torch.as_tensor(wav), sr, 24000).numpy()
+else:
+    wav24 = wav
+save("ref_audio_native", wav.astype(np.float32))
+wav, sr = wav24.astype(np.float32), 24000
+# ...AND MAKE THE PROMPT USE THE SAME AUDIO.
+#
+# The previous version of this change resampled only the audio it DUMPED.
+# The prompt is built by prepare_inputs -> _resolve_segment_audio_codes ->
+# encode_prompt_audio(audio_tokenizer, audio_path), which re-reads the file
+# from disk at its native rate — so the fixture ended up internally
+# inconsistent: ref_codes came from 24 kHz while the audio embeddings inside
+# backbone_inputs_embeds came from 16 kHz. The diff harness caught it as
+# backbone_inputs_embeds collapsing from cos 0.999957 to 0.937599 while
+# ref_codes was byte-identical across a regeneration that changed ref_codes
+# completely — a fixture disagreeing with itself.
+#
+# Writing the resampled clip out and pointing the request at THAT file makes
+# one audio array feed every consumer: the dump, the prompt and generation.
+REF_WAV_24K = WORK / "ref_24k.wav"
+sf.write(str(REF_WAV_24K), wav, sr, subtype="PCM_16")
+# ...AND READ IT BACK BEFORE ENCODING.
+#
+# "One array feeds every consumer" has to mean the array the PROMPT sees.
+# sf.write(subtype="PCM_16") quantizes float32 to int16 and
+# encode_prompt_audio reads it back as float32, so encoding the pre-write
+# array would dump codes from samples that no longer exist anywhere else.
+# That residual showed up as backbone_inputs_embeds stalling at cos 0.971269
+# — better than the 0.937599 of the previous bug and still not parity, which
+# is exactly what a small, uniform input difference looks like.
+wav, _sr_back = sf.read(str(REF_WAV_24K), always_2d=True, dtype="float32")
+wav = np.mean(wav, axis=1)
+assert _sr_back == sr, f"wrote {sr} Hz, read back {_sr_back} Hz"
+step("ref_resampled_for_prompt", src_sr=16000, dst_sr=sr, n_samples=int(wav.shape[0]),
+     path=str(REF_WAV_24K), note="dump encodes the READ-BACK samples, as the prompt does")
+
 enc = audio_tokenizer.encode(wav, sr=sr)
-ref_codes = np.asarray(enc["audio_codes"][0], dtype=np.int32)   # (T_ref, 16)
+
+
+def to_np(x, dtype):
+    """Tensors coming back from the audio tokenizer live on the GPU, and
+    np.asarray on a cuda tensor raises rather than copying. Run 7 reached the
+    model load and died here — 15 minutes to learn one missing .cpu()."""
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        if x.dtype in (torch.bfloat16, torch.float16):
+            # numpy has no bf16 — np.asarray on one raises rather than
+            # widening. The model runs in bf16 throughout, so this is on the
+            # path for every float dump, not a corner case.
+            x = x.float()
+    return np.asarray(x, dtype=dtype)
+
+
+ref_codes = to_np(enc["audio_codes"][0], np.int32)              # (T_ref, 16)
 save("ref_audio", wav.astype(np.float32))
 save("ref_codes", ref_codes)
 step("ref_encoded", sr=sr, n_samples=int(wav.shape[0]), ref_frames=int(ref_codes.shape[0]))
 
 # ── prompt assembly (Voice Clone) ─────────────────────────────────────────
-# `ref_edit_tata` is the only template that carries a reference clip; the
-# clone branch is exactly `_ref_clone_tata_segments` (templates.py:74-84):
-#   [S0]{ref_text}  <|AUDIO|>*T_ref <|audio_eos|>  [S0]{text}
-# Passing guidance_scale=1.0 with both dual scales None keeps it single-branch
-# (templates.py:292-297) — the CFG multi-branch dumps are a phase-2 follow-up.
+# `ref_edit_tata` is the only template that carries a reference clip.
+#
+# ⚠ CORRECTED 2026-09-15. This block previously claimed the dump used the
+# "clone branch". It does not, and the fixture's own ids prove it: segment 2
+# contains 262156/262157 (<ins_bos>/<ins_eos>) wrapped around the instruction.
+# prepare_inputs ALWAYS builds from `template.build_segments`
+# (templates.py:"positive_segments = ..."), which for ref_edit_tata is
+# `_ref_edit_tata_segments` — the INSTRUCTION variant:
+#     [S0]{ref_text} | <|AUDIO|>*T_ref <|audio_eos|> | [S0]<ins_bos>{ins}<ins_eos>{text}
+# `build_negative_segments` (the actual clone branch) is only reached when
+# guidance_scale != 1.0. So guidance_scale=1.0 keeps this SINGLE-BRANCH, which
+# was the true half of the old claim, but the single branch is the positive,
+# instruction-carrying one.
+#
+# This matters to anything comparing against the fixture: a C++ prompt built
+# WITHOUT the instruction cannot match these ids no matter how good its
+# tokenizer is.
 request = {
     "id": "breeze-ref",
     "text": SYN_TEXT,
     "instruction": "Speak clearly and naturally.",
     "speaker": "S0",
-    "ref_audio_path": str(REF_WAV),
+    # The 24 kHz copy, NOT the 16 kHz original: everything downstream must see
+    # the same samples ref_codes was computed from.
+    "ref_audio_path": str(REF_WAV_24K),
     "ref_text": REF_TEXT,
 }
 set_all_seeds(SEED)
@@ -314,21 +451,47 @@ merged = model._merge_input_ids_with_input_values(
 merged_embeds = merged["inputs_embeds"] if isinstance(merged, dict) else merged
 save("backbone_inputs_embeds", f32(merged_embeds[0]))
 
-bb_out = model.backbone_model(
-    inputs_embeds=merged_embeds,
-    attention_mask=inputs["attention_mask"],
-    use_cache=False,
-    output_hidden_states=True,
-    return_dict=True,
-)
+# The backbone is assembled by breeze_backbone_factory, not by a stock
+# transformers model class, and its wrapper does NOT propagate
+# output_hidden_states — run 9 asked for them, was handed None, and died
+# iterating it. Per-layer states are the whole point of this dump (they are
+# what bisects a backbone drift to one layer), so capture them with forward
+# hooks, which depend on nothing the wrapper chooses to return.
+_bb_layer_hs = []
+
+
+def _cap(_mod, _inp, out):
+    _bb_layer_hs.append(out[0] if isinstance(out, tuple) else out)
+
+
+_handles = [layer.register_forward_hook(_cap) for layer in model.backbone_model.layers]
+try:
+    bb_out = model.backbone_model(
+        inputs_embeds=merged_embeds,
+        attention_mask=inputs["attention_mask"],
+        use_cache=False,
+        return_dict=True,
+    )
+finally:
+    for h in _handles:
+        h.remove()
+
 h_last = bb_out.last_hidden_state[0, -1]              # (2048,)
 save("backbone_hidden_frame0", f32(h_last))
-for j, hs in enumerate(bb_out.hidden_states):
+# Index 0 is the layer-0 OUTPUT here (the hook fires after the layer), so
+# backbone_layer{J} is "the residual stream after layer J" — the same
+# convention csm_tts.cpp's layer_outputs uses, and NOT the hidden_states
+# convention where index 0 is the input embedding. backbone_inputs_embeds is
+# dumped separately and is that input.
+if not _bb_layer_hs:
+    raise SystemExit("backbone forward hooks captured nothing — the per-layer "
+                     "bisect would be silently missing from the fixture")
+for j, hs in enumerate(_bb_layer_hs):
     save(f"backbone_layer{j}_frame0", f32(hs[0, -1]))
 logits0 = model.lm_head(h_last)                       # (2052,)
 save("backbone_logits_frame0", f32(logits0))
 step("backbone_prefill_done", L=int(merged_embeds.shape[1]),
-     n_hidden_states=len(bb_out.hidden_states),
+     n_layer_states=len(_bb_layer_hs),
      argmax_cb0=int(logits0.argmax().item()))
 
 # ── stage 4: depth decoder, frame 0, per-codebook logits ──────────────────
@@ -367,35 +530,145 @@ save("dd_codes_frame0_stepwise", np.asarray(frame0, dtype=np.int32))
 step("depth_decoder_frame0_done", codes=frame0)
 
 # ── stage 5: full generate (codes) + codec decode ─────────────────────────
-set_all_seeds(SEED)
-gen = model.generate(**{k: v for k, v in inputs.items() if v is not None},
-                     output_audio=True, return_dict_in_generate=True)
-codes = gen.sequences                                      # (B, T, 16)
-if codes.ndim == 3:
-    codes = codes[0]
-codes = codes.detach().cpu().numpy().astype(np.int32)      # (T, 16)
-# Truncate at the first all-pad frame, exactly like the codec path does
-# (generation_breeze.py:1238-1248) — EOS frames are stored as all
-# codebook_pad_token_id and must not reach the codec.
-pad = int(model.config.codebook_pad_token_id)
-is_pad = (codes == pad).all(axis=-1)
-cut = int(np.argmax(is_pad)) if is_pad.any() else codes.shape[0]
-if cut != codes.shape[0]:
-    print(f"  truncating codes at first pad frame: {codes.shape[0]} -> {cut}", flush=True)
-codes = codes[:cut]
+def generate_codes(gen_inputs):
+    """generate() over prepare_inputs() output -> ((T, 16) int32 codes, raw output)."""
+    set_all_seeds(SEED)
+    # generate() takes an `audio_tokenizer` kwarg (generation_breeze.py:1100) and
+    # WITHOUT it falls into the `audio_tokenizer is None` branch, which reaches for
+    # self.codec_model.quantizer.cardinality — an attribute the bundled Mimi class
+    # does not have on this transformers version. That branch is dead weight
+    # anyway: runtime.py always loads the Qwen3 tokenizer, and the Mimi codec in
+    # the checkpoint is a training leftover we drop from the GGUF entirely. Pass
+    # the real tokenizer and the whole branch is skipped.
+    out = model.generate(**{k: v for k, v in gen_inputs.items() if v is not None},
+                         output_audio=True, audio_tokenizer=audio_tokenizer,
+                         return_dict_in_generate=True)
+    grid = out.sequences                                   # (B, T, 16)
+    if grid.ndim == 3:
+        grid = grid[0]
+    grid = grid.detach().cpu().numpy().astype(np.int32)    # (T, 16)
+    # Truncate at the first all-pad frame, exactly like the codec path does
+    # (generation_breeze.py:1238-1248) — EOS frames are stored as all
+    # codebook_pad_token_id and must not reach the codec.
+    is_pad = (grid == int(model.config.codebook_pad_token_id)).all(axis=-1)
+    cut = int(np.argmax(is_pad)) if is_pad.any() else grid.shape[0]
+    if cut != grid.shape[0]:
+        print(f"  truncating codes at first pad frame: {grid.shape[0]} -> {cut}", flush=True)
+    return grid[:cut], out
+
+
+codes, gen = generate_codes(inputs)
 save("codes", codes)
 for f in range(min(N_DUMP_FRAMES, codes.shape[0])):
     save(f"dd_codes_frame{f}", codes[f])
 
 audio = gen.audio[0] if getattr(gen, "audio", None) else None
 if audio is None:
-    dec = audio_tokenizer.decode(torch.as_tensor(codes)[None].to(DEVICE))
-    audio = dec["audio"][0] if isinstance(dec, dict) else dec
-audio = np.asarray(audio.detach().float().cpu() if torch.is_tensor(audio) else audio,
-                   dtype=np.float32).reshape(-1)
+    # Same call shape upstream uses (generation_breeze.py:1324) — a dict with a
+    # LIST of code tensors, not a batched tensor. The previous form here was a
+    # guess and would have decoded the wrong thing if it had ever been reached.
+    from models.generation_breeze import _extract_decoded_audio_tensor
+
+    dec = audio_tokenizer.decode(
+        {"audio_codes": [torch.as_tensor(codes).to(DEVICE)]}
+    )
+    audio = _extract_decoded_audio_tensor(dec)
+audio = to_np(audio, np.float32).reshape(-1)
 save("codec_audio", audio)
 sf.write(str(WORK / "breeze-ref.wav"), audio, 24000, subtype="PCM_16")
 step("generate_done", frames=int(codes.shape[0]), n_samples=int(audio.shape[0]))
+
+# ── guided matrix: Voice Design / Voice Direction and their controls ──────
+# Everything above is ONE request shape: reference + instruction at
+# cfg_scale=1.0, a single branch. The C++ port also runs the two-branch
+# combine `negative + cfg_scale * (positive - negative)`, and nothing above
+# can tell whether that is right. Each case here is a request as infer.py
+# would build it (select_template_name picks the template), greedy, and lands
+# in guided/<name>/ for `crispasr-diff bt2-tts-guided`:
+#
+#   prompt_input_ids         the template's own prompt
+#   neg_prompt_input_ids     the negative prompt, when prepare_inputs builds one
+#   backbone_logits_frame0   frame-0 lm_head logits AFTER the combine
+#   codes                    greedy code grid
+#
+# cfg_scale=0 is refused by infer.py and api.py but is a real generate() mode
+# (it swaps the negative prompt in as the only branch), and it is the control
+# that says the negative prompt is the plain / clone request and nothing else.
+GUIDED_CASES = [  # (name, has_reference, has_instruction, cfg_scale)
+    ("plain", False, False, 1.0),
+    ("clone", True, False, 1.0),
+    ("design-s0", False, True, 0.0),
+    ("design-s1", False, True, 1.0),
+    ("design-s4", False, True, 4.0),
+    ("direct-s0", True, True, 0.0),
+    ("direct-s1", True, True, 1.0),
+    ("direct-s4", True, True, 4.0),
+]
+
+
+def prefill_logits(ids, text_mask, text_len, attn, values):
+    """lm_head logits at the last prefill position of one prompt."""
+    merged_ = model._merge_input_ids_with_input_values(
+        input_ids=ids, input_values=values, text_ids_mask=text_mask,
+        text_ids_len=text_len, attention_mask=attn,
+    )
+    embeds = merged_["inputs_embeds"] if isinstance(merged_, dict) else merged_
+    out = model.backbone_model(inputs_embeds=embeds, attention_mask=attn,
+                               use_cache=False, return_dict=True)
+    return model.lm_head(out.last_hidden_state[0, -1]).float()
+
+
+def dump_guided_case(name, has_ref, has_ins, scale):
+    req = {"id": name, "text": SYN_TEXT, "speaker": "S0"}
+    if has_ins:
+        req["instruction"] = request["instruction"]
+    if has_ref:
+        req["ref_audio_path"] = str(REF_WAV_24K)
+        req["ref_text"] = REF_TEXT
+    template_name = select_template_name(req)
+    case_inputs = prepare_inputs(
+        tokenizer, audio_tokenizer, model, [req], get_template(template_name),
+        guidance_scale=scale, guidance_scale_ref=None, guidance_scale_ins=None,
+    )
+    pos = prefill_logits(case_inputs["input_ids"], case_inputs["text_ids_mask"],
+                         case_inputs["text_ids_len"], case_inputs["attention_mask"],
+                         case_inputs["input_values"])
+    combined = pos
+    neg_ids = case_inputs.get("cfg_negative_prompt_ids")
+    if neg_ids is not None:
+        neg = prefill_logits(neg_ids, case_inputs["cfg_negative_text_ids_mask"],
+                             case_inputs["cfg_negative_text_ids_len"],
+                             case_inputs["cfg_negative_prompt_attention_mask"],
+                             case_inputs.get("cfg_negative_input_values", case_inputs["input_values"]))
+        combined = neg + scale * (pos - neg)
+    grid, _ = generate_codes(case_inputs)
+
+    sub = f"guided/{name}"
+    (DUMPS / sub).mkdir(parents=True, exist_ok=True)
+    save(f"{sub}/prompt_input_ids", f32(case_inputs["input_ids"][0]).astype(np.int32))
+    if neg_ids is not None:
+        save(f"{sub}/neg_prompt_input_ids", f32(neg_ids[0]).astype(np.int32))
+    save(f"{sub}/backbone_logits_frame0", f32(combined))
+    save(f"{sub}/codes", grid)
+    return {"template": template_name, "cfg_scale": scale, "frames": int(grid.shape[0]),
+            "branches": 2 if neg_ids is not None and scale != 0.0 else 1,
+            "argmax_cb0": int(combined.argmax().item())}
+
+
+# A case that dies must not take the base fixture, or the other cases, with
+# it: the session behind this point cost a 7 GB download. The failure is
+# recorded in meta.json and fails the kernel AFTER the upload.
+guided_meta, guided_errors = {}, {}
+for _name, _has_ref, _has_ins, _scale in GUIDED_CASES:
+    try:
+        guided_meta[_name] = dump_guided_case(_name, _has_ref, _has_ins, _scale)
+        step("guided_case_done", case=_name, **guided_meta[_name])
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        guided_errors[_name] = repr(exc)
+        step("guided_case_FAILED", case=_name, error=repr(exc))
 
 # ── meta ──────────────────────────────────────────────────────────────────
 cfg = model.config
@@ -407,9 +680,13 @@ meta = {
     "syn_text": SYN_TEXT,
     "ref_text": REF_TEXT,
     "ref_wav": "samples/jfk.wav",
-    "template": "ref_edit_tata (clone branch, cfg_scale=1.0)",
+    "template": "ref_edit_tata POSITIVE branch (ref_text + audio + <ins_bos>instruction<ins_eos>text), cfg_scale=1.0, single branch",
+    "instruction": request["instruction"],
     "attn_implementation": "eager",
     "dtype": "bfloat16",
+    "device": RUN_DEVICE,
+    "gpu_drawn": RUN_GPU,
+    "script_version": SCRIPT_VERSION,
     "num_codebooks": int(cfg.num_codebooks),
     "audio_vocab_size": int(cfg.audio_vocab_size),
     "audio_token_id": int(cfg.audio_token_id),
@@ -422,6 +699,8 @@ meta = {
                      else cfg.backbone_config.num_hidden_layers),
     "dd_layers": int(cfg.depth_decoder_config.num_hidden_layers),
     "shapes": {p.stem: list(np.load(p).shape) for p in sorted(DUMPS.glob("*.npy"))},
+    "guided": guided_meta,
+    "guided_errors": guided_errors,
 }
 (DUMPS / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 step("meta_written", n_dumps=len(meta["shapes"]))
@@ -449,5 +728,7 @@ if HF_TOKEN:
 else:
     step("no_hf_token_staged_locally", dir=str(DUMPS))
 
+if guided_errors:
+    raise SystemExit(f"guided cases failed: {sorted(guided_errors)}")
 step("done")
 print("[DONE]", flush=True)

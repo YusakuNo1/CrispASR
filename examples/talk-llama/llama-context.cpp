@@ -11,6 +11,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -312,6 +313,15 @@ llama_context::llama_context(const llama_model& model, llama_context_params para
         bool pipeline_parallel = model.n_devices() > 1 && model.n_gpu_layers() > model.hparams.n_layer &&
                                  model.split_mode() == LLAMA_SPLIT_MODE_LAYER && cparams.offload_kqv &&
                                  !model.has_tensor_overrides();
+
+        // Single-sequence decode can benefit from graph reuse more than from
+        // pipeline scheduling. Keep the established default until same-hardware
+        // output and warm timing prove the opt-in tradeoff (Index-Echo 9B).
+        const char* pipeline_disable = std::getenv("CRISPASR_LLAMA_PIPELINE_DISABLE");
+        if (pipeline_parallel && pipeline_disable && atoi(pipeline_disable) != 0) {
+            LLAMA_LOG_INFO("%s: pipeline parallelism disabled by CRISPASR_LLAMA_PIPELINE_DISABLE\n", __func__);
+            pipeline_parallel = false;
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {

@@ -9,7 +9,7 @@
 - [x] C++ runtime + full 12-point wiring (src, CLI adapter, factory, arch map,
   CMake, C-ABI session ×10 points, registry, quantizer, diff harness, tests,
   README/docs/tts.md, Go LDFLAGS). All syntax-checked with g++ -fsyntax-only.
-- [~] Kaggle validate: kernel `chr1str/crispasr-supertonic-434`.
+- [~] Kaggle validate: kernel `${KAGGLE_ACCOUNT}/crispasr-supertonic-434`.
   - v1 ERROR: ref dumper missing from branch (bash-cwd trap). Fixed e58b06da.
   - v2 ERROR, two findings: (a) te_* stages cos~0 with |mine|==|ref| to 1e-6 =
     the pre-e32ca6f2 reference layout transpose; (b) GGML_ASSERT(can_repeat)
@@ -112,4 +112,4 @@ each frame = 512 samples → wav [B, 6L·512]. Trim to sr·dur.
 
 ## Worktree
 `.claude/worktrees/feat-434-supertonic`, branch `feat/434-supertonic`.
-Kaggle account: chr1str (chr1s4 taken by a parallel agent).
+Kaggle account: $KAGGLE_ACCOUNT ($KAGGLE_ACCOUNT taken by a parallel agent).

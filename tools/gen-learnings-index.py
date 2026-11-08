@@ -110,6 +110,7 @@ OVERRIDES = {
     "Backend-name guards must match": _M,
     "Server warmup is the launch-time differentiator": _M,
     "When a clone/zero-shot path misbehaves": _P,
+    "2026-10-22 — A voice-clone gate grades the REFERENCE": _P,
     "A TTS AR model that \"never stops\"": _P,
     "An input feature the checkpoint wasn't trained with": _P,
     "Diff-harness \"drift\" is mostly the GGUF quant": _P,
@@ -139,6 +140,7 @@ OVERRIDES = {
 
 # Families to cross-reference. Order matters only for readability.
 MODELS = [
+    ("dolphin", r"[Dd]olphin"),
     ("chatterbox", r"[Cc]hatterbox|CAMPPlus|S3Tokenizer|S3Gen|HiFT"),
     ("cosyvoice3", r"cosyvoice|CosyVoice|CFM Euler"),
     ("vibevoice", r"vibevoice|VibeVoice"),

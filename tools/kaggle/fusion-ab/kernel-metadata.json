@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-fusion-a-b-norm-affine-siglu-on-t4",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-fusion-a-b-norm-affine-siglu-on-t4",
   "title": "CrispASR — fusion A/B (norm_affine + siglu) on T4",
   "code_file": "crispasr-fusion-ab.py",
   "language": "python",

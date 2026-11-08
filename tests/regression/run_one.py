@@ -48,11 +48,16 @@ Env:
   KEEP_WORK       If set to 1, don't delete WORK_DIR on exit.
   REGRESSION_MANIFEST  Path to manifest.json (default:
                   tests/regression/manifest.json).
+  REGRESSION_DIAGNOSTICS_DIR  Optional directory outside WORK_DIR for bounded
+                  command logs and a failed TTS roundtrip's generated WAV.
+  REGRESSION_KEEP_TTS_WAV  Set to 1 with the diagnostics directory to retain
+                  a successful roundtrip's WAV as an explicit manual control.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -63,6 +68,74 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_LOG_LIMIT = 512 * 1024
+_WAV_LIMIT = 32 * 1024 * 1024
+
+
+def _diagnostics_dir() -> Path | None:
+    value = os.environ.get("REGRESSION_DIAGNOSTICS_DIR")
+    if not value:
+        return None
+    path = Path(value).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _bounded_output(value: str | bytes | None) -> dict:
+    data = value.encode("utf-8", errors="replace") if isinstance(value, str) else value or b""
+    text = data[-_LOG_LIMIT:].decode("utf-8", errors="replace")
+    encoded = text.encode("utf-8")
+    if len(encoded) > _LOG_LIMIT:
+        # Replacing malformed bytes can expand the tail by up to 3x. Trim the
+        # encoded suffix and drop only a partial codepoint at its new start.
+        text = encoded[-_LOG_LIMIT:].decode("utf-8", errors="ignore")
+    return {
+        "bytes": len(data),
+        "truncated": len(data) > _LOG_LIMIT or len(encoded) > _LOG_LIMIT,
+        "text": text,
+    }
+
+
+def _run_captured(argv: list[str], *, check: bool, timeout: int, label: str) -> subprocess.CompletedProcess:
+    """Run an unchanged CLI argv; persist bounded output when requested."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=check, timeout=timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        diag = _diagnostics_dir()
+        if diag is not None:
+            (diag / f"{label}.json").write_text(json.dumps({
+                "argv": argv,
+                "returncode": exc.returncode if isinstance(exc, subprocess.CalledProcessError) else None,
+                "timed_out": isinstance(exc, subprocess.TimeoutExpired),
+                "stdout": _bounded_output(exc.stdout),
+                "stderr": _bounded_output(exc.stderr),
+            }, indent=2) + "\n")
+        raise
+    diag = _diagnostics_dir()
+    if diag is not None:
+        (diag / f"{label}.json").write_text(json.dumps({
+            "argv": argv,
+            "returncode": proc.returncode,
+            "timed_out": False,
+            "stdout": _bounded_output(proc.stdout),
+            "stderr": _bounded_output(proc.stderr),
+        }, indent=2) + "\n")
+    return proc
+
+
+def _preserve_tts_wav(name: str, wav: Path) -> None:
+    """Keep only a small generated WAV, never model or downloaded input files."""
+    diag = _diagnostics_dir()
+    if diag is None or not wav.is_file():
+        return
+    size = wav.stat().st_size
+    if size > _WAV_LIMIT:
+        (diag / "wav-skipped.json").write_text(json.dumps({
+            "reason": "generated WAV exceeds diagnostics cap", "bytes": size,
+            "limit": _WAV_LIMIT,
+        }, indent=2) + "\n")
+        return
+    shutil.copyfile(wav, diag / f"tts_{name}.wav")
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":
@@ -190,19 +263,31 @@ def strip_ai_disclaimer(transcript: str) -> str:
     return transcript
 
 
-def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path) -> str:
+def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path, *, srt: bool = False,
+                   label: str = "transcript") -> str:
     """Run `crispasr -m gguf -f sample`, return the transcript line.
 
     The CLI prints the transcript on its own line near the end, after
     the "transcribed N s audio in M s (Kx realtime)" status line.
     Grab the last non-empty non-status line.
     """
-    proc = subprocess.run(
+    if srt:
+        # Bilingual backends emit several cues/lines. Checking the final stdout
+        # line would silently discard earlier cues and every source transcript.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="regression-srt-", dir=gguf.parent) as temp:
+            prefix = Path(temp) / "decoded"
+            _run_captured([str(crispasr_bin), "-m", str(gguf), "-f", str(sample),
+                           "-osrt", "-of", str(prefix)],
+                          check=True, timeout=600, label=label)
+            cues = prefix.with_suffix(".srt").read_text()
+            return " ".join(line.strip() for line in cues.splitlines()
+                            if line.strip() and not line.strip().isdigit() and "-->" not in line)
+    proc = _run_captured(
         [str(crispasr_bin), "-m", str(gguf), "-f", str(sample)],
-        capture_output=True,
-        text=True,
         check=True,
         timeout=600,
+        label=label,
     )
     # The transcript is on stdout; status lines go to stderr. Take stdout's
     # last non-empty line as the transcript (the CLI prints a single text
@@ -241,14 +326,22 @@ def parse_diff_stdout(stdout: str) -> dict[str, float]:
 
 def evaluate_stage_thresholds(
     stages: dict[str, float], thresholds: dict[str, float],
+    default: float | None = None, advisory: tuple[str, ...] | list[str] = (),
 ) -> tuple[list[tuple[str, float, float]], list[tuple[str, float, float]], list[str], list[tuple[str, float]]]:
     """Apply manifest thresholds to parsed cos_min map.
+
+    `default` (manifest `stage_threshold_default`) gates every captured stage
+    that has no explicit threshold — per-layer / conv-snapshot stages used to be
+    INFO-only and could drift arbitrarily without failing anything. Stages whose
+    name starts with a prefix in `advisory` (manifest `advisory_stages`) stay
+    ungated extras. Without `default`, all unlisted stages are extras (old
+    behaviour).
 
     Returns (passes, fails, missing, extras):
       passes  — [(stage, cos_min, threshold)] above threshold
       fails   — [(stage, cos_min, threshold)] below threshold
       missing — [stage] in thresholds but not in stages
-      extras  — [(stage, cos_min)] in stages but not in thresholds
+      extras  — [(stage, cos_min)] captured but not gated
     """
     passes: list[tuple[str, float, float]] = []
     fails: list[tuple[str, float, float]] = []
@@ -259,10 +352,20 @@ def evaluate_stage_thresholds(
             continue
         v = stages[stage]
         (passes if v >= threshold else fails).append((stage, v, threshold))
-    extras = sorted(
-        (s, stages[s]) for s in set(stages) - set(thresholds)
-    )
+    extras: list[tuple[str, float]] = []
+    for s in sorted(set(stages) - set(thresholds)):
+        v = stages[s]
+        if default is None or s.startswith(tuple(advisory)):
+            extras.append((s, v))
+        else:
+            (passes if v >= default else fails).append((s, v, default))
     return passes, fails, missing, extras
+
+
+def stage_gate_kwargs(entry: dict) -> dict:
+    """Manifest entry -> the default/advisory kwargs of evaluate_stage_thresholds."""
+    d = entry.get("stage_threshold_default")
+    return {"default": None if d is None else float(d), "advisory": tuple(entry.get("advisory_stages", []))}
 
 
 def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Path) -> dict:
@@ -276,16 +379,21 @@ def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Pat
     the harness's verdict and only fail if a stage is missing or the
     process crashed outright.
     """
-    proc = subprocess.run(
+    proc = _run_captured(
         [str(diff_bin), backend_id, str(gguf), str(ref), str(sample)],
-        capture_output=True,
-        text=True,
         check=False,
         timeout=600,
+        label="diff",
     )
     if proc.returncode < 0:
         die(f"crispasr-diff died from signal {-proc.returncode}\n"
             f"  stderr tail: {proc.stderr[-400:]}")
+    # Index-Echo's harness also gates magnitude, exact prompt IDs and cached
+    # greedy IDs. Those failures have no cosine row; ignoring its exit status
+    # would silently drop the port's required acceptance gates.
+    if backend_id == "index-echo" and proc.returncode != 0:
+        die(f"Index-Echo mandatory diff gate failed (rc={proc.returncode})\n"
+            f"  stdout tail: {proc.stdout[-1600:]}\n  stderr tail: {proc.stderr[-400:]}")
     # crispasr-diff prints summary lines on stdout. Parse the [PASS]/[FAIL]
     # lines; ignore the diff harness's own pass/fail verdict — we apply our
     # own per-stage thresholds from the manifest.
@@ -299,12 +407,105 @@ def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Pat
     return result
 
 
+def transcript_gate(entry: dict, actual: str) -> tuple[bool, list[str]]:
+    """The transcript pass/fail rule, shared by run_one.py and the Kaggle suite
+    (which used to compare byte-exact and so failed entries GH passes).
+
+    DEFAULT is a zero-tolerance metric gate, not byte-equal: a space-delimited
+    transcript that differs ONLY in punctuation/case has WER=0 and passes, even
+    with no explicit tolerance block — otherwise every byte-equal backend flaps
+    red the moment CI flips a comma (fastconformer / wav2vec2 / mini-omni2 flip
+    run-to-run). An explicit transcript_tolerance widens the bound (e.g. TTS
+    roundtrips). Gating metric by language:
+      * space-delimited: WER (invariant to punctuation/case decode ties); CER
+        is reported as advisory only. The diff-harness stages catch drift.
+      * CJK / no-whitespace: CER (whitespace-split WER is degenerate there).
+    Returns (ok, printable lines).
+    """
+    expected = entry["expected_transcript"]
+    if actual == expected:
+        return True, ["\033[32m  PASS\033[0m  (byte-equal)", f"    {actual!r}"]
+    tol = entry.get("transcript_tolerance") or {"cer_max": 0.0, "wer_max": 0.0}
+    cer, wer = compute_transcript_metrics(expected, actual)
+    cer_max = float(tol.get("cer_max", 0.0))
+    wer_max = float(tol.get("wer_max", 0.0))
+    if " " in expected.strip():
+        ok = wer <= wer_max
+        gate = f"wer={wer:.4f} (max {wer_max}) [gate]  cer={cer:.4f} [advisory]"
+    else:
+        ok = cer <= cer_max
+        gate = f"cer={cer:.4f} (max {cer_max}) [gate, CJK]  wer={wer:.4f} [advisory]"
+    verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
+    suffix = " (within tolerance)" if ok else " (over tolerance)"
+    return ok, [f"{verdict}  {gate}{suffix}", f"    expected: {expected!r}", f"    actual:   {actual!r}"]
+
+
+def validate_exact_diff_transcript(entry: dict) -> None:
+    """Reject incomplete full-precision controls before downloading models."""
+    required = entry.get("require_exact_diff_transcript", False)
+    if not isinstance(required, bool):
+        raise ValueError("require_exact_diff_transcript must be boolean")
+    if required and (not entry.get("diff_gguf") or entry.get("skip_diff", False)
+                     or not entry.get("transcript_reference")):
+        raise ValueError("Exact diff transcript requires diff_gguf, stage diff and independent transcript_reference")
+
+
+def exact_diff_transcript_gate(entry: dict, actual: str) -> tuple[bool, list[str]]:
+    """The F16 control always requires zero error against the original target."""
+    return transcript_gate({**entry, "transcript_tolerance": {"cer_max": 0.0, "wer_max": 0.0}}, actual)
+
+
+def verify_transcript_reference(entry: dict, reference: Path, sample: Path,
+                                work_dir: Path) -> str:
+    """Verify a transcript target against pinned, independent CTC logits.
+
+    This checks provenance before native inference. It cannot silently bless a
+    new native output by replacing the expected string. Human accuracy is
+    reported separately because upstream-model parity can include model errors.
+    """
+    import hashlib
+    from itertools import groupby
+    import gguf
+    import numpy as np
+
+    source = entry["transcript_reference"]
+    def check_hash(path: Path, expected: str):
+        with path.open("rb") as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            actual = h.hexdigest()
+        if actual != expected:
+            raise ValueError(f"Transcript reference SHA256 mismatch: {path.name}")
+    check_hash(reference, source["sha256"])
+    check_hash(sample, source["sample_sha256"])
+    pin = source["vocab"]
+    vocab_path = hf_download(pin["repo"], pin["file"], pin["revision"], work_dir)
+    check_hash(vocab_path, pin["sha256"])
+    vocab = json.loads(vocab_path.read_text())
+    inv = {i: text for text, i in vocab.items()}
+    reader = gguf.GGUFReader(str(reference))
+    logits = next(t.data for t in reader.tensors if t.name == source["stage"])
+    if logits.ndim != 2 or logits.shape[1] != len(vocab) or not np.isfinite(logits).all():
+        raise ValueError("Invalid independent CTC logit grid")
+    blank = vocab[source["blank_token"]]
+    ids = np.argmax(logits, axis=1).tolist()
+    decoded = "".join(inv[i] for i, _ in groupby(ids) if i != blank)
+    decoded = decoded.replace(source["word_delimiter_token"], " ").strip()
+    if _normalize_for_wer(decoded) != _normalize_for_wer(entry["expected_transcript"]):
+        raise ValueError(f"Transcript target disagrees with independent Python reference: {decoded!r}")
+    print(f"[transcript-reference] SHA256 verified; independent Python decode: {decoded!r}")
+    return decoded
+
+
 def regression_for(name: str, manifest: dict, work_dir: Path,
                    crispasr_bin: Path, diff_bin: Path) -> int:
     """Run one backend's regression. Return number of failures."""
     entry = next((b for b in manifest["backends"] if b["name"] == name), None)
     if entry is None:
         die(f"backend '{name}' not in manifest")
+
+    validate_exact_diff_transcript(entry)
 
     gguf_local = hf_download(
         entry["gguf"]["repo"],
@@ -356,77 +557,63 @@ def regression_for(name: str, manifest: dict, work_dir: Path,
 
     failures = 0
     skip_diff = entry.get("skip_diff", False)
+    if "transcript_reference" in entry:
+        if ref_local is None:
+            raise ValueError("Transcript provenance requires an independent reference dump")
+        verify_transcript_reference(entry, ref_local, sample, work_dir)
 
     # ----- 1. Transcript -----
     print(f"\n[transcript] {name}")
-    actual = run_transcript(crispasr_bin, gguf_local, sample)
-    expected = entry["expected_transcript"]
-    # DEFAULT to a zero-tolerance metric gate (not immediate byte-equal FAIL):
-    # a space-delimited transcript that differs ONLY in the punctuation/case
-    # decode tie has WER=0 and must pass, even with no explicit tolerance block —
-    # otherwise every byte-equal backend flaps red the moment CI flips a comma
-    # (empirically fastconformer / wav2vec2 / mini-omni2 flip run-to-run). An
-    # explicit transcript_tolerance widens the bound further (e.g. TTS roundtrips);
-    # its absence just means the tight wer_max=0 / cer_max=0 default.
-    tol = entry.get("transcript_tolerance") or {"cer_max": 0.0, "wer_max": 0.0}
-    if actual == expected:
-        print("\033[32m  PASS\033[0m  (byte-equal)")
-        print(f"    {actual!r}")
-    else:
-        # Pass if within tolerance on the language-appropriate metric. Reflects
-        # the ASR-regression contract users care about: meaning preservation, not
-        # byte equality.
-        cer, wer = compute_transcript_metrics(expected, actual)
-        cer_max = float(tol.get("cer_max", 0.0))
-        wer_max = float(tol.get("wer_max", 0.0))
-        # Pick the GATING metric by language:
-        #  * Space-delimited (Latin etc.): gate on WER. WER is invariant to the
-        #    punctuation/case decode ties that flip *non-deterministically between
-        #    CI runs* (empirically the comma after "americans" flips run-to-run for
-        #    mini-omni2 / wav2vec2 at WER=0), so a CER gate flaps red forever while
-        #    the words are identical. WER still catches real word errors, and the
-        #    diff-harness cos stages catch model-weight drift. CER stays advisory.
-        #  * CJK / no-whitespace: WER is degenerate (whitespace split yields one
-        #    token, so any diff → WER≈1), so gate on CER instead.
-        is_space_delimited = " " in expected.strip()
-        if is_space_delimited:
-            ok = wer <= wer_max
-            gate = f"wer={wer:.4f} (max {wer_max}) [gate]  cer={cer:.4f} (max {cer_max}) [advisory]"
-        else:
-            ok = cer <= cer_max
-            gate = f"cer={cer:.4f} (max {cer_max}) [gate, CJK]  wer={wer:.4f} (advisory)"
-        verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
-        suffix = " (within tolerance)" if ok else " (over tolerance)"
-        print(f"{verdict}  {gate}{suffix}")
-        print(f"    expected: {expected!r}")
-        print(f"    actual:   {actual!r}")
-        if not ok:
-            failures += 1
+    actual = run_transcript(crispasr_bin, gguf_local, sample,
+                            srt=entry.get("transcript_format") == "srt")
+    # WER-normalised gate, shared with the Kaggle suite; see transcript_gate.
+    ok, lines = transcript_gate(entry, actual)
+    for ln in lines:
+        print(ln)
+    if not ok:
+        failures += 1
+    if "human_reference_transcript" in entry:
+        _, human_wer = compute_transcript_metrics(entry["human_reference_transcript"], actual)
+        print(f"[human-accuracy/advisory] WER={human_wer:.4f}; upstream parity is a separate gate")
 
     # ----- 2. Diff harness -----
     if skip_diff:
         print(f"\n[diff-harness] {name}  \033[33mSKIP\033[0m (skip_diff=true; no ref dump baked yet)")
         return failures
 
-    print(f"\n[diff-harness] {name}")
-    stages = run_diff(diff_bin, entry["backend_id"], gguf_local, ref_local, sample)
+    # `diff_gguf` (optional): run the stage diff on a full-precision GGUF while
+    # the transcript above stays on the shipped quant. A q4_k encoder sits at
+    # cos ~0.95 against an F32 reference, so a gate on it can only be loose;
+    # the F16 file of the same model matches at >= 0.99999 and can be gated tight.
+    diff_gguf = gguf_local
+    if entry.get("diff_gguf"):
+        dg = entry["diff_gguf"]
+        diff_gguf = hf_download(dg.get("repo", entry["gguf"]["repo"]), dg["file"],
+                                dg.get("revision", entry["gguf"]["revision"]), work_dir)
+    if entry.get("require_exact_diff_transcript", False):
+        print(f"\n[transcript-f16] {name}")
+        control = run_transcript(crispasr_bin, diff_gguf, sample,
+                                 srt=entry.get("transcript_format") == "srt", label="transcript-f16")
+        control_ok, control_lines = exact_diff_transcript_gate(entry, control)
+        for line in control_lines:
+            print(line)
+        failures += int(not control_ok)
+    print(f"\n[diff-harness] {name}  ({diff_gguf.name})")
+    stages = run_diff(diff_bin, entry["backend_id"], diff_gguf, ref_local, sample)
     thresholds = entry["diff_thresholds"]
-    for stage, threshold in thresholds.items():
-        if stage not in stages:
-            print(f"\033[33m  SKIP\033[0m {stage}  (not captured by diff harness)")
-            continue
-        cos_min = stages[stage]
-        ok = cos_min >= threshold
-        verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
-        print(f"{verdict} {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
-        if not ok:
-            failures += 1
-    # Surface any stages that came back but aren't in thresholds — these
-    # are new captures that should be added to manifest.json.
-    extra = set(stages) - set(thresholds)
-    for stage in sorted(extra):
-        print(f"\033[33m  INFO\033[0m {stage} cos_min={stages[stage]:.6f} "
-              f"(not in manifest thresholds; add it if intentional)")
+    passes, fails, missing, extras = evaluate_stage_thresholds(stages, thresholds, **stage_gate_kwargs(entry))
+    for stage in missing:
+        print(f"\033[31m  FAIL\033[0m {stage}  (required stage not captured by diff harness)")
+    for stage, cos_min, threshold in passes:
+        print(f"\033[32m  PASS\033[0m {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
+    for stage, cos_min, threshold in fails:
+        print(f"\033[31m  FAIL\033[0m {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
+    failures += len(fails) + len(missing)
+    # Captured but ungated: no stage_threshold_default, or listed in
+    # advisory_stages. Add a threshold (or a default) if the stage is meant to hold.
+    for stage, cos_min in extras:
+        print(f"\033[33m  INFO\033[0m {stage} cos_min={cos_min:.6f} "
+              f"(ungated: not in diff_thresholds / advisory_stages)")
 
     return failures
 
@@ -564,19 +751,21 @@ def tts_roundtrip_for(name: str, manifest: dict, work_dir: Path,
         syn_cmd += ["--codec-model", str(codec_local)]
     syn_cmd += list(entry.get("tts_extra_args", []))
     try:
-        proc = subprocess.run(syn_cmd, capture_output=True, text=True,
-                              timeout=300)
+        proc = _run_captured(syn_cmd, check=False, timeout=300, label="tts-synth")
     except subprocess.TimeoutExpired:
+        _preserve_tts_wav(name, out_wav)
         if advisory:
             return advisory_skip("TTS synth timed out after 300 s")
         die(f"{name}: TTS synth timed out after 300 s")
     if proc.returncode != 0:
+        _preserve_tts_wav(name, out_wav)
         if advisory:
             return advisory_skip(f"TTS synth crashed (rc={proc.returncode})")
         print(f"\033[31m  FAIL\033[0m  TTS synth crashed (rc={proc.returncode})")
         print(f"    stderr tail: ...{(proc.stderr or '')[-300:]}")
         return 1
     if not out_wav.is_file() or out_wav.stat().st_size < 1000:
+        _preserve_tts_wav(name, out_wav)
         if advisory:
             return advisory_skip(f"TTS produced no usable output: {out_wav}")
         print(f"\033[31m  FAIL\033[0m  TTS produced no usable output: {out_wav}")
@@ -589,13 +778,14 @@ def tts_roundtrip_for(name: str, manifest: dict, work_dir: Path,
                "-f", str(out_wav),
                "--no-prints"]
     try:
-        proc = subprocess.run(asr_cmd, capture_output=True, text=True,
-                              timeout=180)
+        proc = _run_captured(asr_cmd, check=False, timeout=180, label="roundtrip-asr")
     except subprocess.TimeoutExpired:
+        _preserve_tts_wav(name, out_wav)
         if advisory:
             return advisory_skip("ASR roundtrip timed out after 180 s")
         die(f"{name}: ASR roundtrip timed out after 180 s")
     if proc.returncode != 0:
+        _preserve_tts_wav(name, out_wav)
         if advisory:
             return advisory_skip(f"ASR roundtrip crashed (rc={proc.returncode})")
         print(f"\033[31m  FAIL\033[0m  ASR roundtrip crashed (rc={proc.returncode})")
@@ -611,6 +801,8 @@ def tts_roundtrip_for(name: str, manifest: dict, work_dir: Path,
     wer_max = float(entry["wer_max"])
     _, wer = compute_transcript_metrics(tts_phrase, transcript)
     ok = wer <= wer_max
+    if not ok or os.environ.get("REGRESSION_KEEP_TTS_WAV") == "1":
+        _preserve_tts_wav(name, out_wav)
     # `advisory: true` entries report their WER but never fail the run — for
     # legitimately weak / high-variance TTS models (e.g. bark-small) whose
     # roundtrip can't clear a tight cross-platform bar. NOT for masking a real
@@ -629,6 +821,78 @@ def tts_roundtrip_for(name: str, manifest: dict, work_dir: Path,
     if raw_transcript != transcript:
         print(f"    (raw incl. AI-disclosure: {raw_transcript!r})")
     return 0 if (ok or advisory) else 1
+
+
+def compare_alignment(expected: list[dict], actual: list[dict], tolerance: float) -> tuple[bool, str, dict]:
+    """Compare word alignments: identical normalized words, every start/end
+    within ``tolerance`` seconds. Returns (ok, reason, stats)."""
+    def norm(word: str) -> str:
+        return re.sub(r"[^\w]", "", word.lower())
+
+    if not expected:
+        return False, "expected alignment is empty", {}
+    if len(expected) != len(actual):
+        return False, f"word count {len(actual)} != expected {len(expected)}", {}
+    got = [norm(str(w.get("word", ""))) for w in actual]
+    want = [norm(str(w["word"])) for w in expected]
+    if got != want:
+        first = next(i for i, (a, b) in enumerate(zip(got, want)) if a != b)
+        return False, f"word {first}: {got[first]!r} != expected {want[first]!r}", {}
+    errors = []
+    for a, b in zip(actual, expected):
+        for key in ("start", "end"):
+            try:
+                value = float(a[key])
+            except (KeyError, TypeError, ValueError):
+                return False, f"missing or non-numeric {key!r} for {a.get('word')!r}", {}
+            if not math.isfinite(value):
+                return False, f"non-finite {key} for {a.get('word')!r}", {}
+            errors.append(abs(value - float(b[key])))
+    stats = {"words": len(actual), "max_abs_s": max(errors), "mean_abs_s": sum(errors) / len(errors)}
+    if stats["max_abs_s"] > tolerance:
+        return False, f"max timestamp error {stats['max_abs_s']:.3f}s > {tolerance}s", stats
+    return True, "", stats
+
+
+def align_for(name: str, manifest: dict, work_dir: Path, crispasr_bin: Path) -> int:
+    """Run one forced-aligner regression (manifest.align_backends).
+
+    Downloads the pinned aligner GGUF, runs ``crispasr --align-only`` on the
+    entry's sample and reference text, and compares the JSON word alignment
+    with the pinned expected words (``expected_source`` records where they came
+    from, e.g. the upstream Python implementation). Returns failures (0/1).
+    """
+    entry = next((b for b in manifest.get("align_backends", []) if b["name"] == name), None)
+    if entry is None:
+        die(f"aligner '{name}' not in manifest.align_backends")
+    g = entry["gguf"]
+    print(f"\n[align] {name}  ({g['repo']}@{g['revision'][:8]}::{g['file']})")
+    print(f"  expected  {entry['expected_source']}")
+    # The Qwen3 forced-aligner path is selected by filename; keep the pinned name.
+    gguf = hf_download(g["repo"], g["file"], g["revision"], work_dir)
+    sample = REPO_ROOT / entry["sample"]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_json = work_dir / f"align_{name}.json"
+    cmd = [str(crispasr_bin), "--align-only", "-am", str(gguf), "-f", str(sample),
+           "--ref-text", entry["ref_text"], "--align-format", "json", "--align-output", str(out_json),
+           "-ng", "-t", str(entry.get("threads", 2))] + list(entry.get("extra_args", []))
+    proc = _run_captured(cmd, check=False, timeout=int(entry.get("timeout_s", 900)), label="align")
+    if proc.returncode != 0 or not out_json.exists():
+        print(f"\033[31m  FAIL\033[0m  crispasr --align-only exited {proc.returncode}")
+        print((proc.stderr or "")[-2000:])
+        return 1
+    try:
+        actual = json.loads(out_json.read_text())
+    except ValueError as exc:
+        print(f"\033[31m  FAIL\033[0m  unreadable alignment JSON: {exc}")
+        return 1
+    ok, reason, stats = compare_alignment(entry["expected_words"], actual, float(entry["tolerance_s"]))
+    if ok:
+        print(f"\033[32m  PASS\033[0m  {stats['words']} words, max |dt| {stats['max_abs_s']:.3f}s "
+              f"(tol {entry['tolerance_s']}s)")
+        return 0
+    print(f"\033[31m  FAIL\033[0m  {reason}")
+    return 1
 
 
 def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
@@ -653,6 +917,36 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
     from huggingface_hub import HfApi
     from huggingface_hub.errors import HfHubHTTPError
 
+    # An EXPIRED token is worse than no token: huggingface_hub sends it and HF
+    # answers 401 even for a PUBLIC repo, so a stale credential breaks a repo
+    # that would have worked anonymously. cstr/crispasr-regression-fixtures is
+    # public and ungated, and the 2026-09-16 nightly died on exactly that —
+    # "Repository Not Found ... make sure you are authenticated" against a repo
+    # needing no authentication at all.
+    #
+    # Fails OPEN on anything but an explicit 401/403: a timeout is not evidence
+    # that a token is bad, and dropping a good one would break private fetches
+    # for an unrelated reason.
+    _tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if _tok:
+        try:
+            import urllib.error
+            import urllib.request
+            _rq = urllib.request.Request(
+                "https://huggingface.co/api/whoami-v2",
+                headers={"Authorization": f"Bearer {_tok}"})
+            with urllib.request.urlopen(_rq, timeout=20) as _r:
+                _rejected = _r.status in (401, 403)
+        except urllib.error.HTTPError as _e:
+            _rejected = _e.code in (401, 403)
+        except Exception:
+            _rejected = False
+        if _rejected:
+            print("\033[33mWARN\033[0m  HF_TOKEN is expired or revoked — dropping it "
+                  "and continuing anonymously (the fixtures and gguf repos are public).")
+            os.environ.pop("HF_TOKEN", None)
+            os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+
     api = HfApi()
     fx_repo = manifest["fixtures"]["repo"]
     fx_rev = manifest["fixtures"]["revision"]
@@ -670,18 +964,22 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
     failures = 0
     backends = manifest["backends"]
     tts_backends = manifest.get("tts_backends", [])
+    align_backends = manifest.get("align_backends", [])
     if backend_filter:
+        align_backends = [b for b in align_backends if b["name"] == backend_filter]
         filt_asr = [b for b in backends if b["name"] == backend_filter]
         filt_tts = [b for b in tts_backends if b["name"] == backend_filter]
-        if not filt_asr and not filt_tts:
+        if not filt_asr and not filt_tts and not align_backends:
             die(f"backend '{backend_filter}' not in manifest")
         backends = filt_asr
         tts_backends = filt_tts
 
     print(f"dry-run: fixtures {fx_repo}@{fx_rev[:8]} has {len(fx_files)} files")
-    print(f"dry-run: checking {len(backends)} ASR + {len(tts_backends)} TTS backend(s)")
+    print(f"dry-run: checking {len(backends)} ASR + {len(tts_backends)} TTS + "
+          f"{len(align_backends)} aligner backend(s)")
 
     for entry in backends:
+        validate_exact_diff_transcript(entry)
         name = entry["name"]
         # skip_preflight: true — GGUF repo temporarily inaccessible (e.g. HF
         # private-repo storage limit). Dry-run skips the artifact check so CI
@@ -707,6 +1005,31 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
                   f"{gguf_rev[:8]}::{gguf_file} not found")
             failures += 1
             continue
+
+        if "transcript_reference" in entry:
+            pin = entry["transcript_reference"]["vocab"]
+            try:
+                vocab_ok = api.file_exists(repo_id=pin["repo"], repo_type="model",
+                                           revision=pin["revision"], filename=pin["file"])
+            except HfHubHTTPError as exc:
+                vocab_ok = False
+                print(f"  {exc}")
+            if not vocab_ok:
+                print(f"  FAIL {name}: pinned transcript-reference vocabulary missing")
+                failures += 1
+
+        dg = entry.get("diff_gguf")
+        if dg and not entry.get("skip_diff", False):
+            dg_repo, dg_rev = dg.get("repo", gguf_repo), dg.get("revision", gguf_rev)
+            try:
+                dg_ok = api.file_exists(repo_id=dg_repo, repo_type="model", revision=dg_rev, filename=dg["file"])
+            except HfHubHTTPError as exc:
+                dg_ok = False
+                print(f"  {exc}")
+            if not dg_ok:
+                print(f"  \033[31mFAIL\033[0m {name}: diff_gguf {dg_repo}@{dg_rev[:8]}::{dg['file']} not found")
+                failures += 1
+                continue
 
         # Fixture ref.gguf — membership check against the listing.
         # Skipped for transcript-only entries (skip_diff: true).
@@ -797,7 +1120,25 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
             continue
         print(f"  \033[32mPASS\033[0m {name}  (TTS roundtrip via {asr_ref})")
 
-    total = len(backends) + len(tts_backends)
+    for entry in align_backends:
+        name = entry["name"]
+        missing = [k for k in ("gguf", "sample", "ref_text", "expected_words", "expected_source", "tolerance_s")
+                   if k not in entry]
+        if missing:
+            print(f"  \033[31mFAIL\033[0m {name}: align entry missing {missing}")
+            failures += 1
+            continue
+        if not (REPO_ROOT / entry["sample"]).exists():
+            print(f"  \033[31mFAIL\033[0m {name}: sample {entry['sample']} not in repo")
+            failures += 1
+            continue
+        if not _check_pinned_file("align gguf", name, entry["gguf"]["repo"],
+                                  entry["gguf"]["revision"], entry["gguf"]["file"]):
+            failures += 1
+            continue
+        print(f"  \033[32mPASS\033[0m {name}  (aligner vs {entry['expected_source']})")
+
+    total = len(backends) + len(tts_backends) + len(align_backends)
     if failures == 0:
         print(f"\n\033[32mOK\033[0m  dry-run: all {total} backend(s) "
               f"have their pinned artifacts on HF")
@@ -851,10 +1192,12 @@ def main() -> int:
     asr_entry = next((b for b in manifest["backends"] if b["name"] == backend_name), None)
     tts_entry = next((b for b in manifest.get("tts_backends", [])
                       if b["name"] == backend_name), None) if asr_entry is None else None
+    align_entry = next((b for b in manifest.get("align_backends", [])
+                        if b["name"] == backend_name), None) if asr_entry is None and tts_entry is None else None
 
-    if asr_entry is None and tts_entry is None:
-        die(f"backend '{backend_name}' not in manifest.backends or "
-            f"manifest.tts_backends")
+    if asr_entry is None and tts_entry is None and align_entry is None:
+        die(f"backend '{backend_name}' not in manifest.backends, "
+            f"manifest.tts_backends or manifest.align_backends")
 
     # crispasr-diff is only needed for full ASR diff entries
     # (skip_diff=false). TTS roundtrip doesn't use it.
@@ -869,7 +1212,12 @@ def main() -> int:
     keep_work = os.environ.get("KEEP_WORK") == "1"
 
     try:
-        if tts_entry is not None:
+        diagnostics = os.environ.get("REGRESSION_DIAGNOSTICS_DIR")
+        if diagnostics and Path(diagnostics).resolve().is_relative_to(work_root.resolve()):
+            die("REGRESSION_DIAGNOSTICS_DIR must be outside WORK_DIR so cleanup preserves evidence")
+        if align_entry is not None:
+            failures = align_for(backend_name, manifest, work_root, crispasr_bin)
+        elif tts_entry is not None:
             failures = tts_roundtrip_for(
                 backend_name, manifest, work_root, crispasr_bin)
         else:

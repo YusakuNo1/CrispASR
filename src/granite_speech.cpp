@@ -130,6 +130,7 @@ struct granite_speech_hparams {
     uint32_t llm_head_dim = 128;
     uint32_t llm_ff_dim = 4096;
     float llm_rope_theta = 10000.0f;
+    core_granite_llm::RopeScaling llm_rope;
     float llm_rms_eps = 1e-5f;
     uint32_t llm_vocab_size = 100353;
 
@@ -375,6 +376,7 @@ struct granite_speech_context {
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -414,6 +416,21 @@ static bool granite_speech_load_model(granite_speech_model& model, const char* p
         hp.llm_head_dim = core_gguf::kv_u32(g, "granite_speech.llm.head_dim", hp.llm_head_dim);
         hp.llm_ff_dim = core_gguf::kv_u32(g, "granite_speech.llm.ff_dim", hp.llm_ff_dim);
         hp.llm_rope_theta = core_gguf::kv_f32(g, "granite_speech.llm.rope_theta", hp.llm_rope_theta);
+        const std::string rope_type = core_gguf::kv_str(g, "granite_speech.llm.rope_scaling.type", "default");
+        if (rope_type != "default") {
+            const float factor = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.factor", 0.0f);
+            const int original_ctx = core_gguf::kv_u32(g, "granite_speech.llm.rope_scaling.original_context", 0);
+            const float attention_factor =
+                core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.attention_factor", 0.0f);
+            const float beta_fast = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.beta_fast", 32.0f);
+            const float beta_slow = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.beta_slow", 1.0f);
+            if (rope_type != "yarn" || !core_granite_llm::configure_yarn(hp.llm_rope, factor, original_ctx,
+                                                                         attention_factor, beta_fast, beta_slow)) {
+                fprintf(stderr, "granite_speech: unsupported or invalid RoPE scaling metadata\n");
+                core_gguf::free_metadata(g);
+                return false;
+            }
+        }
         hp.llm_rms_eps = core_gguf::kv_f32(g, "granite_speech.llm.rms_norm_eps", hp.llm_rms_eps);
         hp.llm_vocab_size = core_gguf::kv_u32(g, "granite_speech.llm.vocab_size", hp.llm_vocab_size);
 
@@ -649,7 +666,16 @@ extern "C" int32_t* granite_speech_tokenize(struct granite_speech_context* ctx, 
         if (end <= plain_start)
             return;
         std::string seg = input.substr(plain_start, end - plain_start);
-        auto ids = core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, seg);
+        // granite-4.x (audio token >= 50000) uses the Llama-3 pre-tokenizer
+        // (\p{N}{1,3}, punctuation keeps its trailing newlines: "?\n" is ONE
+        // token). tokenize_simple split on whitespace and dropped the "\n"
+        // entirely, so every non-default prompt (-l, --hotwords, --ask,
+        // translate) differed from transformers' apply_chat_template ids.
+        // Verified id-for-id against the HF tokenizer on the backend's prompt
+        // shapes. granite-3.x keeps its GPT-2 path (different regex; unverified).
+        auto ids = ctx->model.hparams.audio_token_index >= 50000
+                       ? core_bpe::tokenize_qwen(ctx->token_to_id, ctx->merge_rank, seg, 3)
+                       : core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, seg);
         out_ids.insert(out_ids.end(), ids.begin(), ids.end());
     };
 
@@ -1548,7 +1574,7 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
         }
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "granite_encoder_graph: compute failed\n");
         return nullptr;
     }
@@ -1607,7 +1633,7 @@ static bool run_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tens
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return false;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mm_pair_in"), x, 0, (size_t)d_in * T * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return false;
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_a"), out_a, 0, (size_t)d_out_a * T * sizeof(float));
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_b"), out_b, 0, (size_t)d_out_b * T * sizeof(float));
@@ -1746,7 +1772,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
         // Shaw block attention on CPU
         core_conformer_ibm::shaw_block_attention_cpu(attn_out.data(), Q.data(), K.data(), V.data(),
                                                      rpe_per_layer[il].empty() ? nullptr : rpe_per_layer[il].data(), T,
-                                                     n_heads, hd, ctx_size, attn_scale, remainder);
+                                                     n_heads, hd, ctx_size, attn_scale, remainder, ctx->n_threads);
 
         if (ctx->params.verbosity >= 2 && il == 0) {
             fprintf(stderr, "  L0 after attn[0][:4] = %.4f %.4f %.4f %.4f\n", attn_out[0], attn_out[1], attn_out[2],
@@ -1786,7 +1812,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
             if (b.post_norm_b)
                 ggml_backend_tensor_get(b.post_norm_b, nb.data(), 0, d * sizeof(float));
             core_cpu::layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
-                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f, ctx->n_threads);
         }
 
         // PLUS: snapshot the post-norm hidden state at any cat_layer index.
@@ -2092,7 +2118,7 @@ extern "C" float* granite_speech_run_projector(struct granite_speech_context* ct
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "proj_enc_input"), window_data, 0,
                                 (size_t)window_size * d * sizeof(float));
 
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
             return nullptr;
 
         ggml_tensor* out = ggml_graph_get_tensor(gf, "proj_output");
@@ -2206,6 +2232,7 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
@@ -2288,7 +2315,7 @@ extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, 
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return nullptr;
 
     // Debug: dump per-layer values during prefill
@@ -2465,6 +2492,7 @@ static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
@@ -2541,8 +2569,8 @@ static float* granite_run_bucket_decode(granite_speech_context* ctx, const float
         pmask[k] = (k <= n_past) ? zero : neg_inf;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
 
-    const ggml_status st =
-        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    const ggml_status st = use_ga ? ggml_backend_graph_compute(ctx->backend, gf)
+                                  : core_sched_prof::compute(ctx->sched, gf, "granite-speech");
     if (st != GGML_STATUS_SUCCESS)
         return nullptr;
 
@@ -2610,6 +2638,7 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
@@ -2691,8 +2720,8 @@ static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
 
     const int64_t t_comp0 = ggml_time_us();
-    const ggml_status st =
-        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    const ggml_status st = use_ga ? ggml_backend_graph_compute(ctx->backend, gf)
+                                  : core_sched_prof::compute(ctx->sched, gf, "granite-speech");
     ctx->dec_prof_compute_us += ggml_time_us() - t_comp0;
     if (st != GGML_STATUS_SUCCESS)
         return -1;
@@ -2802,7 +2831,7 @@ extern "C" float* granite_speech_embed_tokens(struct granite_speech_context* ctx
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), input_ids, 0, (size_t)n_tokens * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return nullptr;
     ggml_tensor* emb = ggml_graph_get_tensor(gf, "embeds");
     float* result = (float*)malloc((size_t)n_tokens * d * sizeof(float));

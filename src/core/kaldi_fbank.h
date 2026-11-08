@@ -6,6 +6,8 @@
 // preemphasis_coefficient=0.97, remove_dc_offset=True, raw_energy=True,
 // round_to_power_of_two=True, snip_edges=True, window_type='povey'.
 //
+// Triangles are built in the mel domain, as Kaldi does (mel_domain_triangles).
+//
 // Useful for any speaker / VAD encoder trained against Kaldi's `fbank`
 // pipeline. Currently consumed by the chatterbox CAMPPlus port (80-bin)
 // and structurally identical to the `compute_fbank` helper inlined in
@@ -13,8 +15,8 @@
 // fbank — that path adds an `int16_scale` knob here).
 //
 // Output is row-major (T_frames, n_mels) float32. T_frames =
-// (n_samples - win_samples) / hop_samples + 1 (kaldi snip_edges=True
-// — drops trailing partial frames).
+// (n_samples - win_samples) / hop_samples + 1 with snip_edges (the default,
+// drops trailing partial frames), or (n_samples + hop/2) / hop without.
 
 #pragma once
 
@@ -42,7 +44,17 @@ struct FbankParams {
                                      // (firered_asr / funasr trained on int16-scaled features;
                                      //  CAMPPlus / most modern speaker encoders consume raw [-1, 1])
     WindowType window_type = WindowType::Povey;
+    // Kaldi `snip_edges=false`: frame i starts at i*hop + hop/2 - win/2, samples
+    // outside the signal are mirrored, and T = (n + hop/2) / hop — what
+    // kaldi-native-fbank / sherpa-onnx use. Default true keeps the historic framing.
+    bool snip_edges = true;
+    // Kaldi, kaldi-native-fbank and torchaudio.compliance.kaldi build the
+    // triangles linear in MEL. Until 2026-09 this file built them linear in Hz,
+    // and every Kaldi-fbank backend drifted from its reference by that much
+    // (log-mel mean |d| ~2.6e-3). false keeps the Hz form for an explicit caller.
+    bool mel_domain_triangles = true;
 };
+// high_freq: 0 = Nyquist, negative = Nyquist + high_freq (Kaldi's convention, e.g. -400).
 
 // Compute Kaldi-compatible filterbank features for the given 16 kHz mono
 // PCM buffer. Returns (T_frames, n_mels) row-major float32 features.

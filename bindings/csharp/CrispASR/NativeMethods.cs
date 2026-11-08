@@ -9,7 +9,7 @@ namespace CrispASR
     /// The public <see cref="Session"/> class wraps these into safe,
     /// idiomatic C# types.
     /// </summary>
-    internal static class NativeMethods
+    internal static partial class NativeMethods
     {
         // One name, shared with NativeLibraryResolver — the resolver only
         // intercepts loads of exactly this name, so the two must not drift.
@@ -140,6 +140,12 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_max_new_tokens(IntPtr s, int n);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_autochunk(IntPtr s, int enabled, int chunk_seconds);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_max_new_tokens_per_second(IntPtr s, float rate, int minimum);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_frequency_penalty(IntPtr s, float penalty);
@@ -357,6 +363,17 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr crispasr_session_result_segment_speaker(IntPtr result, int i);
 
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_result_n_tokens(IntPtr r, int segment);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_result_token_text(IntPtr r, int segment, int token);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long crispasr_session_result_token_t0(IntPtr r, int segment, int token);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long crispasr_session_result_token_t1(IntPtr r, int segment, int token);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_session_result_token_p(IntPtr r, int segment, int token);
+
         // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
         // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
         // canary-ctc). _logits returns a const float* (frame-major;
@@ -415,6 +432,15 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern long crispasr_align_result_word_t1(IntPtr result, int i);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_align_result_n_characters(IntPtr result, int word);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_align_result_character_text(IntPtr result, int word, int i);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long crispasr_align_result_character_t0(IntPtr result, int word, int i);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long crispasr_align_result_character_t1(IntPtr result, int word, int i);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_align_result_free(IntPtr result);
@@ -493,6 +519,8 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr crispasr_session_piano_notes(IntPtr s, out int nNotes);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_piano_note_programs(IntPtr s, out int nNotes);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_piano_sample_rate(IntPtr s);
 
         // pitch (F0)
@@ -529,8 +557,15 @@ namespace CrispASR
         internal static extern int crispasr_session_convert_n_speakers(IntPtr s);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_convert_sample_rate(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert_inter_channels(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert_upsample_product(IntPtr s);
 
         // ---- Streaming ----
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_stream_kind(IntPtr session);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr crispasr_session_stream_open(
             IntPtr s, int nThreads, int stepMs, int lengthMs,
@@ -546,6 +581,8 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_stream_flush(IntPtr stream);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_stream_set_live_decode(IntPtr stream, int enabled);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_stream_close(IntPtr stream);
@@ -692,6 +729,16 @@ namespace CrispASR
             int n = 0;
             while (n < buf.Length && buf[n] != 0) n++;
             return Encoding.UTF8.GetString(buf, 0, n);
+        }
+
+        internal static byte[] CopyUtf8Bytes(IntPtr ptr)
+        {
+            if (ptr == IntPtr.Zero) return Array.Empty<byte>();
+            int n = 0;
+            while (Marshal.ReadByte(ptr, n) != 0) n = checked(n + 1);
+            var result = new byte[n];
+            if (n > 0) Marshal.Copy(ptr, result, 0, n);
+            return result;
         }
 
         internal static string? PtrToUtf8(IntPtr ptr)

@@ -1,7 +1,10 @@
 #include "realtime_server.h"
 #include "core/realtime_turn_buffer.h"
+#include "core/crispasr_env.h"
 #include "crispasr_vad.h"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -23,6 +26,7 @@ typedef SOCKET socket_t;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 typedef int socket_t;
@@ -204,6 +208,14 @@ static void ws_send_close(socket_t fd) {
     send_all(fd, f, 2);
 }
 
+// Answer a Ping with a Pong that carries the same payload.
+static bool ws_send_pong(socket_t fd, const std::vector<uint8_t>& payload) {
+    uint8_t head[2] = {0x8A, (uint8_t)payload.size()};
+    if (!send_all(fd, head, 2))
+        return false;
+    return payload.empty() || send_all(fd, payload.data(), payload.size());
+}
+
 static int ws_read_frame(socket_t fd, std::vector<uint8_t>& payload, uint8_t* out_opcode) {
     uint8_t h[2];
     if (!recv_exact(fd, h, 2))
@@ -273,6 +285,7 @@ struct rt_session {
     CrispasrBackend* backend;
     std::mutex* model_mutex;
     whisper_params rp;
+    int max_turn_seconds = 30;
     core_realtime::TurnBuffer turn{16000 * 30};
     std::unique_ptr<CrispasrRealtimeSession> realtime;
     std::string text_sent;
@@ -288,6 +301,18 @@ struct rt_session {
     rt_session(socket_t fd, CrispasrBackend* b, std::mutex* m, whisper_params p)
         : client_fd(fd), backend(b), model_mutex(m), rp(std::move(p)), realtime(backend->create_realtime_session(rp)) {
         server_vad = rp.vad && !rp.vad_model.empty();
+        if (realtime && std::strcmp(backend->name(), "nemotron") == 0) {
+            if (const char* value = crispasr_env::get("CRISPASR_NEMOTRON_MAX_TURN_SECONDS")) {
+                char* end = nullptr;
+                const long seconds = std::strtol(value, &end, 10);
+                if (end != value && *end == '\0' && seconds >= 1 && seconds <= 300) {
+                    max_turn_seconds = (int)seconds;
+                    turn = core_realtime::TurnBuffer((size_t)16000 * max_turn_seconds);
+                } else {
+                    fprintf(stderr, "realtime: CRISPASR_NEMOTRON_MAX_TURN_SECONDS must be 1..300; using 30\n");
+                }
+            }
+        }
     }
 
     void send_simple_event(const char* type) {
@@ -475,11 +500,13 @@ static void rt_handle_connection(rt_session* sess) {
 
     std::string req(req_buf);
     std::string ws_key;
-    auto pos = req.find("Sec-WebSocket-Key:");
-    if (pos == std::string::npos)
-        pos = req.find("sec-websocket-key:");
+    std::string req_lower = req;
+    std::transform(req_lower.begin(), req_lower.end(), req_lower.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    const std::string key_header = "\r\nsec-websocket-key:";
+    auto pos = req_lower.find(key_header);
     if (pos != std::string::npos) {
-        auto start = req.find_first_not_of(" \t", pos + 18);
+        auto start = req.find_first_not_of(" \t", pos + key_header.size());
         auto end = req.find("\r\n", start);
         if (start != std::string::npos && end != std::string::npos)
             ws_key = req.substr(start, end - start);
@@ -509,7 +536,7 @@ static void rt_handle_connection(rt_session* sess) {
     created["turn_detection"] = sess->server_vad ? "server_vad" : "client_commit";
     created["server_vad"] = sess->server_vad;
     created["partial_transcription"] = sess->realtime != nullptr;
-    created["max_turn_seconds"] = 30;
+    created["max_turn_seconds"] = sess->max_turn_seconds;
     ws_send_text(sess->client_fd, created.dump());
 
     std::vector<uint8_t> payload;
@@ -520,6 +547,13 @@ static void rt_handle_connection(rt_session* sess) {
             break;
         if (opcode == 0x08)
             break; // close
+        if (opcode == 0x09) {
+            if (payload.size() > 125)
+                break; // a Ping carries at most 125 bytes
+            if (!ws_send_pong(sess->client_fd, payload))
+                break;
+            continue;
+        }
 
         if (opcode == 0x01 && len > 0) { // text
             std::string msg(payload.begin(), payload.end());
@@ -554,6 +588,15 @@ static void rt_handle_connection(rt_session* sess) {
 
 static void rt_listener_thread(CrispasrBackend* backend, std::mutex* model_mutex, whisper_params base_params) {
     while (g_rt_running.load()) {
+        // select() with a timeout, not a bare accept(): closing a listening socket
+        // does not wake a blocked accept() on Linux, so realtime_server_stop()'s
+        // join would hang and the server could not shut down.
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(g_rt_listen_fd, &rfds);
+        struct timeval tv = {1, 0};
+        if (select((int)g_rt_listen_fd + 1, &rfds, nullptr, nullptr, &tv) <= 0)
+            continue;
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
         socket_t client = accept(g_rt_listen_fd, (struct sockaddr*)&addr, &addr_len);
@@ -609,10 +652,10 @@ void realtime_server_stop() {
     if (!g_rt_running.load())
         return;
     g_rt_running.store(false);
+    if (g_rt_thread.joinable())
+        g_rt_thread.join(); // the select() loop exits within ~1 s
     if (g_rt_listen_fd != INVALID_SOCKET) {
         CLOSE_SOCKET(g_rt_listen_fd);
         g_rt_listen_fd = INVALID_SOCKET;
     }
-    if (g_rt_thread.joinable())
-        g_rt_thread.join();
 }

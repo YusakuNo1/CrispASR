@@ -100,6 +100,11 @@ const char* nemotron_token_to_str(struct nemotron_context* ctx, int token_id);
 float* nemotron_compute_mel(struct nemotron_context* ctx, const float* samples, int n_samples, int* out_n_mels,
                             int* out_T_mel);
 
+// Returns frame-major [T_enc, d_model] from the existing subsampling graph.
+// The caller owns the returned allocation and must free it.
+float* nemotron_run_preencode_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc,
+                                  int* out_d_model);
+
 float* nemotron_run_encoder_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc,
                                 int* out_d_model);
 
@@ -119,7 +124,8 @@ void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, 
 // Persistent cache-aware streaming session. append() consumes new 16 kHz PCM
 // and emits tokens for encoder chunks that have become stable. flush=true
 // pads/processes the final short chunk. reset() starts a new utterance while
-// retaining the loaded model.
+// retaining the loaded model. Input packet sizes do not change the model
+// processing cadence: audio is regrouped into canonical internal steps.
 struct nemotron_stream* nemotron_stream_create(struct nemotron_context* ctx);
 void nemotron_stream_free(struct nemotron_stream* stream);
 bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,

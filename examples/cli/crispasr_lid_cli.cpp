@@ -8,6 +8,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_lid.h" // shared library header (src/)
+#include "core/lid_recording.h"
 #include "crispasr_subprocess.h"
 #include "whisper_params.h"
 
@@ -48,6 +49,31 @@ std::string expand_home(const std::string& p) {
     return std::string(home) + p.substr(1);
 }
 
+// LID models follow the same consent rule as the main model (#570): a cached
+// file is used as-is; a missing one downloads only with --auto-download or an
+// interactive "yes". Otherwise LID is skipped with a hint, never a silent fetch.
+std::string lid_fetch(const char* file, const char* url, const whisper_params& p, const char* tag) {
+    if (!crispasr_cache::probe_cached_file(file, p.cache_dir).empty() || p.auto_download)
+        return crispasr_cache::ensure_cached_file(file, url, p.no_prints, tag, p.cache_dir);
+#ifdef _WIN32
+    const bool tty = _isatty(_fileno(stdin)) != 0;
+#else
+    const bool tty = isatty(fileno(stdin)) != 0;
+#endif
+    if (tty) {
+        fprintf(stderr, "%s: language-ID model %s is not cached.\n  Download now? [Y/n] ", tag, file);
+        fflush(stderr);
+        char line[16] = {0};
+        if (fgets(line, sizeof(line), stdin) && (line[0] == '\n' || line[0] == 'y' || line[0] == 'Y'))
+            return crispasr_cache::ensure_cached_file(file, url, p.no_prints, tag, p.cache_dir);
+    }
+    fprintf(stderr,
+            "%s: language-ID model %s is not cached; skipping LID. Pass --auto-download to fetch it, "
+            "-l <code> to name the language, or --lid-backend off.\n",
+            tag, file);
+    return "";
+}
+
 // Default whisper LID model: multilingual tiny. 75 MB, fast.
 constexpr const char* kWhisperLidDefaultUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
 constexpr const char* kWhisperLidDefaultFile = "ggml-tiny.bin";
@@ -69,31 +95,32 @@ std::string scratch_dir() {
 constexpr const char* kEcapaLidDefaultFile = "ecapa-lid-107.gguf";
 
 std::string resolve_whisper_lid_model(const whisper_params& p) {
-    if (!p.lid_model.empty())
+    // --lid-model belongs to the selected provider. A Silero GGUF (or
+    // another provider's checkpoint) must never be reused by Whisper when
+    // that provider declines a window and we take the default fallback.
+    const bool selected_whisper =
+        p.lid_backend.empty() || p.lid_backend == "whisper" || p.lid_backend == "whisper-tiny";
+    if (selected_whisper && !p.lid_model.empty() && p.lid_model != "auto")
         return expand_home(p.lid_model);
-    return crispasr_cache::ensure_cached_file(kWhisperLidDefaultFile, kWhisperLidDefaultUrl, p.no_prints,
-                                              "crispasr[lid]", p.cache_dir);
+    return lid_fetch(kWhisperLidDefaultFile, kWhisperLidDefaultUrl, p, "crispasr[lid]");
 }
 
 std::string resolve_silero_lid_model(const whisper_params& p) {
     if (!p.lid_model.empty() && p.lid_model != "auto")
         return expand_home(p.lid_model);
-    return crispasr_cache::ensure_cached_file(kSileroLidDefaultFile, kSileroLidDefaultUrl, p.no_prints,
-                                              "crispasr[lid-silero]", p.cache_dir);
+    return lid_fetch(kSileroLidDefaultFile, kSileroLidDefaultUrl, p, "crispasr[lid-silero]");
 }
 
 std::string resolve_firered_lid_model(const whisper_params& p) {
     if (!p.lid_model.empty() && p.lid_model != "auto")
         return expand_home(p.lid_model);
-    return crispasr_cache::ensure_cached_file(kFireredLidDefaultFile, kFireredLidDefaultUrl, p.no_prints,
-                                              "crispasr[lid-firered]", p.cache_dir);
+    return lid_fetch(kFireredLidDefaultFile, kFireredLidDefaultUrl, p, "crispasr[lid-firered]");
 }
 
 std::string resolve_ecapa_lid_model(const whisper_params& p) {
     if (!p.lid_model.empty() && p.lid_model != "auto")
         return expand_home(p.lid_model);
-    return crispasr_cache::ensure_cached_file(kEcapaLidDefaultFile, kEcapaLidDefaultUrl, p.no_prints,
-                                              "crispasr[lid-ecapa]", p.cache_dir);
+    return lid_fetch(kEcapaLidDefaultFile, kEcapaLidDefaultUrl, p, "crispasr[lid-ecapa]");
 }
 
 // Common English-name → ISO 639-1 mapping for the sherpa subprocess path.
@@ -245,11 +272,28 @@ bool crispasr_backend_probe_language(CrispasrBackend& backend, const float* samp
     if (!be.empty() && be != "probe" && be != "self")
         return false;
 
+    if (params.lid_full_recording) {
+        core_lid::WindowResult result;
+        const bool ok = core_lid::detect_recording(
+            samples, n_samples,
+            [&](const float* window, int count, core_lid::WindowResult& vote) {
+                if (!backend.detect_language(window, count, params, vote.lang_code, vote.confidence))
+                    return false;
+                vote.source = std::string(backend.name()) + "-probe";
+                return true;
+            },
+            result);
+        if (!ok)
+            return false;
+        out.lang_code = result.lang_code;
+        out.confidence = result.confidence;
+        out.source = result.source;
+        return true;
+    }
     std::string lang;
     float confidence = 0.0f;
     if (!backend.detect_language(samples, n_samples, params, lang, confidence) || lang.empty())
         return false;
-
     out.lang_code = lang;
     out.confidence = confidence;
     out.source = std::string(backend.name()) + "-probe";
@@ -275,8 +319,8 @@ static bool detect_whisper_cli(const float* samples, int n_samples, const whispe
     return true;
 }
 
-bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
-                                  crispasr_lid_result& out) {
+static bool crispasr_detect_language_cli_window(const float* samples, int n_samples, const whisper_params& params,
+                                                crispasr_lid_result& out) {
     out = {};
     if (!samples || n_samples <= 0)
         return false;
@@ -371,4 +415,30 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
     fprintf(stderr, "crispasr[lid]: unknown --lid-backend '%s' (expected 'whisper', 'silero', 'firered', or 'ecapa')\n",
             be.c_str());
     return false;
+}
+
+bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
+                                  crispasr_lid_result& out) {
+    if (!params.lid_full_recording)
+        return crispasr_detect_language_cli_window(samples, n_samples, params, out);
+
+    core_lid::WindowResult result;
+    const bool ok = core_lid::detect_recording(
+        samples, n_samples,
+        [&](const float* window, int count, core_lid::WindowResult& vote) {
+            crispasr_lid_result one;
+            if (!crispasr_detect_language_cli_window(window, count, params, one))
+                return false;
+            vote.lang_code = one.lang_code;
+            vote.confidence = one.confidence;
+            vote.source = one.source;
+            return true;
+        },
+        result);
+    if (!ok)
+        return false;
+    out.lang_code = result.lang_code;
+    out.confidence = result.confidence;
+    out.source = result.source;
+    return true;
 }

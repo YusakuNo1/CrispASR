@@ -13,9 +13,10 @@
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "core/asr_sensitivity.h"      // --sensitivity presets (PLAN.md §W7)
-#include "core/ggml_cpu_backend.h"     // CPU-backend probe — fail fast when no module loads (#405)
-#include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
-#include "core/win_compat.h"           // setenv/unsetenv shims for MSVC
+#include "core/parakeet_gguf.h"
+#include "core/ggml_cpu_backend.h" // CPU-backend probe — fail fast when no module loads (#405)
+#include "core/gpu_backend_pref.h" // crispasr_set_gpu_backend_pref (#214)
+#include "core/win_compat.h"       // setenv/unsetenv shims for MSVC
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -74,6 +75,7 @@ struct whisper_params {
     float logprob_thold   = -1.00f;
     float no_speech_thold =  0.6f;
     float grammar_penalty = 100.0f;
+    bool grammar_strict   = false;
     float temperature     = 0.0f;
     float temperature_inc = 0.2f;
 
@@ -292,6 +294,8 @@ static bool whisper_params_parse_arg_general(int argc, char** argv, int& i, whis
         params.grammar_rule = ARGV_NEXT;
     } else if (arg == "--grammar-penalty") {
         params.grammar_penalty = std::stof(ARGV_NEXT);
+    } else if (arg == "--grammar-strict") {
+        params.grammar_strict = true;
     } else {
         return false;
     }
@@ -359,6 +363,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.language = whisper_param_turn_lowercase(ARGV_NEXT);
     } else if (arg == "-dl" || arg == "--detect-language") {
         params.detect_language = true;
+    } else if (arg == "--lid-full-recording") {
+        params.lid_full_recording = true;
     } else if (arg == "--prompt") {
         params.prompt = ARGV_NEXT;
     } else if (arg == "--ask") {
@@ -490,6 +496,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         } else {
             fprintf(stderr, "crispasr: --att-context expects \"L,R\" (e.g. 128,128 or -1,-1), got '%s'\n", v.c_str());
         }
+    } else if (arg == "--hikari-stride" || arg == "--hikari-refresh-stride") {
+        params.hikari_refresh_stride = std::stoi(ARGV_NEXT);
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -498,6 +506,10 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.lid_on_transcript = ARGV_NEXT;
     } else if (arg == "--diarize-method") {
         params.diarize_method = ARGV_NEXT;
+    } else if (arg == "--diarize-model") {
+        params.diarize_model = ARGV_NEXT;
+    } else if (arg == "--sortformer-mode") {
+        params.sortformer_mode = ARGV_NEXT;
     } else if (arg == "--sherpa-bin") {
         params.sherpa_bin = ARGV_NEXT;
     } else if (arg == "--sherpa-segment-model") {
@@ -580,6 +592,22 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
 #undef ARGV_NEXT
 }
 
+// TTS sampling controls shared with the server and Session API.
+static bool whisper_params_parse_arg_tts_sampling(int argc, char** argv, int& i, whisper_params& params) {
+    std::string arg = argv[i];
+#define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
+    // --top-k/--top-p are generic aliases (#564: moss-diarize reads the same fields).
+    if (arg == "--tts-top-k" || arg == "--top-k") {
+        params.tts_top_k = std::stoi(ARGV_NEXT);
+    } else if (arg == "--tts-top-p" || arg == "--top-p") {
+        params.tts_top_p = std::stof(ARGV_NEXT);
+    } else {
+        return false;
+    }
+    return true;
+#undef ARGV_NEXT
+}
+
 // Continuation of whisper_params_parse_arg_backend_vad — split off so the
 // `else if` chain doesn't trip MSVC's C1061 "blocks nested too deeply"
 // limit. MSVC parses `else if` as `else { if ... }`, so each branch adds
@@ -632,6 +660,13 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             params.tts_speed = 1.0f;
         if (params.tts_speed > 4.0f)
             params.tts_speed = 4.0f;
+    } else if (arg == "--tts-duration") {
+        // Exact target duration in seconds (omnivoice; upstream `duration` parity).
+        params.tts_duration = std::stof(ARGV_NEXT);
+        if (params.tts_duration < 0.0f)
+            params.tts_duration = 0.0f;
+        if (params.tts_duration > 600.0f)
+            params.tts_duration = 600.0f;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -662,11 +697,13 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.align_format = ARGV_NEXT;
     } else if (arg == "--align-only") {
         params.align_only = true;
+    } else if (arg == "--ultra-head") {
+        params.ultra_head = ARGV_NEXT;
     } else if (arg == "--align-granularity") {
         params.align_granularity = ARGV_NEXT;
     } else if (arg == "--text-file") {
         params.text_file = ARGV_NEXT;
-    } else if (arg == "--instruct") {
+    } else if (arg == "--instruct" || arg == "--tts-instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--tts-phonemes") {
         params.tts_phonemes = ARGV_NEXT;
@@ -739,12 +776,6 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_play_device = std::stoi(ARGV_NEXT);
     } else if (arg == "--text") {
         params.text_input = ARGV_NEXT;
-    } else if (arg == "--translate-max-tokens") {
-        params.translate_max_tokens = std::stoi(ARGV_NEXT);
-    } else if (arg == "-trsl" || arg == "--tr-sl" || arg == "--translate-source-lang") {
-        params.translate_source_lang = whisper_param_turn_lowercase(ARGV_NEXT);
-    } else if (arg == "-trtl" || arg == "--tr-tl" || arg == "--translate-target-lang") {
-        params.translate_target_lang = whisper_param_turn_lowercase(ARGV_NEXT);
     } else if (arg == "--accept-license") {
         if (++i >= argc) {
             fprintf(stderr, "error: --accept-license requires an SPDX tag (or \"all\")\n");
@@ -774,7 +805,18 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
     } else if (arg == "--hf-file" || arg == "-hff") {
         params.hf_file = ARGV_NEXT;
         params.auto_download = true;
-    } else if (arg == "--dry-run-resolve") {
+    } else {
+        return false;
+    }
+    return true;
+#undef ARGV_NEXT
+}
+
+// Second half of the above, split for the same MSVC C1061 nesting limit.
+static bool whisper_params_parse_arg_streaming_tts2(int argc, char** argv, int& i, whisper_params& params) {
+    std::string arg = argv[i];
+#define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
+    if (arg == "--dry-run-resolve") {
         params.dry_run_resolve = true;
     } else if (arg == "--dry-run-ignore-cache") {
         params.dry_run_ignore_cache = true;
@@ -794,8 +836,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.server_api_keys = ARGV_NEXT;
     } else if (arg == "--stream-step") {
         params.stream_step_ms = std::stoi(ARGV_NEXT);
+        params.stream_step_explicit = true;
     } else if (arg == "--stream-length") {
         params.stream_length_ms = std::stoi(ARGV_NEXT);
+        params.stream_length_explicit = true;
+    } else if (arg == "--stream-realtime") {
+        params.stream_realtime = true;
+    } else if (arg == "--stream-session") {
+        params.stream_session = true;
     } else if (arg == "--stream-keep") {
         params.stream_keep_ms = std::stoi(ARGV_NEXT);
     } else if (arg == "--stream-json") {
@@ -929,6 +977,53 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
 #undef ARGV_NEXT
 }
 
+// Live and text translation flags — their own chunk for the same MSVC C1061
+// reason as the split below: whisper_params_parse_arg_streaming_tts had
+// grown to 124 branches and broke the Windows build.
+static bool whisper_params_parse_arg_translate(int argc, char** argv, int& i, whisper_params& params) {
+    std::string arg = argv[i];
+#define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
+    if (arg == "--translate-max-tokens") {
+        params.translate_max_tokens = std::stoi(ARGV_NEXT);
+    } else if (arg == "-trsl" || arg == "--tr-sl" || arg == "--translate-source-lang") {
+        params.translate_source_lang = whisper_param_turn_lowercase(ARGV_NEXT);
+    } else if (arg == "-trtl" || arg == "--tr-tl" || arg == "--translate-target-lang") {
+        params.translate_target_lang = whisper_param_turn_lowercase(ARGV_NEXT);
+    } else if (arg == "--live-translate") {
+        // Preset: microphone in, transcript + translation out. The stream
+        // defaults it implies are applied in crispasr_run.cpp.
+        params.live_translate = true;
+        params.mic = true;
+        params.stream = true;
+    } else if (arg == "--translate-model") {
+        params.translate_model = ARGV_NEXT;
+    } else if (arg == "--translate-backend") {
+        params.translate_backend = ARGV_NEXT;
+    } else if (arg == "--translate-prompt") {
+        params.translate_prompt = ARGV_NEXT;
+    } else if (arg == "--translate-revise") {
+        params.translate_revise_model = ARGV_NEXT;
+    } else if (arg == "--translate-revise-asr") {
+        params.translate_revise_asr = ARGV_NEXT;
+    } else if (arg == "--translate-view") {
+        params.translate_view = ARGV_NEXT;
+    } else if (arg == "--translate-revise-backlog") {
+        params.translate_revise_backlog = std::stoi(ARGV_NEXT);
+    } else if (arg == "--translate-beam") {
+        params.translate_beam = std::stoi(ARGV_NEXT);
+        if (params.translate_beam < 0) {
+            fprintf(stderr, "crispasr: --translate-beam must be >= 0\n");
+            exit(2);
+        }
+    } else if (arg == "--no-translate-drafts") {
+        params.translate_drafts = false;
+    } else {
+        return false;
+    }
+    return true;
+#undef ARGV_NEXT
+}
+
 static bool whisper_params_parse(int argc, char** argv, whisper_params& params) {
     if (const char* env_device = std::getenv("CRISPASR_ARG_DEVICE")) {
         params.gpu_device = std::stoi(env_device);
@@ -975,7 +1070,16 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
         if (whisper_params_parse_arg_backend_vad(argc, argv, i, params)) {
             continue;
         }
+        if (whisper_params_parse_arg_tts_sampling(argc, argv, i, params)) {
+            continue;
+        }
         if (whisper_params_parse_arg_streaming_tts(argc, argv, i, params)) {
+            continue;
+        }
+        if (whisper_params_parse_arg_translate(argc, argv, i, params)) {
+            continue;
+        }
+        if (whisper_params_parse_arg_streaming_tts2(argc, argv, i, params)) {
             continue;
         }
 
@@ -1015,7 +1119,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.hotwords.empty() ? "" : params.hotwords.c_str());
     fprintf(out,
             "             --context TEXT        [%-7s] hotword/context text injected into the prompt "
-            "(vibevoice-asr only)\n",
+            "(qwen3, vibevoice-asr)\n",
             params.context.empty() ? "" : "set");
     fprintf(out,
             "             --prefix-text TEXT    [%-7s] granite incremental decoding: seed the transcript so "
@@ -1106,9 +1210,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.log_score ? "true" : "false");
     fprintf(out, "  -ng,       --no-gpu               [%-7s] disable GPU\n", params.use_gpu ? "false" : "true");
     fprintf(out, "  -dev N,    --device N             [%-7d] GPU device ID (default: 0)\n", params.gpu_device);
-    fprintf(out,
-            "  --gpu-backend NAME                [%-7s] force GPU backend: cuda|vulkan|metal|cpu (default: auto)\n",
-            params.gpu_backend.empty() ? "auto" : params.gpu_backend.c_str());
+    fprintf(
+        out,
+        "  --gpu-backend NAME                [%-7s] force GPU backend: cuda|vulkan|metal|cann|cpu (default: auto)\n",
+        params.gpu_backend.empty() ? "auto" : params.gpu_backend.c_str());
     fprintf(out, "  -fa,       --flash-attn           [%-7s] enable flash attention\n",
             params.flash_attn ? "true" : "false");
     fprintf(out, "  -nfa,      --no-flash-attn        [%-7s] disable flash attention\n",
@@ -1122,6 +1227,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.grammar_rule.c_str());
     fprintf(out, "  --grammar-penalty N               [%-7.1f] scales down logits of nongrammar tokens\n",
             params.grammar_penalty);
+    fprintf(out, "  --grammar-strict                  [%-7s] no end-of-text until the grammar is complete\n",
+            params.grammar_strict ? "true" : "false");
     // crispasr backend dispatch
     fprintf(out, "\ncrispasr backend options (select a non-whisper model):\n");
     fprintf(out,
@@ -1167,13 +1274,17 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(out, "  --lid-model FNAME                 [%-7s] optional LID model path (default ggml-tiny.bin)\n",
             params.lid_model.c_str());
     fprintf(out,
+            "  --lid-full-recording              [%-7s] opt in to language detection across all 15 s windows; "
+            "duration-weighted vote (default: first 15 s)\n",
+            params.lid_full_recording ? "true" : "false");
+    fprintf(out,
             "  --lid-on-transcript FNAME         [%-7s] post-ASR text LID. Path or "
             "'auto[:cld3|glotlid|lid-fasttext176]' (default cld3, auto-downloaded). "
             "Emits lang=<code>\\tconf=<x>\\tbackend=<n> to stderr.\n",
             params.lid_on_transcript.c_str());
     fprintf(out,
             "  --diarize-method NAME             [%-7s] diarize method: "
-            "energy|xcorr|vad-turns|sherpa|pyannote|ecapa|foxnose\n",
+            "energy|xcorr|vad-turns|sherpa|pyannote|ecapa|foxnose|sortformer\n",
             params.diarize_method.c_str());
     fprintf(out,
             "                                             energy/xcorr: stereo channel split; vad-turns: gap-based "
@@ -1183,6 +1294,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
                  "use sherpa/ecapa)\n");
     fprintf(out, "                                             sherpa/ecapa: external sherpa-onnx subprocess with "
                  "segmentation + speaker embedding + clustering\n");
+    fprintf(out, "                                             sortformer: NVIDIA Nemotron-3-Diarization, end-to-end, "
+                 "up to 8 speakers in arrival order, 10 ms resolution (one global pass; model: --diarize-model)\n");
+    fprintf(out,
+            "  --diarize-model PATH              [%-7s] GGUF for --diarize-method sortformer (a sortformer GGUF; "
+            "'auto' fetches nvidia/Nemotron-3-Diarization q8_0, OpenMDW-1.1)\n",
+            params.diarize_model.empty() ? "auto" : params.diarize_model.c_str());
+    fprintf(out,
+            "  --sortformer-mode MODE            [%-7s] sortformer chunk schedule: offline | low_latency (1.04 s) | "
+            "very_low_latency (0.64 s) | ultra_low_latency (0.32 s)\n",
+            params.sortformer_mode.empty() ? "offline" : params.sortformer_mode.c_str());
     fprintf(out,
             "  --diarize-embedder MODEL          [%-7s] speaker-embedding model used to cluster pyannote local "
             "tracks into globally stable speaker IDs. Pluggable; known aliases: 'auto' / 'titanet' (192-d "
@@ -1266,6 +1387,49 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.stream_continuous ? "true" : "false");
     fprintf(out, "  --monitor                         [%-7s] show unicode progress symbols during streaming\n",
             params.stream_monitor ? "true" : "false");
+    fprintf(out,
+            "  --live-translate                  [%-7s] live microphone transcription + sentence-by-sentence "
+            "translation (implies --mic --stream --vad; pair with -l SRC and --tr-tl TGT)\n",
+            params.live_translate ? "true" : "false");
+    fprintf(out,
+            "  --translate-model FNAME           [%-7s] text translator (m2m100 / marian / madlad GGUF, or 'auto') run "
+            "behind a streaming recogniser; enables translation on --stream / --mic too\n",
+            params.translate_model.c_str());
+    fprintf(
+        out,
+        "  --translate-backend NAME          [%-7s] translator: m2m100, marian, madlad, or llm (a translation chat LLM "
+        "GGUF such as Hy-MT2); default: detect from the model\n",
+        params.translate_backend.c_str());
+    fprintf(out, "  --translate-prompt TEXT                     llm translator prompt: hy-mt2, index-translate, or a "
+                 "template with {src} {tgt} {text} (default: by model file name, else hy-mt2)\n");
+    fprintf(out, "  --translate-revise MODEL                    live translation slow pass: re-translate each finished "
+                 "paragraph with this translation LLM (hy-mt2, index-translate, or a GGUF) and replace the fast "
+                 "translations\n");
+    fprintf(out, "  --translate-revise-asr MODEL                with --translate-revise: re-transcribe each finished "
+                 "utterance with this slower recogniser first (a GGUF or a registry name, e.g. canary)\n");
+    fprintf(out,
+            "  --translate-view inplace|scroll             terminal view: inplace redraws the transcript so revisions "
+            "replace text where it stands (default with --translate-revise); scroll appends\n");
+    fprintf(out,
+            "  --translate-revise-backlog N      [%-7d] paragraphs queued for the slow pass before the oldest is "
+            "dropped\n",
+            params.translate_revise_backlog);
+    fprintf(out,
+            "  --translate-beam N                [%-7d] translator beam size (1 = greedy, fastest); 0 = the "
+            "translator's default\n",
+            params.translate_beam);
+    fprintf(out,
+            "  --no-translate-drafts             [%-7s] translate committed sentences only, no draft of the open "
+            "one\n",
+            params.translate_drafts ? "false" : "true");
+    fprintf(out,
+            "  --stream-session                  [%-7s] live translation: drive the recogniser's incremental "
+            "session (nemotron, qwen3, vibevoice-streaming) instead of re-decoding each step\n",
+            params.stream_session ? "true" : "false");
+    fprintf(out,
+            "  --stream-realtime                 [%-7s] input is real time: read the whole backlog per step when "
+            "decoding falls behind (implied by --live-translate)\n",
+            params.stream_realtime ? "true" : "false");
     fprintf(out, "  --server                          [%-7s] run as HTTP server (persistent model, POST /inference)\n",
             params.server ? "true" : "false");
     fprintf(out, "  --host HOST                       [%-7s] server bind address\n", params.server_host.c_str());
@@ -1331,6 +1495,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "frames (~80ms ea) — true windowed attn (O(T*window) mem, NeMo rel_pos_local_attn); "
             "-1,-1 = full. CRISPASR_FC_WINDOWED_ATTN=0 forces legacy masked-full\n",
             "model");
+    fprintf(out,
+            "             --hikari-stride N      [%-7d] hikari strided encoder refresh interval (0 = exact, K>0)\n",
+            params.hikari_refresh_stride);
     fprintf(out, "             --lcs-dedup VAL        [%-7s] sub-word LCS dedup across chunk boundaries: auto|on|off\n",
             params.lcs_dedup.c_str());
     fprintf(out,
@@ -1413,6 +1580,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "                                                 --text-file - reads from stdin (auto-detects format);\n"
             "                                                 .json accepts CrispASR --output-json transcription\n"
             "                                                 -m/--backend, --vad, --max-len are unused here\n"
+            "             --ultra-head FNAME        optional Ultra local-head GGUF for --align-only\n"
             "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
             "                                                 (segment = re-timed input cues/segments;\n"
             "                                                 auto = segment for .srt/.json, word otherwise)\n");
@@ -1458,17 +1626,31 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "moss-tts-local). Units are the backend's AR decode step, NOT samples or ms: one codec frame, "
             "12.5 Hz on the shipped models, so 80 ms each and N=25 floors at ~2 s. -1 = model default\n",
             params.tts_min_speech_tokens);
+    fprintf(out,
+            "             --tts-top-k, --top-k N   [%-7s] top-k cutoff (dia/tada/chatterbox/moss-tts/moss-diarize); "
+            "0 disables filtering\n",
+            "default");
     fprintf(
         out,
-        "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada/irodori; "
-        "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
-        "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+        "             --tts-top-p, --top-p X   [%-7s] nucleus threshold (dia/tada/chatterbox/moss-tts/moss-diarize); "
+        "1 disables filtering\n",
         "default");
+    fprintf(out,
+            "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale "
+            "(vibevoice/chatterbox/f5/tada/irodori/bt2-tts; "
+            "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
+            "bt2-tts: applies with --tts-instruct (default 1 = unguided, try 4); "
+            "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+            "default");
     fprintf(
         out,
         "             --tts-speed X            [%-7.2f] speaking-rate multiplier (kokoro/omnivoice/f5/piper/melotts/"
         "fastpitch): >1 faster/shorter, <1 slower/longer\n",
         params.tts_speed);
+    fprintf(out,
+            "             --tts-duration X         [%-7s] EXACT target duration in seconds (omnivoice): wins over the "
+            "text/rate estimate; 0 = estimate\n",
+            "0");
     fprintf(out, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(out,
@@ -2400,6 +2582,10 @@ int main(int argc, char** argv) {
         whisper_print_usage(argc, argv, params, stderr);
         return 1;
     }
+    if (!params.ultra_head.empty() && !params.align_only) {
+        fprintf(stderr, "crispasr: --ultra-head requires --align-only\n");
+        return 1;
+    }
 
     // Argument validation belongs before dispatch. This check used to sit after
     // every crispasr_run_backend() early return, so it only ever ran on the
@@ -2491,8 +2677,17 @@ int main(int argc, char** argv) {
         // never prevented.
         if (!params.gpu_backend.empty()) {
             crispasr_set_gpu_backend_pref(params.gpu_backend.c_str());
+            if (ci_starts_with(params.gpu_backend.c_str(), "cann")) {
+                crispasr_set_gpu_device_pref(params.gpu_device);
+            }
         }
     }
+
+    // #560: --detect-language is an exit action, including when -m names an
+    // invalid or absent ASR model. Route before --hf-repo and model dispatch so
+    // only the selected LID provider may resolve/load a model.
+    if (params.detect_language && !params.server && !params.dry_run_resolve)
+        return crispasr_run_lid_only(params);
 
     // Issue #128 — resolve --hf-repo / --hf-file early, before any
     // model-path interpretation downstream. Synthesise the HF resolve
@@ -2675,6 +2870,11 @@ int main(int argc, char** argv) {
     {
         const bool explicit_backend = !params.backend.empty();
         const bool model_is_auto = is_auto_model_arg(params.model);
+
+        // #551: do not fall through to legacy Whisper or a forced incompatible
+        // loader when a known unsupported GGUF yields an empty detector result.
+        if (!model_is_auto && core_parakeet_gguf::reject_external_file(params.model.c_str()))
+            return 11;
 
         bool auto_detected_non_whisper = false;
         if (!explicit_backend && !model_is_auto) {
@@ -3027,11 +3227,13 @@ int main(int argc, char** argv) {
                     wparams.n_grammar_rules = grammar_rules.size();
                     wparams.i_start_rule = grammar_parsed.symbol_ids.at(params.grammar_rule);
                     wparams.grammar_penalty = params.grammar_penalty;
+                    wparams.grammar_strict = params.grammar_strict;
                 }
             }
 
             // this callback is called on each new segment
-            if (!wparams.print_realtime) {
+            // #466: methods that label after decoding print once labelled (below).
+            if (!wparams.print_realtime && !params.diarize_labels_after_decode()) {
                 wparams.new_segment_callback = fout_factory.print_segment_callback;
                 wparams.new_segment_callback_user_data = &user_data;
             }
@@ -3138,6 +3340,12 @@ int main(int argc, char** argv) {
                                                                params);
                     }
                 }
+            }
+
+            // #466: the live callback was held back for this method; print the
+            // labelled segments now, where it would have printed them.
+            if (params.diarize_labels_after_decode() && fout_factory.print_segment_callback) {
+                crispasr_print_stdout(crispasr_make_disp_segments(segs, 0), !params.no_timestamps);
             }
 
             // macros to stringify function name

@@ -10,11 +10,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "crispasr_aligner.h"
+#include "crispasr_session.h"
+#include "core/qwen3_forced_aligner.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -41,6 +44,55 @@ TEST_CASE("align-only: crispasr_align_words null/empty safety", "[unit][align]")
 TEST_CASE("align-only: crispasr_aligner_free_cache does not crash when empty", "[unit][align]") {
     crispasr_aligner_free_cache(); // must not crash
     crispasr_aligner_free_cache(); // double-free safety
+}
+
+TEST_CASE("align-only: Ultra entry rejects invalid input without changing output", "[unit][align]") {
+    std::vector<CrispasrUltraAlignedWord> output{{"unchanged", 1.25, 2.75}};
+    float sample = 0.0f;
+    CHECK_FALSE(crispasr_align_words_ultra("", "head", "hello", &sample, 1, 1, output));
+    CHECK_FALSE(crispasr_align_words_ultra("forced-aligner.gguf", "", "hello", &sample, 1, 1, output));
+    CHECK_FALSE(crispasr_align_words_ultra("other.gguf", "head", "hello", &sample, 1, 1, output));
+    CHECK_FALSE(crispasr_align_words_ultra("forced-aligner.gguf", "head", "hello", nullptr, 1, 1, output));
+    CHECK_FALSE(
+        crispasr_align_words_ultra("forced-aligner.gguf", "head", "hello", &sample, 120 * 16000 + 1, 1, output));
+    sample = std::numeric_limits<float>::quiet_NaN();
+    CHECK_FALSE(crispasr_align_words_ultra("forced-aligner.gguf", "head", "hello", &sample, 1, 1, output));
+    REQUIRE(output.size() == 1);
+    CHECK(output[0].text == "unchanged");
+    CHECK(output[0].start_ms == 1.25);
+    CHECK(output[0].end_ms == 2.75);
+    CHECK(crispasr_align_words_ultra_abi(nullptr, nullptr, nullptr, nullptr, 0, 1) == nullptr);
+    CHECK(crispasr_ultra_align_result_n_words(nullptr) == 0);
+    CHECK(std::string(crispasr_ultra_align_result_word_text(nullptr, 0)).empty());
+    CHECK(crispasr_ultra_align_result_word_start_ms(nullptr, 0) == 0);
+    CHECK(crispasr_ultra_align_result_word_end_ms(nullptr, 0) == 0);
+    crispasr_ultra_align_result_free(nullptr);
+}
+
+TEST_CASE("align-only: each segment gets its own audio interval", "[unit][align][issue444]") {
+    constexpr int sr = 16000;
+    const int slice_start = 10 * sr;
+    const int slice_end = 100 * sr;
+
+    // Two segments in one VAD slice must not both restart at the slice origin.
+    const auto first = crispasr_alignment_audio_range(7197, 8509, slice_start, slice_end, sr);
+    const auto second = crispasr_alignment_audio_range(8893, 8901, slice_start, slice_end, sr);
+    REQUIRE(first.valid());
+    REQUIRE(second.valid());
+    CHECK(first.start == 7197 * sr / 100);
+    CHECK(first.end == 8509 * sr / 100);
+    CHECK(first.offset_cs == 7197);
+    CHECK(second.start >= first.end);
+    CHECK(second.offset_cs == 8893);
+
+    // Context-expanded timestamps are clipped to the actual slice samples.
+    const auto clipped = crispasr_alignment_audio_range(500, 12000, slice_start, slice_end, sr);
+    REQUIRE(clipped.valid());
+    CHECK(clipped.start == slice_start);
+    CHECK(clipped.end == slice_end);
+    CHECK(clipped.offset_cs == 1000);
+
+    CHECK_FALSE(crispasr_alignment_audio_range(5000, 5000, slice_start, slice_end, sr).valid());
 }
 
 // Join cue texts back into the flat transcript --align-only feeds the aligner.
@@ -181,7 +233,7 @@ TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
         CHECK(w[3] == "bar");
     }
     SECTION("CJK splits per character") {
-        auto w = crispasr_tokenise_align_words("你好world");
+        auto w = crispasr_tokenise_align_words("你好，world!");
         REQUIRE(w.size() == 3);
         CHECK(w[0] == "你");
         CHECK(w[1] == "好");
@@ -193,12 +245,87 @@ TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
     }
 }
 
+TEST_CASE("align-only: display units restore punctuation without adding timestamp slots", "[unit][align][issue444]") {
+    SECTION("CJK sentence punctuation attaches to the preceding character") {
+        const auto labels = crispasr_tokenise_align_words("你好，world!再见？");
+        const auto display = crispasr_tokenise_align_display_words("你好，world!再见？");
+        REQUIRE(labels == std::vector<std::string>{"你", "好", "world", "再", "见"});
+        REQUIRE(display == std::vector<std::string>{"你", "好，", "world!", "再", "见？"});
+        CHECK(display.size() == labels.size());
+    }
+
+    SECTION("leading and repeated punctuation preserve the one-to-one map") {
+        const auto labels = crispasr_tokenise_align_words("“你好……” test-case.");
+        const auto display = crispasr_tokenise_align_display_words("“你好……” test-case.");
+        REQUIRE(display.size() == labels.size());
+        REQUIRE(display.size() == 4);
+        CHECK(display[0] == "“你");
+        CHECK(display[1] == "好……”");
+        CHECK(display[2] == "test-");
+        CHECK(display[3] == "case.");
+    }
+
+    SECTION("#465: a Hangul syllable after a space keeps that space; the labels do not") {
+        const std::string ko = "내일 오전에 회의 자료를 보내주세요.";
+        const auto labels = crispasr_tokenise_align_words(ko);
+        const auto display = crispasr_tokenise_align_display_words(ko);
+        REQUIRE(display.size() == labels.size());
+        CHECK(labels[2] == "오"); // alignment slots stay space-free
+        REQUIRE(display == std::vector<std::string>{"내", "일", " 오", "전", "에", " 회", "의", " 자", "료", "를",
+                                                    " 보", "내", "주", "세", "요."});
+        std::string joined;
+        for (const auto& w : display)
+            joined += w; // the rebuild sites append a spaced word as-is and glue CJK units
+        CHECK(joined == ko);
+    }
+
+    SECTION("#465: unspaced CJK text and Latin words are unchanged") {
+        CHECK(crispasr_tokenise_align_display_words("你好世界") == std::vector<std::string>{"你", "好", "世", "界"});
+        CHECK(crispasr_tokenise_align_display_words("hello world") == std::vector<std::string>{"hello", "world"});
+    }
+
+    SECTION("an opening quote after whitespace attaches to the following word") {
+        const auto labels = crispasr_tokenise_align_words("hello “world”");
+        const auto display = crispasr_tokenise_align_display_words("hello “world”");
+        REQUIRE(display.size() == labels.size());
+        REQUIRE(display == std::vector<std::string>{"hello", "“world”"});
+    }
+}
+
+TEST_CASE("align-only: Qwen3 timestamp repair matches Python blueprint", "[unit][align][issue444]") {
+    SECTION("first-maximum LIS tie and short anomaly snapping") {
+        std::vector<int> ts{0, 0, 1, 0};
+        core_qwen3_forced_aligner::fix_timestamps(ts);
+        CHECK(ts == std::vector<int>{0, 0, 1, 1});
+    }
+    SECTION("long anomaly run interpolates") {
+        std::vector<int> ts{0, 8, 7, 6, 5, 16};
+        core_qwen3_forced_aligner::fix_timestamps(ts);
+        CHECK(ts == std::vector<int>{0, 8, 10, 12, 14, 16});
+    }
+}
+
 // Build a synthetic word alignment: word i spans [i*100, i*100+80) cs.
 static std::vector<CrispasrAlignedWord> make_words(const std::vector<std::string>& texts) {
     std::vector<CrispasrAlignedWord> out;
     for (size_t i = 0; i < texts.size(); i++)
         out.push_back({texts[i], (int64_t)(i * 100), (int64_t)(i * 100 + 80)});
     return out;
+}
+
+TEST_CASE("align-only: Qwen3 forced-aligner dispatch by filename (#579 Ultra)", "[unit][align]") {
+    // Existing names keep their routing.
+    CHECK(crispasr_aligner_is_qwen3_forced_aligner("qwen3-forced-aligner-0.6b-q4_k.gguf"));
+    CHECK(crispasr_aligner_is_qwen3_forced_aligner("/models/Qwen3-FA-0.6B.gguf"));
+    // The documented Ultra conversion name and the upstream repo spelling.
+    CHECK(crispasr_aligner_is_qwen3_forced_aligner("qwen3-forced-aligner-ultra-f16.gguf"));
+    CHECK(crispasr_aligner_is_qwen3_forced_aligner("Qwen3-ForcedAligner-Ultra-F16.gguf"));
+    CHECK(crispasr_aligner_is_qwen3_forced_aligner("qwen3_forced_aligner_ultra.gguf"));
+    // CTC / wav2vec2 aligners must not be captured.
+    CHECK_FALSE(crispasr_aligner_is_qwen3_forced_aligner("canary-ctc-aligner-q4_k.gguf"));
+    CHECK_FALSE(crispasr_aligner_is_qwen3_forced_aligner("wav2vec2-base-960h-aligner.gguf"));
+    CHECK_FALSE(crispasr_aligner_is_qwen3_forced_aligner("qwen3-asr-0.6b-q4_k.gguf"));
+    CHECK_FALSE(crispasr_aligner_is_qwen3_forced_aligner(""));
 }
 
 TEST_CASE("align-only: group aligned words into segments", "[unit][align]") {

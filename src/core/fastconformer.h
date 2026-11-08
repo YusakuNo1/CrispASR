@@ -209,8 +209,14 @@ struct PreEncodeWeights {
 // staged comparison.  Feature ordering: k = oc*(OW) + ow  (matches Python's
 // x.transpose(1,2).reshape(T, C*Freq) convention).
 static inline void snap_conv4d(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* t, const char* name) {
-    // permute(1, 2, 0, 3): (OW,OH,OC,N) → (OH,OC,OW,N)
-    ggml_tensor* p = ggml_cont(ctx0, ggml_permute(ctx0, t, 1, 2, 0, 3));
+    // ggml_permute sends source dim i to position axes[i]: (0, 2, 1, 3) turns
+    // (OW,OH,OC,N) into (OW,OC,OH,N) - frequency fastest, then channel, then
+    // time - i.e. feature k = oc*OW + ow per time row, exactly what
+    // tools/reference_backends/*.py dump ((C,T,F) -> permute(1,0,2) -> (T, C*F)).
+    // The old (1, 2, 0, 3) made the CHANNEL fastest; the diff harness then
+    // compared reordered numbers (canary pre_enc_c*: cos -0.16..-0.32) while
+    // pre_encode_output, which does not go through this snap, matched 0.999999.
+    ggml_tensor* p = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
     // reshape to (OC*OW, OH): ne[0]=OC*OW fastest, ne[1]=OH (T_enc)
     const int64_t C_Freq = t->ne[2] * t->ne[0]; // OC * OW
     const int64_t T_enc = t->ne[1];             // OH
@@ -368,16 +374,11 @@ struct PwRepackBuf {
     }
 };
 
-// Repack each layer's F16 conv_pw1_w / conv_pw2_w into fresh 2D Q8_0 tensors
-// (allocated in `out`) and repoint the BlockWeights fields. `model_quantized`
-// should be true when the surrounding model weights are quantized (used by
-// the auto gate). Returns the number of tensors repacked.
-static inline int repack_conv_pw_q8(std::vector<BlockWeights*>& layers, ggml_backend_t backend, bool model_quantized,
-                                    PwRepackBuf& out, const char* tag) {
-    const int mode = fc_pw_q8_mode();
-    if (mode == 0 || (mode == -1 && !model_quantized))
-        return 0;
-
+// Repack arbitrary F16 matmul-weight slots into fresh 2D Q8_0 tensors and
+// repoint the slots. A leading unit dimension is collapsed; callers must only
+// pass tensors they consume through reshape_2d + mul_mat.
+static inline int repack_f16_matmuls_q8(const std::vector<ggml_tensor**>& slots, ggml_backend_t backend,
+                                        PwRepackBuf& out, const char* tag) {
     auto eligible = [](ggml_tensor* t) {
         if (!t || t->type != GGML_TYPE_F16 || !ggml_is_contiguous(t))
             return false;
@@ -386,8 +387,8 @@ static inline int repack_conv_pw_q8(std::vector<BlockWeights*>& layers, ggml_bac
     };
 
     size_t n_tensors = 0;
-    for (auto* e : layers)
-        n_tensors += (eligible(e->conv_pw1_w) ? 1 : 0) + (eligible(e->conv_pw2_w) ? 1 : 0);
+    for (auto* slot : slots)
+        n_tensors += slot && eligible(*slot) ? 1 : 0;
     if (n_tensors == 0)
         return 0;
 
@@ -398,16 +399,14 @@ static inline int repack_conv_pw_q8(std::vector<BlockWeights*>& layers, ggml_bac
 
     // Pass 1: create the Q8_0 tensors (2D — collapse the leading unit dim).
     std::vector<std::pair<ggml_tensor**, ggml_tensor*>> jobs; // (slot, q8 tensor)
-    for (auto* e : layers) {
-        for (ggml_tensor** slot : {&e->conv_pw1_w, &e->conv_pw2_w}) {
-            ggml_tensor* src = *slot;
-            if (!eligible(src))
-                continue;
-            const int64_t n_per_row = src->ne[0] > 1 ? src->ne[0] : src->ne[1];
-            const int64_t n_rows = ggml_nelements(src) / n_per_row;
-            ggml_tensor* q8 = ggml_new_tensor_2d(out.ctx, GGML_TYPE_Q8_0, n_per_row, n_rows);
-            jobs.push_back({slot, q8});
-        }
+    for (auto* slot : slots) {
+        if (!slot || !eligible(*slot))
+            continue;
+        ggml_tensor* src = *slot;
+        const int64_t n_per_row = src->ne[0] > 1 ? src->ne[0] : src->ne[1];
+        const int64_t n_rows = ggml_nelements(src) / n_per_row;
+        ggml_tensor* q8 = ggml_new_tensor_2d(out.ctx, GGML_TYPE_Q8_0, n_per_row, n_rows);
+        jobs.push_back({slot, q8});
     }
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
@@ -434,8 +433,24 @@ static inline int repack_conv_pw_q8(std::vector<BlockWeights*>& layers, ggml_bac
         *j.first = j.second;
     }
 
-    fprintf(stderr, "%s: repacked %zu F16 conv pw tensors to Q8_0 (CRISPASR_FC_PW_Q8)\n", tag, jobs.size());
+    fprintf(stderr, "%s: repacked %zu F16 matmul tensors to Q8_0\n", tag, jobs.size());
     return (int)jobs.size();
+}
+
+// Repack each layer's F16 conv_pw1_w / conv_pw2_w. `model_quantized` is
+// used by the CRISPASR_FC_PW_Q8 auto gate.
+static inline int repack_conv_pw_q8(std::vector<BlockWeights*>& layers, ggml_backend_t backend, bool model_quantized,
+                                    PwRepackBuf& out, const char* tag) {
+    const int mode = fc_pw_q8_mode();
+    if (mode == 0 || (mode == -1 && !model_quantized))
+        return 0;
+    std::vector<ggml_tensor**> slots;
+    slots.reserve(layers.size() * 2);
+    for (auto* layer : layers) {
+        slots.push_back(&layer->conv_pw1_w);
+        slots.push_back(&layer->conv_pw2_w);
+    }
+    return repack_f16_matmuls_q8(slots, backend, out, tag);
 }
 
 // ---------------------------------------------------------------------------

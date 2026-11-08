@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-vibevoice-asr-f16-vs-q4-k-on-t4",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-vibevoice-asr-f16-vs-q4-k-on-t4",
   "title": "CrispASR — vibevoice-asr F16 vs Q4_K on T4",
   "code_file": "crispasr-vibevoice-asr-bench.ipynb",
   "language": "python",

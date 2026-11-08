@@ -16,7 +16,7 @@ if not cdir.exists():
 
 # HF token
 for p in ["/kaggle/input/crispasr-hf-token/hf_token.txt",
-          "/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"]:
+          "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt"]:
     if os.path.exists(p):
         os.environ["HF_TOKEN"] = open(p).read().strip()
         break

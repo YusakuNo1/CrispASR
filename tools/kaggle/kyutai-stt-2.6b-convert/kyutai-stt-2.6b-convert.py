@@ -18,11 +18,11 @@ Conversion is CPU-bound. The Mimi weights are shared with the 1B model
 the LM safetensors (~5.2 GB in bfloat16 → ~2.6 GB in F16).
 
 REQUIREMENTS:
-  - chr1s4/crispasr-hf-token dataset mounted (HF token for upload only;
+  - ${KAGGLE_ACCOUNT}/crispasr-hf-token dataset mounted (HF token for upload only;
     kyutai/stt-2.6b-en is publicly available, no gating).
 
-Push (under chr1s4):
-  export KAGGLE_API_TOKEN=<chr1s4 token>
+Push (under $KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/kyutai-stt-2.6b-convert
 """
 

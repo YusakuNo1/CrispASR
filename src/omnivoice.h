@@ -51,6 +51,17 @@ struct omnivoice_context* omnivoice_init_from_file(const char* path_model, struc
 // Required before the first synthesize call. Returns 0 on success.
 int omnivoice_set_tokenizer_path(struct omnivoice_context* ctx, const char* path);
 
+// Configure audio utilities without changing context_params' by-value ABI.
+// Defaults: preprocess=true, postprocess=true, pad/fade=0.1 seconds.
+// postprocess controls silence removal only; fade/pad are independent upstream.
+// Set before loading a reference; changing preprocessing does not re-encode an
+// already-loaded prompt. Durations must be finite and in [0,10]. Returns 0/-1.
+// Environment at init: CRISPASR_OMNIVOICE_PREPROCESS_PROMPT,
+// CRISPASR_OMNIVOICE_POSTPROCESS_OUTPUT (0 disables); *_PAD_DURATION and
+// *_FADE_DURATION (seconds). *_AUDIO_LEGACY=1 restores the prior raw pipeline.
+int omnivoice_set_audio_processing(struct omnivoice_context* ctx, bool preprocess_prompt, bool postprocess_output,
+                                   float pad_duration, float fade_duration);
+
 // Set a reference voice from a 24 kHz mono WAV plus its transcription.
 // The audio is encoded via the HiggsAudioV2 tokenizer to produce
 // reference audio codes for the voice-cloning prompt.
@@ -67,6 +78,18 @@ int omnivoice_set_instruct(struct omnivoice_context* ctx, const char* instruct);
 // >1 = faster / shorter audio, <1 = slower / longer, 1.0 = model estimate.
 // Useful when a reference voice yields an over- or under-long estimate.
 int omnivoice_set_speed(struct omnivoice_context* ctx, float speed);
+
+// Set an EXACT target duration, in seconds (upstream OmniVoice's `duration`
+// argument; parity). When > 0 it overrides the text/speaking-rate estimate
+// outright for subsequent synthesis calls. 0 (or negative) restores the
+// estimate (or CRISPASR_OMNIVOICE_TARGET_DURATION when that is set). Read live
+// per synthesize; clamped to a sane maximum (600 s).
+//
+// This is the escape hatch for the two failure modes of the estimate: a
+// `ref_text` that does not match the reference audio, and an under-estimate
+// that truncates the tail (the generator is masked-iterative and cannot ask
+// for more room — #363). A caller dubbing into a known window should pass it.
+int omnivoice_set_target_duration(struct omnivoice_context* ctx, float seconds);
 
 // Set the number of masked-iterative (diffusion) steps. Stage0 cost is
 // num_steps × 2 backbone forwards, so this is the dominant speed/quality lever:

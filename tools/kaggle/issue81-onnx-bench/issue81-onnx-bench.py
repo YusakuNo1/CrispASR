@@ -5,8 +5,8 @@ Tests all CrispASR backends that fit in Kaggle's time/disk budget.
 Head-to-head with onnx-asr for overlapping models (whisper, parakeet, canary).
 CrispASR-only RTF for the 20+ backends onnx-asr doesn't support.
 
-Push (under chr1str):
-  export KAGGLE_API_TOKEN=<chr1str token>
+Push (under $KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/issue81-onnx-bench
 """
 
@@ -43,7 +43,7 @@ if (REPO / "tools" / "kaggle").is_dir():
 import kaggle_harness as kh  # noqa: E402
 
 kh.init_progress()  # structured progress + heartbeat plumbing (kaggle_usage.md regime)
-# 3-tier HF auth (env -> Kaggle secret -> attached chr1str/crispasr-hf-token
+# 3-tier HF auth (env -> Kaggle secret -> attached ${KAGGLE_ACCOUNT}/crispasr-hf-token
 # dataset) so Phase 3's GGUF pulls are authenticated (avoids anon rate limits;
 # the token dataset is attached specifically for this).
 kh.resolve_hf_token()
@@ -55,7 +55,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 BUILD = TEMP / "build"
 BUILD.mkdir(parents=True, exist_ok=True)
 
-# Install ninja/ccache/mold AND warm ccache from the attached chr1str/crispasr-ccache
+# Install ninja/ccache/mold AND warm ccache from the attached ${KAGGLE_ACCOUNT}/crispasr-ccache
 # dataset (kaggle_usage.md #13/#17). Without this the build runs cold (~21 min);
 # warm it's ~3 min. cache_and_link_flags() below only sets the compiler-launcher
 # flags — it does NOT install or warm ccache, which is what this call does.
@@ -494,7 +494,7 @@ with open(WORK / "benchmark_results.json", "w") as f:
     json.dump(all_results, f, indent=2)
 print(f"\n  Results saved to {WORK / 'benchmark_results.json'}")
 
-# Refresh the ccache snapshot so the chr1str/crispasr-ccache dataset can be updated
+# Refresh the ccache snapshot so the ${KAGGLE_ACCOUNT}/crispasr-ccache dataset can be updated
 # from this run (kaggle_usage.md #17 — keep it current or warm builds go stale).
 # ccache lives at the RELOCATED CCACHE_DIR (/kaggle/temp/.ccache, out of the
 # output). Tar it into /kaggle/working/ccache.tar as the ONLY ccache artifact in
@@ -507,7 +507,7 @@ try:
         subprocess.run(f"tar cf {WORK}/ccache.tar -C {parent} {ccache_dir.name}", shell=True, check=True)
         sz = (WORK / "ccache.tar").stat().st_size / (1024**2)
         print(f"  ccache.tar written to /kaggle/working ({sz:.0f} MB) — the only ccache artifact in "
-              f"the output; update chr1str/crispasr-ccache from it", flush=True)
+              f"the output; update ${KAGGLE_ACCOUNT}/crispasr-ccache from it", flush=True)
         subprocess.run("ccache -s 2>/dev/null | tail -6 || true", shell=True)
 except Exception as e:  # noqa: BLE001
     print(f"  ccache tar skipped: {e}", flush=True)

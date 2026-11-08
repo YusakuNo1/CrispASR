@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-parakeet-ggml-decode-ab",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-parakeet-ggml-decode-ab",
   "title": "crispasr-parakeet-ggml-decode-ab",
   "code_file": "crispasr-parakeet-ggml-decode-ab.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token",
-    "chr1str/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

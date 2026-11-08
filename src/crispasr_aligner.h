@@ -33,10 +33,17 @@
 #include <string>
 #include <vector>
 
+struct CrispasrAlignedCharacter {
+    std::string text;
+    int64_t t0_cs = 0;
+    int64_t t1_cs = 0;
+};
+
 struct CrispasrAlignedWord {
     std::string text;
     int64_t t0_cs = 0; // centiseconds, absolute (includes t_offset_cs)
     int64_t t1_cs = 0;
+    std::vector<CrispasrAlignedCharacter> characters{}; // measured wav2vec2 CTC labels only
 };
 
 /// A re-timed segment: one input SRT cue (or one text line) with timings
@@ -49,12 +56,37 @@ struct CrispasrAlignedSegment {
     size_t word_end = 0;
 };
 
+// Absolute sample interval used when aligning one ASR segment.  Keeping this
+// calculation beside the aligner prevents per-slice callers from accidentally
+// feeding every segment the whole VAD slice (issue #444), which resets each
+// segment's timestamps to the same slice origin.
+struct CrispasrAlignmentAudioRange {
+    int start = 0;         // absolute sample index, inclusive
+    int end = 0;           // absolute sample index, exclusive
+    int64_t offset_cs = 0; // timestamp corresponding to start
+
+    bool valid() const { return end > start; }
+};
+
+CrispasrAlignmentAudioRange crispasr_alignment_audio_range(int64_t segment_t0_cs, int64_t segment_t1_cs,
+                                                           int slice_start, int slice_end, int sample_rate);
+
 /// Split text into alignment "words": whitespace-delimited for
 /// space-delimited languages, per-character for CJK. This is the exact
 /// splitter the aligner backends use — callers that map aligned words back
 /// onto larger units (SRT cues, lines) must count with this, not with a
 /// naive space count.
+// True when the aligner model path selects the Qwen3 forced-aligner runtime
+// (filename-based; includes the Ultra base checkpoint's upstream spelling).
+bool crispasr_aligner_is_qwen3_forced_aligner(const std::string& aligner_model);
+
 std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
+
+/// The same alignment units with punctuation reattached to the neighbouring
+/// unit for display. Alignment models must not receive punctuation timestamp
+/// slots, but subtitle splitting still needs sentence-ending marks on the
+/// returned words so it can use their measured times instead of interpolation.
+std::vector<std::string> crispasr_tokenise_align_display_words(const std::string& text);
 
 /// Parse SRT content into cue texts (indices and timestamps discarded,
 /// multi-line cue text joined with spaces, whitespace-only cues dropped).
@@ -79,10 +111,15 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// Run CTC forced alignment.
 ///
 /// Dispatches to canary-ctc-aligner by default, to qwen3-fa when
-/// `aligner_model` filename contains "forced-aligner" / "qwen3-fa" /
+/// `aligner_model` filename contains "forced-aligner" / "forcedaligner" / "qwen3-fa" /
 /// "qwen3-forced", and to wav2vec2/hubert/data2vec CTC when the filename
 /// or GGUF architecture identifies that family. Models load and free inside the call —
 /// cost is dominated by the ASR pass upstream, not the aligner load.
+///
+/// Canary/FastConformer inference uses overlapping encoder windows for long
+/// input (30-second cores by default), then one global transcript alignment.
+/// chunk_seconds changes the core duration; zero explicitly disables windowing.
+/// Host logits/DP memory still scales with recording length. VAD is not applied.
 ///
 /// Returns an empty vector on any failure (error printed to stderr).
 ///
@@ -95,7 +132,21 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// false-positives.
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads, bool* out_load_failed = nullptr);
+                                                      int n_threads, bool* out_load_failed = nullptr,
+                                                      int chunk_seconds = 30);
+
+struct CrispasrUltraAlignedWord {
+    std::string text;
+    double start_ms = 0;
+    double end_ms = 0;
+};
+
+// Experimental single-clip Ultra path. Preserves sub-centisecond timing and
+// rejects clips over 120 seconds instead of returning partial alignment. On
+// failure returns false and leaves `output` unchanged.
+bool crispasr_align_words_ultra(const std::string& aligner_model, const std::string& head_model,
+                                const std::string& transcript, const float* samples, int n_samples, int n_threads,
+                                std::vector<CrispasrUltraAlignedWord>& output);
 
 /// Free the cached aligner model context (§176e). Call at shutdown.
 void crispasr_aligner_free_cache();

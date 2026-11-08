@@ -13,14 +13,14 @@ maintenance is bumping pinned revisions in `tests/regression/manifest.json`.
 tools/kaggle/
 ├── README.md                   This file.
 ├── kernel-metadata.json        Kaggle manifest for the VALIDATE kernel
-│                               (id = chr1str/crispasr-regression-suite,
+│                               (id = ${KAGGLE_ACCOUNT}/crispasr-regression-suite,
 │                                code_file = crispasr-regression.py).
 ├── crispasr-regression.py      THE notebook script. Clones the repo,
 │                               builds CrispASR, runs the regression
 │                               suite. Same file powers both kernels.
 ├── push.sh                     `kaggle kernels push` for the validate kernel.
 └── rebake/                     Sibling kernel for AUTO re-bake.
-    ├── kernel-metadata.json    id = chr1str/crispasr-auto-rebake-refs,
+    ├── kernel-metadata.json    id = ${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs,
     │                           code_file = crispasr-rebake.py.
     ├── crispasr-rebake.py      Thin bootstrap: sets MODE=rebake +
     │                           UPLOAD=1, clones `main`, exec's the
@@ -31,6 +31,48 @@ tools/kaggle/
 Two Kaggle kernels, one canonical script — the rebake kernel pulls the
 latest `crispasr-regression.py` from `main` on every run, so changes to
 the regression logic propagate without re-pushing the bootstrap.
+
+## What belongs on Kaggle (and what doesn't)
+
+Kaggle is for work that needs a **real GPU**: CUDA or Vulkan speed and parity on
+hardware, and PyTorch references that only run in reasonable time on CUDA.
+Everything that runs on CPU goes to GitHub Actions instead, through
+`.github/workflows/heavy-cpu.yml` and `tools/ci-heavy/` (see its README). That
+covers Python reference dumps, diff harnesses, ASR roundtrips, and
+download → convert → quantize → upload. Standard runners are free for this
+public repo: 4 vCPU, 16 GB RAM, 6 h per job.
+
+Rules that follow from Kaggle's terms and guidelines (an account was banned on
+2026-09-28 for "resource abuse"):
+
+- One account per person. Never switch accounts to get around a quota or the
+  2-session GPU cap; wait instead.
+- Don't request a GPU session for its RAM, disk or internet, or to build C++
+  without using the GPU afterwards.
+- Attach only datasets the notebook really uses. No build caches or storage
+  datasets (the ccache datasets now live on HF).
+- No re-push loops. Push, wait, read `kernels_logs`.
+
+## Account, token and pushing
+
+Nothing account-specific is committed. Kernel metadata (`id`, `dataset_sources`, …)
+and kernel code use the placeholder `${KAGGLE_ACCOUNT}`; `tools/kaggle/kpush.py`
+renders it from the environment and pushes with the token from the environment:
+
+```bash
+# CI: KAGGLE_ACCOUNT / KAGGLE_TOKEN are repository secrets (see kaggle-status.yml).
+# Locally: export them from a private env file - never type a token on a command line.
+python3 tools/kaggle/kpush.py tools/kaggle/<kernel-dir>
+```
+
+`tests/test_no_secrets.py` (Secret scan workflow, every push) fails if a token, a
+literal owner in kernel metadata, or the account name itself lands in the repo.
+
+Kaggle's Terms allow ONE account per person and its Community Guidelines ban
+"abuse [of] kernel resources such as free storage" and attaching unrelated
+datasets: never switch accounts to get around quota or session limits, and do not
+keep build caches or tooling as Kaggle datasets (the build caches now live in private
+Hugging Face dataset repos).
 
 ## One-time setup
 
@@ -66,7 +108,7 @@ The CLI prefers the modern access token when both files exist.
    `https://www.kaggle.com/code/<your-kaggle-username>/crispasr-regression-suite`.
    The slug `<username>` comes from the `id` field in
    `kernel-metadata.json` — edit that to your username before the
-   first push if you're not `chr1str`.
+   first push if you're not `$KAGGLE_ACCOUNT`.
 
 2. **Wait for the first run to complete cleanly** (poll the URL or
    `kaggle kernels status <id>`). The first run downloads ~1 GB
@@ -84,10 +126,10 @@ The CLI prefers the modern access token when both files exist.
 4. **Enable the schedule** (the manual step the CLI can't do —
    Kaggle hasn't exposed scheduling via API):
    - Validate kernel
-     ([chr1str/crispasr-regression-suite](https://www.kaggle.com/code/chr1str/crispasr-regression-suite)):
+     ([${KAGGLE_ACCOUNT}/crispasr-regression-suite](https://www.kaggle.com/code/${KAGGLE_ACCOUNT}/crispasr-regression-suite)):
      Settings → "Schedule a notebook run" → Weekly · Sun · 04:00 UTC.
    - Rebake kernel
-     ([chr1str/crispasr-auto-rebake-refs](https://www.kaggle.com/code/chr1str/crispasr-auto-rebake-refs)):
+     ([${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs](https://www.kaggle.com/code/${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs)):
      Settings → "Schedule a notebook run" → Monthly · 1st · 04:00 UTC.
      Less often than validate because re-baking is intentional drift
      adoption, not routine checking. The fixtures HF repo gets new

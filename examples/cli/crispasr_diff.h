@@ -90,6 +90,10 @@ struct Report {
     float norm_ratio = 1.0f;    // rms_data / rms_ref (1 when both are zero)
     float cos_min = 1.0f;       // worst per-row cosine similarity (-1 .. 1)
     float cos_mean = 1.0f;      // average per-row cosine similarity
+    int64_t cos_min_row = -1;   // row index of cos_min (-1 = no row compared)
+    int64_t n_rows = 0;         // rows compared
+    float cos_min_norm_cpp = 0; // L2 norms of that row: a tiny-norm row makes
+    float cos_min_norm_ref = 0; //   cosine ill-conditioned, a big one does not
     int top1_match = 0;         // logits only: tokens matching ref argmax
     int top1_total = 0;         // logits only: total tokens compared
     std::vector<int64_t> shape; // shape of the ref tensor
@@ -140,7 +144,10 @@ public:
     // reference tensor, and cos_min / cos_mean reflect per-row cosine
     // similarity. When cmp_type == L2, rows aren't used and cos_* are
     // left at their defaults.
-    enum CompareMode { COS_LAST_DIM, L2_ONLY };
+    // GGUF reverses NumPy dimensions: ne[0] is the contiguous feature/vocab
+    // width. Use COS_FIRST_DIM for row-major (tokens, features) captures.
+    // Preserve COS_LAST_DIM for existing callers with historical layouts.
+    enum CompareMode { COS_LAST_DIM, L2_ONLY, COS_FIRST_DIM };
     Report compare(const std::string& name, const float* data, size_t n_elem, CompareMode mode = COS_LAST_DIM) const;
 
     // Convenience: compare the argmax-over-last-dim of `data` against

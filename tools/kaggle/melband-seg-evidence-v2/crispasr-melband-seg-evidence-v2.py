@@ -1,7 +1,7 @@
 """
 CrispASR — mel-band-roformer SEGMENTATION evidence, v2 (PR #422 review finding).
 
-v2 of crispasr-melband-seg-evidence. The v1 pilot (chr1s4/crispasr-melband-seg-
+v2 of crispasr-melband-seg-evidence. The v1 pilot (${KAGGLE_ACCOUNT}/crispasr-melband-seg-
 evidence) established the method; this run fixes three things that made v1
 structurally unable to deliver a trustworthy verdict. Everything through the
 GGUF conversion is v1's scaffold unchanged.

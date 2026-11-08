@@ -16,6 +16,9 @@
 // data-dependent control flow into one monolithic graph.
 
 #include "melotts.h"
+#include "core/bert_words.h"
+#include "core/melotts_bert_alignment.h"
+#include "core/melotts_sdp.h"
 #include "bert_encoder.h"
 
 #include "ggml.h"
@@ -289,25 +292,7 @@ static std::string post_replace_ph(const std::string& ph, const std::map<std::st
 
 // Simple tokenizer: split on punctuation/spaces, keep punctuation as tokens
 static std::vector<std::string> tokenize_english(const std::string& text) {
-    std::vector<std::string> tokens;
-    std::string cur;
-    for (char c : text) {
-        if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':' || c == '-' || c == '\'' ||
-            c == '\n') {
-            if (!cur.empty()) {
-                tokens.push_back(cur);
-                cur.clear();
-            }
-            if (c != ' ') {
-                tokens.push_back(std::string(1, c));
-            }
-        } else {
-            cur += c;
-        }
-    }
-    if (!cur.empty())
-        tokens.push_back(cur);
-    return tokens;
+    return core_bert::uncased_words(text);
 }
 
 // ── Rule-based letter-to-sound for OOV words ─────────────────────
@@ -925,10 +910,15 @@ struct melotts_context {
     int n_threads;
     uint32_t seed;
     std::string dump_dir;
+    std::map<int, std::string> speaker_names;
 
     std::unordered_map<ggml_tensor*, std::vector<float>> weight_cache;
     bool weight_cache_enabled = true;
 };
+
+static bool melotts_speaker_id_valid(const melotts_context* ctx, int id) {
+    return ctx && id >= 0 && static_cast<uint32_t>(id) < ctx->hp.n_speakers;
+}
 
 // ── Diff harness ──────────────────────────────────────────────────
 
@@ -940,6 +930,17 @@ static void dump_stage(const melotts_context* ctx, const char* label, const floa
     if (f) {
         fwrite(data, sizeof(float), n, f);
         fclose(f);
+    }
+}
+
+static void dump_input_ids(const melotts_context* ctx, const char* label, const std::vector<int>& ids) {
+    if (ctx->dump_dir.empty())
+        return;
+    const std::vector<int32_t> data(ids.begin(), ids.end());
+    const std::string path = ctx->dump_dir + "/" + label + ".bin";
+    if (FILE* file = fopen(path.c_str(), "wb")) {
+        fwrite(data.data(), sizeof(int32_t), data.size(), file);
+        fclose(file);
     }
 }
 
@@ -1579,6 +1580,10 @@ static void dds_conv_forward(const melotts_dds_conv& dds, const std::vector<floa
 
 static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, const float* d_knots, int num_bins,
                          float range_min, float range_max) {
+    // Original Melo transforms.py uses 1e-3 minima on probabilities BEFORE
+    // mapping to the tail interval, and 1e-3 + softplus on derivatives.
+    constexpr float min_bin = 1e-3f;
+    constexpr float min_derivative = 1e-3f;
     std::vector<float> widths(num_bins), heights(num_bins), derivatives(num_bins + 1);
 
     float max_w = *std::max_element(w_bins, w_bins + num_bins);
@@ -1588,7 +1593,7 @@ static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, c
         sum_w += widths[i];
     }
     for (int i = 0; i < num_bins; i++)
-        widths[i] = widths[i] / sum_w * (range_max - range_min) + 1e-5f;
+        widths[i] = (min_bin + (1.0f - min_bin * num_bins) * widths[i] / sum_w) * (range_max - range_min);
 
     float max_h = *std::max_element(h_bins, h_bins + num_bins);
     float sum_h = 0;
@@ -1597,12 +1602,12 @@ static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, c
         sum_h += heights[i];
     }
     for (int i = 0; i < num_bins; i++)
-        heights[i] = heights[i] / sum_h * (range_max - range_min) + 1e-5f;
+        heights[i] = (min_bin + (1.0f - min_bin * num_bins) * heights[i] / sum_h) * (range_max - range_min);
 
     derivatives[0] = 1.0f;
     derivatives[num_bins] = 1.0f;
     for (int i = 0; i < num_bins - 1; i++)
-        derivatives[i + 1] = logf(1.0f + expf(d_knots[i])) + 1e-5f;
+        derivatives[i + 1] = std::max(d_knots[i], 0.0f) + log1pf(expf(-fabsf(d_knots[i]))) + min_derivative;
 
     std::vector<float> cum_w(num_bins + 1), cum_h(num_bins + 1);
     cum_w[0] = range_min;
@@ -1610,6 +1615,12 @@ static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, c
     for (int i = 0; i < num_bins; i++) {
         cum_w[i + 1] = cum_w[i] + widths[i];
         cum_h[i + 1] = cum_h[i] + heights[i];
+    }
+    cum_w[num_bins] = range_max;
+    cum_h[num_bins] = range_max;
+    for (int i = 0; i < num_bins; i++) {
+        widths[i] = cum_w[i + 1] - cum_w[i];
+        heights[i] = cum_h[i + 1] - cum_h[i];
     }
 
     int bin_idx = num_bins - 1;
@@ -1622,7 +1633,7 @@ static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, c
 
     float w_k = widths[bin_idx], h_k = heights[bin_idx];
     float d_k = derivatives[bin_idx], d_k1 = derivatives[bin_idx + 1];
-    float s_k = h_k / (w_k + 1e-10f);
+    float s_k = h_k / w_k;
     float y_yk = y_in - cum_h[bin_idx];
     float t2 = d_k1 + d_k - 2.0f * s_k;
 
@@ -1632,7 +1643,7 @@ static float rqs_inverse(float y_in, const float* w_bins, const float* h_bins, c
     float disc = b * b - 4.0f * a * c;
     if (disc < 0)
         disc = 0;
-    float xi = (2.0f * c) / (-b - sqrtf(disc + 1e-10f));
+    float xi = (2.0f * c) / (-b - sqrtf(disc));
     xi = std::clamp(xi, 0.0f, 1.0f);
 
     return xi * w_k + cum_w[bin_idx];
@@ -1766,6 +1777,13 @@ static void sdp_forward(melotts_context* ctx,
         for (int i = 0; i < 2 * T; i++)
             z[i] = dist(gen);
     }
+
+    dump_stage(ctx, "sdp_noise", z.data(), z.size());
+
+    // Original reversed ModuleList starts with its terminal Flip. Dropping
+    // the useless ConvFlow slot 1 retains the final Flip before affine slot 0.
+    for (int t = 0; t < T; t++)
+        std::swap(z[t * 2 + 0], z[t * 2 + 1]);
 
     // Run SDP flows in reverse
     for (int fi = (int)w.sdp_flows.size() - 1; fi >= 0; fi--) {
@@ -2164,7 +2182,13 @@ static bool hifigan_decode(melotts_context* ctx, const std::vector<float>& z, co
     }
 
     // Final: LeakyReLU → conv_post → tanh
-    x = ggml_leaky_relu(gc, x, 0.1f, false);
+    ggml_tensor* before_post = x;
+    x = ggml_leaky_relu(gc, x, 0.01f, false);
+    ggml_tensor* post_activation = x;
+    if (!ctx->dump_dir.empty()) {
+        ggml_set_output(before_post);
+        ggml_set_output(post_activation);
+    }
     x = conv1d_cf(gc, x, w.dec_conv_post_w, nullptr, 1, 3, 1);
     x = ggml_tanh(gc, x);
 
@@ -2183,6 +2207,16 @@ static bool hifigan_decode(melotts_context* ctx, const std::vector<float>& z, co
         ggml_backend_tensor_set(g_input, g_vec.data(), 0, gin * sizeof(float));
 
     ggml_backend_sched_graph_compute(mg.sched, gf);
+
+    if (!ctx->dump_dir.empty()) {
+        const auto backend = ggml_backend_sched_get_tensor_backend(mg.sched, post_activation);
+        fprintf(stderr, "melotts: final activation backend %s\n", backend ? ggml_backend_name(backend) : "unassigned");
+        std::vector<float> before(ggml_nelements(before_post)), after(ggml_nelements(post_activation));
+        ggml_backend_tensor_get(before_post, before.data(), 0, before.size() * sizeof(float));
+        ggml_backend_tensor_get(post_activation, after.data(), 0, after.size() * sizeof(float));
+        dump_stage(ctx, "dec_before_post", before.data(), before.size());
+        dump_stage(ctx, "dec_post_activation", after.data(), after.size());
+    }
 
     int T_audio = (int)ggml_nelements(x);
     pcm_out.resize(T_audio);
@@ -2331,6 +2365,34 @@ static bool load_weights(melotts_context* ctx, const char* path) {
     std::string cmudict_json = core_gguf::kv_str(meta, "melotts.cmudict_json", "{}");
     std::string g2p_en_json = core_gguf::kv_str(meta, "melotts.g2p_en_json", "");
 
+    const std::string speakers = core_gguf::kv_str(meta, "melotts.spk2id_json", "{}");
+    // Converter writes a simple JSON object of ASCII speaker keys to integer IDs.
+    size_t sp = 0;
+    while ((sp = speakers.find('"', sp)) != std::string::npos) {
+        const size_t end = speakers.find('"', sp + 1);
+        if (end == std::string::npos)
+            break;
+        const size_t colon = speakers.find(':', end + 1);
+        if (colon == std::string::npos)
+            break;
+        char* stop = nullptr;
+        long id = std::strtol(speakers.c_str() + colon + 1, &stop, 10);
+        if (stop != speakers.c_str() + colon + 1 && id >= 0 && id < ctx->hp.n_speakers) {
+            std::string name = speakers.substr(sp + 1, end - sp - 1);
+            for (char& c : name) {
+                if (c >= 'A' && c <= 'Z')
+                    c += 'a' - 'A';
+                else if (c == '_')
+                    c = '-';
+            }
+            ctx->speaker_names[(int)id] = name;
+        }
+        sp = end + 1;
+        const size_t comma = speakers.find(',', colon + 1);
+        if (comma == std::string::npos)
+            break;
+        sp = comma + 1;
+    }
     core_gguf::free_metadata(meta);
 
     // Parse symbols
@@ -2566,6 +2628,19 @@ static bool load_weights(melotts_context* ctx, const char* path) {
     w.sdp_flow0_m = require_tensor(tensors, "sdp.flows.0.m");
     w.sdp_flow0_logs = try_tensor(tensors, "sdp.flows.0.logs");
 
+    uint32_t active_flows = 0, dds_layers = 0;
+    if (!core_melotts::sdp_inference_counts([&](const std::string& name) { return tensors.count(name) != 0; },
+                                            active_flows, dds_layers)) {
+        fprintf(stderr, "melotts: incomplete or unsupported SDP tensor inventory\n");
+        return false;
+    }
+    if ((hp.n_sdp_flows != 0 && hp.n_sdp_flows != active_flows) ||
+        (hp.n_sdp_dds_layers != 0 && hp.n_sdp_dds_layers != dds_layers)) {
+        fprintf(stderr, "melotts: SDP metadata disagrees with tensor inventory\n");
+        return false;
+    }
+    hp.n_sdp_flows = active_flows;
+    hp.n_sdp_dds_layers = dds_layers;
     load_dds_conv(tensors, "sdp.convs", hp.n_sdp_dds_layers, w.sdp_convs);
 
     w.sdp_flows.resize(hp.n_sdp_flows);
@@ -2685,6 +2760,10 @@ struct melotts_params melotts_default_params(void) {
 }
 
 struct melotts_context* melotts_init_from_file(const char* path_model, struct melotts_params params) {
+    if (params.speaker_id < 0) {
+        fprintf(stderr, "melotts: speaker ID must be nonnegative\n");
+        return nullptr;
+    }
     auto* ctx = new melotts_context();
     ctx->verbosity = params.verbosity;
     ctx->n_threads = params.n_threads;
@@ -2702,6 +2781,13 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
         ctx->backend = ctx->backend_cpu;
 
     if (!load_weights(ctx, path_model)) {
+        melotts_free(ctx);
+        return nullptr;
+    }
+
+    if (!melotts_speaker_id_valid(ctx, params.speaker_id)) {
+        fprintf(stderr, "melotts: speaker ID %d is outside the model's %u speakers\n", params.speaker_id,
+                ctx->hp.n_speakers);
         melotts_free(ctx);
         return nullptr;
     }
@@ -2830,6 +2916,9 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
         melotts_bench_stage _bs("g2p");
         g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids, word2ph);
     }
+    dump_input_ids(ctx, "phoneme_ids", phone_ids);
+    dump_input_ids(ctx, "tone_ids", tone_ids);
+    dump_input_ids(ctx, "lang_ids", lang_ids);
     int T = (int)phone_ids.size();
 
     if (ctx->verbosity >= 2) {
@@ -2863,53 +2952,40 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
             int n_words = bert_encoder_word_subtokens(ctx->bert_ctx, text, &subtokens);
 
             // Build per-BERT-token phone counts
-            // word2ph has: [pad] [word0_phones] [word1_phones] ... [pad]
-            // subtokens has: [n_sub_word0] [n_sub_word1] ...
-            // BERT tokens: [CLS] [sub00 sub01..] [sub10..] ... [SEP]
             std::vector<int> bert_word2ph;
-            bert_word2ph.push_back(word2ph[0]); // leading pad → [CLS]
-
-            int w2p_idx = 1; // skip leading pad
-            for (int wi = 0; wi < n_words && w2p_idx < (int)word2ph.size() - 1; wi++) {
-                int n_phones_word = word2ph[w2p_idx];
-                int n_sub = subtokens[wi];
-                // distribute_phone: split n_phones evenly across n_sub tokens
-                if (n_sub <= 1) {
-                    bert_word2ph.push_back(n_phones_word);
-                } else {
-                    int base = n_phones_word / n_sub;
-                    int remainder = n_phones_word % n_sub;
-                    for (int s = 0; s < n_sub; s++) {
-                        bert_word2ph.push_back(base + (s < remainder ? 1 : 0));
-                    }
-                }
-                w2p_idx++;
-            }
-
-            // trailing pad → [SEP]
-            if (w2p_idx < (int)word2ph.size())
-                bert_word2ph.push_back(word2ph.back());
+            std::vector<int> word_subtokens;
+            if (n_words > 0)
+                word_subtokens.assign(subtokens, subtokens + n_words);
             free(subtokens);
+            if (!core_melotts::bert_phone_counts(word2ph, word_subtokens, n_bert_tokens, T, bert_word2ph)) {
+                free(bert_out);
+                fprintf(stderr, "melotts: BERT token/phone alignment mismatch\n");
+                g_melotts_ctx = nullptr;
+                return 0;
+            }
+            dump_input_ids(ctx, "bert_word2ph", bert_word2ph);
+            if (!ctx->dump_dir.empty()) {
+                int* ids = nullptr;
+                const int count = bert_encoder_tokenize(ctx->bert_ctx, text, &ids);
+                if (count > 0)
+                    dump_input_ids(ctx, "bert_token_ids", std::vector<int>(ids, ids + count));
+                free(ids);
+            }
 
             // Expand BERT features using bert_word2ph
             ja_bert_features.resize(bert_dim * T, 0.0f);
             int phone_pos = 0;
             for (int bi = 0; bi < (int)bert_word2ph.size() && phone_pos < T; bi++) {
                 int n_phones = bert_word2ph[bi];
-                int bt = std::clamp(bi, 0, n_bert_tokens - 1);
+                int bt = bi;
                 for (int p = 0; p < n_phones && phone_pos < T; p++) {
                     for (int c = 0; c < bert_dim; c++)
                         ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
                     phone_pos++;
                 }
             }
-            while (phone_pos < T) {
-                int bt = n_bert_tokens - 1;
-                for (int c = 0; c < bert_dim; c++)
-                    ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
-                phone_pos++;
-            }
             free(bert_out);
+            dump_stage(ctx, "ja_bert_features", ja_bert_features.data(), ja_bert_features.size());
             if (ctx->verbosity >= 2)
                 fprintf(stderr, "melotts: BERT %d tokens, %d word2ph entries → %d phones\n", n_bert_tokens,
                         (int)bert_word2ph.size(), T);
@@ -3029,7 +3105,7 @@ void melotts_set_sdp_ratio(struct melotts_context* ctx, float v) {
         ctx->sdp_ratio = v;
 }
 void melotts_set_speaker_id(struct melotts_context* ctx, int id) {
-    if (ctx)
+    if (melotts_speaker_id_valid(ctx, id))
         ctx->speaker_id = id;
 }
 void melotts_set_seed(struct melotts_context* ctx, uint32_t seed) {
@@ -3045,4 +3121,11 @@ int melotts_num_speakers(const struct melotts_context* ctx) {
 void melotts_set_dump_dir(struct melotts_context* ctx, const char* dir) {
     if (ctx && dir)
         ctx->dump_dir = dir;
+}
+
+const char* melotts_source_speaker(const struct melotts_context* ctx) {
+    if (!ctx)
+        return nullptr;
+    const auto found = ctx->speaker_names.find(ctx->speaker_id);
+    return found == ctx->speaker_names.end() ? nullptr : found->second.c_str();
 }

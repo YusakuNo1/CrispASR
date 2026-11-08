@@ -12,6 +12,7 @@
 
 #include "core/attention.h"
 #include "core/ecapa_tdnn.h"
+#include "core/sdpa.h" // manual-F32-default SDPA / flash opt-in (#nemotron flash class)
 #include "core/spm_bpe.h"
 #include "core/audio_resample.h"
 #include "core/wav_reader.h"
@@ -2566,8 +2567,13 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim,
             v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)head_dim);
-            ggml_tensor* attn = ggml_flash_attn_ext(cache.gctx, q, k, v, cache.attn_mask, scale, 0.0f, 0.0f);
-            attn = ggml_reshape_2d(cache.gctx, attn, dim, Tg);
+            // Flow-matching estimator (f5-class): default to manual F32 SDPA —
+            // fused flash accumulates KQ in F16 and set_prec is ignored on some
+            // GPUs (P100/sm_60), which corrupts the ODE. Fused is opt-in via
+            // CRISPASR_CONFUCIUS4_FLASH=1. cache.attn_mask is the (Tg,Tg) F16
+            // block-diagonal CFG mask, or nullptr when not fused (full attn).
+            ggml_tensor* attn = core_sdpa::attn(cache.gctx, q, k, v, cache.attn_mask, dim, Tg, scale,
+                                                core_sdpa::flash_enabled("CRISPASR_CONFUCIUS4_FLASH"));
 
             ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, wo, attn);
             x = ggml_add(cache.gctx, x, attn_proj);
@@ -3533,6 +3539,18 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     if (!ctx || !text || !out_n_samples)
         return nullptr;
 
+    if (!ctx->s2a.loaded) {
+        fprintf(stderr, "S2A not loaded — pass --codec-model\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    if (!ctx->vocoder) {
+        fprintf(stderr, "BigVGAN vocoder gguf not loaded\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
     const int vb = ctx->params.verbosity;
 
     load_conditioning_from_env(ctx);
@@ -3634,8 +3652,6 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         if (vb >= 1)
             fprintf(stderr, "confucius4: tokenized '%s' → %zu tokens (SP-BPE + bos/eos)\n", text, text_ids.size());
     } else {
-        fprintf(stderr, "confucius4: no tokenizer. Set CRISPASR_CONFUCIUS4_TEXT_IDS=id1,id2,... "
-                        "or bake vocab into the GGUF.\n");
         *out_n_samples = 0;
         return nullptr;
     }
@@ -3662,12 +3678,6 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     //   7. Strip prompt portion → mel (80, T_target)
     //
     // Step 4: BigVGAN vocoder → PCM @ 22050 Hz (external companion GGUF)
-    if (!ctx->s2a.loaded) {
-        fprintf(stderr, "confucius4: generated %zu semantic codes (S2A not loaded — pass --codec-model)\n",
-                semantic_codes.size());
-        *out_n_samples = 0;
-        return nullptr;
-    }
 
     // Run S2A flow-matching → mel
     if (vb >= 1 && !lm_latent.empty())
@@ -3696,22 +3706,6 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
             fprintf(stderr, "confucius4: BigVGAN: %d mel frames → %d PCM samples @ %d Hz (%.2fs)\n", T_mel, n_pcm, sr,
                     (float)n_pcm / sr);
     }
-
-    if (!pcm) {
-        // Fallback: output silence at the right duration
-        const int hop = 256;
-        n_pcm = T_mel * hop;
-        pcm = (float*)calloc(n_pcm, sizeof(float));
-        if (!pcm) {
-            *out_n_samples = 0;
-            return nullptr;
-        }
-        if (vb >= 1)
-            fprintf(stderr,
-                    "confucius4: output: %d mel frames → %d PCM samples @ %d Hz (%.2fs, silence — no vocoder)\n", T_mel,
-                    n_pcm, sr, (float)n_pcm / sr);
-    }
-
     *out_n_samples = n_pcm;
     return pcm;
 }

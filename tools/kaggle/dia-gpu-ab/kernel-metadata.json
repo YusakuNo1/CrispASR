@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-dia-gpu-ab",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-dia-gpu-ab",
   "title": "crispasr-dia-gpu-ab",
   "code_file": "crispasr-dia-gpu-ab.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token",
-    "chr1str/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

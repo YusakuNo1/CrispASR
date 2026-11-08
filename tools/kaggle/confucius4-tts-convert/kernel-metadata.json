@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-confucius4-tts-convert",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-confucius4-tts-convert",
   "title": "crispasr-confucius4-tts-convert",
   "code_file": "confucius4-tts-convert.py",
   "language": "python",
@@ -7,7 +7,7 @@
   "is_private": "true",
   "enable_gpu": "false",
   "enable_internet": "true",
-  "dataset_sources": ["chr1str/crispasr-hf-token"],
+  "dataset_sources": ["${KAGGLE_ACCOUNT}/crispasr-hf-token"],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

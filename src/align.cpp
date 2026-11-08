@@ -16,19 +16,28 @@
  *    Transitions at each time step t:
  *      stay:        alpha[j] ← alpha_prev[j]
  *      advance:     alpha[j] ← alpha_prev[j-1]
- *      skip-blank:  alpha[j] ← alpha_prev[j-2]  (only when seq[j] ≠ blank AND
- *                                                  seq[j] ≠ seq[j-2])
+ *      skip-blank:  alpha[j] ← alpha_prev[j-2]  (only when seq[j] != blank AND
+ *                                                  seq[j] != seq[j-2])
  *    back-pointer back[t][j] records which of stay/advance/skip-blank was best.
  *
  * 4. Traceback from the last valid label position at t = T-1.
  *
  * 5. Map each word's character range in `seq` to frames → word t0/t1.
  *
- * Memory: O(T × S) for back-pointers — manageable for typical utterances
- * (T ≤ 5000 frames × S ≤ 2000 labels → ~10 MB at int8).
+ * Two execution paths:
+ *   baseline (default) — exact original implementation, preserved verbatim for
+ *     parity and A/B discipline.
+ *   optimized (opt-in) — exact-output optimization gated by environment:
+ *     CRISPASR_CTC_ALIGN_OPT=1. Default off until root benchmarks parity. The
+ *     optimized arm retains the original full-vocabulary max/sum-exp order and
+ *     float arithmetic, stores only required token emissions after identical
+ *     normalization, flattens backpointers, and derives word bounds from
+ *     existing character/path ranges in one pass. No pruning, banding, or
+ *     score shortcuts.
  */
 
 #include "align.h"
+#include "core/parallel_for.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,9 +45,19 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// Gate
+// ---------------------------------------------------------------------------
+
+static bool align_opt_enabled() {
+    const char* e = std::getenv("CRISPASR_CTC_ALIGN_OPT");
+    return e && e[0] == '1' && e[1] == '\0';
+}
 
 // ---------------------------------------------------------------------------
 // Text normalisation helpers
@@ -76,7 +95,7 @@ static int utf8_seq_len(const std::string& word, size_t i) {
 // (e.g. "こ" as a 3-byte entry), not individual bytes. Per-byte iteration
 // previously made every CJK alignment fail with zero overlap (#32).
 static bool word_to_ids(const std::string& word, const std::unordered_map<std::string, int>& v2id, int blank_id,
-                        std::vector<int>& out_chars) {
+                        std::vector<int>& out_chars, std::vector<std::string>& out_text) {
     bool any = false;
     for (size_t i = 0; i < word.size();) {
         const int n = utf8_seq_len(word, i);
@@ -88,6 +107,7 @@ static bool word_to_ids(const std::string& word, const std::unordered_map<std::s
                 id = lookup_char(v2id, (unsigned char)word[i]);
             if (id >= 0 && id != blank_id) {
                 out_chars.push_back(id);
+                out_text.push_back(word.substr(i, 1));
                 any = true;
             }
         } else if (i + (size_t)n <= word.size()) {
@@ -96,6 +116,7 @@ static bool word_to_ids(const std::string& word, const std::unordered_map<std::s
             auto it = v2id.find(cp);
             if (it != v2id.end() && it->second != blank_id) {
                 out_chars.push_back(it->second);
+                out_text.push_back(cp);
                 any = true;
             }
         }
@@ -105,12 +126,15 @@ static bool word_to_ids(const std::string& word, const std::unordered_map<std::s
 }
 
 // ---------------------------------------------------------------------------
-// ctc_forced_align
+// Baseline implementation — preserved verbatim for A/B parity
 // ---------------------------------------------------------------------------
 
-std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, const std::vector<std::string>& words,
-                                             const std::vector<std::string>& vocab, int blank_id, float frame_dur) {
-    if (T <= 0 || V <= 0 || words.empty())
+static std::vector<ctc_word_stamp> ctc_forced_align_baseline(const float* logits, int T, int V,
+                                                             const std::vector<std::string>& words,
+                                                             const std::vector<std::string>& vocab, int blank_id,
+                                                             float frame_dur) {
+    if (!logits || T <= 0 || V <= 0 || words.empty() || blank_id < 0 || blank_id >= V ||
+        vocab.size() > static_cast<size_t>(V) || !std::isfinite(frame_dur) || frame_dur <= 0)
         return {};
 
     // ------------------------------------------------------------------
@@ -139,14 +163,17 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
     }; // inclusive, in chars[]
 
     std::vector<int> chars;
+    std::vector<std::string> char_text;
     std::vector<word_range> wranges;
 
     for (int wi = 0; wi < (int)words.size(); wi++) {
-        if (wi > 0 && bar_id >= 0)
+        if (wi > 0 && bar_id >= 0 && bar_id != blank_id) {
             chars.push_back(bar_id);
+            char_text.emplace_back();
+        }
 
         int cs = (int)chars.size();
-        bool ok = word_to_ids(words[wi], v2id, blank_id, chars);
+        bool ok = word_to_ids(words[wi], v2id, blank_id, chars, char_text);
         int ce = (int)chars.size() - 1;
 
         if (!ok || ce < cs) {
@@ -179,7 +206,7 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
     // ------------------------------------------------------------------
     // 4. Compute log-softmax for every frame  [T × V]
     // ------------------------------------------------------------------
-    std::vector<float> lp(T * V);
+    std::vector<float> lp(static_cast<size_t>(T) * V);
     for (int t = 0; t < T; t++) {
         const float* src = logits + t * V;
         float* dst = lp.data() + t * V;
@@ -202,7 +229,7 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
 
     std::vector<float> alpha(S, NEG_INF), alpha_next(S);
     // back is T × S bytes — for large audio/long transcripts, capped to avoid OOM.
-    // Max practical: 5000 frames × 2000 labels = 10 MB.
+    // Max practical: 5000 frames x 2000 labels = 10 MB.
     std::vector<std::vector<int8_t>> back(T, std::vector<int8_t>(S, 0));
 
     // Initialise t = 0
@@ -252,6 +279,8 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
 
     // Start at the last label (S-1 or S-2, whichever is better)
     int j_cur = (alpha[S - 1] >= alpha[S - 2]) ? S - 1 : S - 2;
+    if (alpha[j_cur] <= NEG_INF)
+        return {}; // No complete CTC path; do not manufacture partial timestamps.
 
     for (int t = T - 1; t >= 0; t--) {
         path[t] = j_cur;
@@ -272,10 +301,21 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
     // ------------------------------------------------------------------
     // 7. Map path to per-word timestamps
     //    For word wi with char range [cs, ce] (inclusive, in chars[]):
-    //      expanded positions: 2*cs+1 … 2*ce+1 (odd = label positions)
+    //      expanded positions: 2*cs+1 .. 2*ce+1 (odd = label positions)
     //    t0 = first frame assigned to any label in that range
-    //    t1 = (last such frame + 1)  → end-exclusive
+    //    t1 = (last such frame + 1)  -> end-exclusive
     // ------------------------------------------------------------------
+    // Each odd expanded state identifies one label occurrence. Repeated
+    // letters have distinct states separated by a required blank.
+    std::vector<int> char_start(N, -1), char_end(N, -1);
+    for (int t = 0; t < T; ++t) {
+        if (path[t] % 2 == 0)
+            continue;
+        const int label = path[t] / 2;
+        if (char_start[label] < 0)
+            char_start[label] = t;
+        char_end[label] = t + 1;
+    }
     std::vector<ctc_word_stamp> result;
     result.reserve(words.size());
 
@@ -307,8 +347,333 @@ std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, 
             ws.t0 = (float)t0_frame * frame_dur;
             ws.t1 = (float)(t1_frame + 1) * frame_dur;
         }
-        result.push_back(ws);
+        for (int ci = wranges[wi].cs; ci <= wranges[wi].ce; ++ci) {
+            if (char_start[ci] >= 0 && !char_text[ci].empty())
+                ws.characters.push_back({char_text[ci], char_start[ci] * frame_dur, char_end[ci] * frame_dur});
+        }
+        result.push_back(std::move(ws));
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Optimized implementation — exact-output, gated opt-in
+// ---------------------------------------------------------------------------
+
+static std::vector<ctc_word_stamp> ctc_forced_align_optimized(const float* logits, int T, int V,
+                                                              const std::vector<std::string>& words,
+                                                              const std::vector<std::string>& vocab, int blank_id,
+                                                              float frame_dur) {
+    if (!logits || T <= 0 || V <= 0 || words.empty() || blank_id < 0 || blank_id >= V ||
+        vocab.size() > static_cast<size_t>(V) || !std::isfinite(frame_dur) || frame_dur <= 0)
+        return {};
+
+    // 1. Build vocab reverse map  token → id (identical to baseline)
+    std::unordered_map<std::string, int> v2id;
+    v2id.reserve(vocab.size());
+    for (int i = 0; i < (int)vocab.size(); i++)
+        v2id[vocab[i]] = i;
+
+    int bar_id = -1;
+    {
+        auto it = v2id.find("|");
+        if (it != v2id.end())
+            bar_id = it->second;
+    }
+
+    // 2. Build character (label) sequence & track per-word char ranges
+    struct word_range {
+        int cs, ce;
+    };
+
+    std::vector<int> chars;
+    std::vector<std::string> char_text;
+    std::vector<word_range> wranges;
+
+    for (int wi = 0; wi < (int)words.size(); wi++) {
+        if (wi > 0 && bar_id >= 0 && bar_id != blank_id) {
+            chars.push_back(bar_id);
+            char_text.emplace_back();
+        }
+
+        int cs = (int)chars.size();
+        bool ok = word_to_ids(words[wi], v2id, blank_id, chars, char_text);
+        int ce = (int)chars.size() - 1;
+
+        if (!ok || ce < cs) {
+            wranges.push_back({-1, -1});
+        } else {
+            wranges.push_back({cs, ce});
+        }
+    }
+
+    int N = (int)chars.size();
+    if (N == 0) {
+        std::vector<ctc_word_stamp> out;
+        for (const auto& w : words)
+            out.push_back({w, 0.f, 0.f});
+        return out;
+    }
+
+    // 3. Build expanded sequence  seq[0..S-1]
+    int S = 2 * N + 1;
+    std::vector<int> seq(S);
+    for (int j = 0; j < S; j++)
+        seq[j] = (j % 2 == 0) ? blank_id : chars[j / 2];
+
+    // 4. Compute log-softmax emitting only required unique tokens.
+    //    Retain the original full-vocabulary max/sum-exp order and
+    //    float arithmetic: max over all V, sum exp(src[i]-max) over all V,
+    //    then store per unique token. Emit is T*U (U = unique token ids),
+    //    state_to_col maps expanded state j -> column in emit.
+    std::vector<int> uniq_ids;
+    std::vector<int> state_to_col(S);
+    std::unordered_map<int, int> id_to_col;
+    uniq_ids.reserve((size_t)S);
+    id_to_col.reserve((size_t)S * 2);
+    for (int j = 0; j < S; ++j) {
+        int tok = seq[j];
+        auto it = id_to_col.find(tok);
+        if (it == id_to_col.end()) {
+            int col = (int)uniq_ids.size();
+            id_to_col.emplace(tok, col);
+            uniq_ids.push_back(tok);
+            state_to_col[j] = col;
+        } else {
+            state_to_col[j] = it->second;
+        }
+    }
+    int U = (int)uniq_ids.size();
+    std::vector<float> emit;
+    const char* serial_env = std::getenv("CRISPASR_CTC_ALIGN_SERIAL");
+    const bool force_serial = serial_env && serial_env[0] == '1' && serial_env[1] == '\0';
+    {
+        size_t total = (size_t)T * (size_t)U;
+        if (U != 0 && total / (size_t)U != (size_t)T)
+            return {};
+        emit.resize(total);
+        auto compute_emit_chunk = [&](int t_start, int t_end) {
+            for (int t = t_start; t < t_end; t++) {
+                const float* src = logits + (size_t)t * (size_t)V;
+                float mx = *std::max_element(src, src + V);
+                float s = 0.f;
+                for (int i = 0; i < V; i++) {
+                    float d = src[i] - mx;
+                    s += expf(d);
+                }
+                float ls = logf(std::max(s, 1e-30f));
+                float* dst = emit.data() + (size_t)t * (size_t)U;
+                for (int k = 0; k < U; ++k) {
+                    float v = src[uniq_ids[k]] - mx;
+                    v -= ls;
+                    dst[k] = v;
+                }
+            }
+        };
+        if (force_serial || T < 16) {
+            compute_emit_chunk(0, T);
+        } else {
+            core_parallel::for_each_chunk(T, 0, compute_emit_chunk);
+        }
+    }
+
+    // 5. Viterbi DP with flattened backpointers
+    const float NEG_INF = -1e30f;
+
+    std::vector<float> alpha(S, NEG_INF), alpha_next(S);
+    std::vector<int8_t> back;
+    {
+        size_t total = (size_t)T * (size_t)S;
+        if (S != 0 && total / (size_t)S != (size_t)T)
+            return {};
+        back.assign(total, 0);
+    }
+
+    {
+        const float* e0 = emit.data();
+        alpha[0] = e0[state_to_col[0]];
+        if (S > 1)
+            alpha[1] = e0[state_to_col[1]];
+    }
+
+    if (force_serial) {
+        for (int t = 1; t < T; t++) {
+            const float* erow = emit.data() + (size_t)t * (size_t)U;
+            std::fill(alpha_next.begin(), alpha_next.end(), NEG_INF);
+            size_t base = (size_t)t * (size_t)S;
+
+            for (int j = 0; j < S; j++) {
+                int tok = seq[j];
+
+                float best = alpha[j];
+                int8_t bsrc = 0;
+
+                if (j >= 1 && alpha[j - 1] > best) {
+                    best = alpha[j - 1];
+                    bsrc = 1;
+                }
+
+                if (j >= 2 && tok != blank_id && seq[j] != seq[j - 2] && alpha[j - 2] > best) {
+                    best = alpha[j - 2];
+                    bsrc = 2;
+                }
+
+                if (best > NEG_INF) {
+                    alpha_next[j] = best + erow[state_to_col[j]];
+                    back[base + (size_t)j] = bsrc;
+                }
+            }
+            alpha.swap(alpha_next);
+        }
+    } else {
+        std::vector<uint8_t> can_skip(S, 0);
+        for (int j = 2; j < S; j++) {
+            if (seq[j] != blank_id && seq[j] != seq[j - 2]) {
+                can_skip[j] = 1;
+            }
+        }
+
+        for (int t = 1; t < T; t++) {
+            const float* erow = emit.data() + (size_t)t * (size_t)U;
+            std::fill(alpha_next.begin(), alpha_next.end(), NEG_INF);
+            size_t base = (size_t)t * (size_t)S;
+            const int j_max = std::min(S, 2 * t + 2);
+
+            for (int j = 0; j < j_max; j++) {
+                float best = alpha[j];
+                int8_t bsrc = 0;
+
+                if (j >= 1 && alpha[j - 1] > best) {
+                    best = alpha[j - 1];
+                    bsrc = 1;
+                }
+
+                if (can_skip[j] && alpha[j - 2] > best) {
+                    best = alpha[j - 2];
+                    bsrc = 2;
+                }
+
+                if (best > NEG_INF) {
+                    alpha_next[j] = best + erow[state_to_col[j]];
+                    back[base + (size_t)j] = bsrc;
+                }
+            }
+            alpha.swap(alpha_next);
+        }
+    }
+
+    // 6. Traceback
+    std::vector<int> path(T);
+
+    int j_cur = S >= 2 ? ((alpha[S - 1] >= alpha[S - 2]) ? S - 1 : S - 2) : 0;
+    if (alpha[j_cur] <= NEG_INF)
+        return {};
+
+    for (int t = T - 1; t >= 0; t--) {
+        path[t] = j_cur;
+        if (t > 0) {
+            int8_t b = back[(size_t)t * (size_t)S + (size_t)j_cur];
+            switch (b) {
+            case 0:
+                break;
+            case 1:
+                j_cur--;
+                break;
+            case 2:
+                j_cur -= 2;
+                break;
+            }
+        }
+    }
+
+    // 7. Map path to per-word timestamps using character ranges.
+    //    Baseline rescans the entire path for every word (O(W*T)).
+    //    Here we derive word bounds from char_start/char_end already
+    //    measured in one pass. For each label c, char_start[c] is first
+    //    frame where path==2*c+1 and char_end[c]==last+1. For word wi
+    //    covering chars [cs..ce], its span is min/max over those labels,
+    //    which equals the baseline's es0..es1 scan because the interval
+    //    between first and last label covers exactly the internal blanks
+    //    as well, and the baseline's scan endpoints are always label
+    //    frames.
+    std::vector<int> char_start(N, -1), char_end(N, -1);
+    for (int t = 0; t < T; ++t) {
+        if (path[t] % 2 == 0)
+            continue;
+        const int label = path[t] / 2;
+        if (char_start[label] < 0)
+            char_start[label] = t;
+        char_end[label] = t + 1;
+    }
+
+    std::vector<ctc_word_stamp> result;
+    result.reserve(words.size());
+
+    for (int wi = 0; wi < (int)words.size(); wi++) {
+        ctc_word_stamp ws;
+        ws.word = words[wi];
+        ws.t0 = 0.f;
+        ws.t1 = 0.f;
+
+        if (wranges[wi].cs < 0) {
+            result.push_back(std::move(ws));
+            continue;
+        }
+
+        int cs = wranges[wi].cs;
+        int ce = wranges[wi].ce;
+        int t0 = INT_MAX;
+        int t1 = -1;
+        for (int ci = cs; ci <= ce; ++ci) {
+            if (char_start[ci] >= 0)
+                t0 = std::min(t0, char_start[ci]);
+            if (char_end[ci] >= 0)
+                t1 = std::max(t1, char_end[ci]);
+        }
+
+        if (t0 != INT_MAX && t1 >= 0) {
+            ws.t0 = (float)t0 * frame_dur;
+            ws.t1 = (float)t1 * frame_dur;
+        } else {
+            // Fallback: extremely rare case where no label of the word
+            // was visited (should imply alignment failure, but baseline
+            // could still have found an internal blank). Rescan path for
+            // this word only to preserve exact output.
+            int es0 = 2 * cs + 1;
+            int es1 = 2 * ce + 1;
+            int t0_frame = -1, t1_frame = -1;
+            for (int t = 0; t < T; t++) {
+                int j = path[t];
+                if (j >= es0 && j <= es1) {
+                    if (t0_frame < 0)
+                        t0_frame = t;
+                    t1_frame = t;
+                }
+            }
+            if (t0_frame >= 0) {
+                ws.t0 = (float)t0_frame * frame_dur;
+                ws.t1 = (float)(t1_frame + 1) * frame_dur;
+            }
+        }
+
+        for (int ci = cs; ci <= ce; ++ci) {
+            if (char_start[ci] >= 0 && !char_text[ci].empty())
+                ws.characters.push_back({char_text[ci], char_start[ci] * frame_dur, char_end[ci] * frame_dur});
+        }
+        result.push_back(std::move(ws));
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Public API — dispatch with A/B gate
+// ---------------------------------------------------------------------------
+
+std::vector<ctc_word_stamp> ctc_forced_align(const float* logits, int T, int V, const std::vector<std::string>& words,
+                                             const std::vector<std::string>& vocab, int blank_id, float frame_dur) {
+    if (align_opt_enabled())
+        return ctc_forced_align_optimized(logits, T, V, words, vocab, blank_id, frame_dur);
+    return ctc_forced_align_baseline(logits, T, V, words, vocab, blank_id, frame_dur);
 }

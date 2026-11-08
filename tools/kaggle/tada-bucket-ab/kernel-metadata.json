@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-tada-bucket-ab",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-tada-bucket-ab",
   "title": "crispasr-tada-bucket-ab",
   "code_file": "crispasr-tada-bucket-ab.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1str/crispasr-hf-token",
-    "chr1str/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],
